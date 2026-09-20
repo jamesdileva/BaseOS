@@ -1,2 +1,6 @@
 /target/
 Cargo.lock
+# S00 hardening (agent-b review #4): local-only records, never commit
+research/benchmarks/*.local.txt
+research/benchmarks/host-toolchain.local.txt
+target/qemu-smoke-*.log
