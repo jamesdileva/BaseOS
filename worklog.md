@@ -69,3 +69,27 @@ Format per entry (per `implementation-guide.md` §31):
   OK; `cargo test` 2/2 OK.
 - **Final:** S01-entry risk (1) closed. Remaining for S01: serial-marker
   end-to-end proof (risk 2) + `tests/` integration harness (risk 3).
+
+## S00 close-out — coding conventions + smoke nit (2026-09-20)
+
+- **Decision:** Close the S00 remainder with (a) `docs/coding-conventions.md`
+  baseline (Rust edition/lints, unsafe-boundary rule, PowerShell fail-loud
+  style, commit/record discipline) and (b) agent-b review #8 nit fix:
+  `smoke.ps1` `-RequireOvmf` missing-firmware branch now uses
+  `Write-Output` + `exit 1` instead of `Write-Error` (which throws
+  terminating under `$ErrorActionPreference = "Stop"` before `exit 1`).
+- **Why:** S00 verification lists "establish coding conventions" with no doc
+  on disk; the nit left the assert path relying on throw semantics instead
+  of an explicit exit code.
+- **Alternatives:** Defer doc to S01 (rejected: S00 Definition of Done
+  requires it; S01 should start from a closed foundation).
+- **Expected:** `cargo test` 2/2, `check-env -Check` OK, `smoke -RequireOvmf`
+  PASS with OVMF FOUND; missing-firmware + `-RequireOvmf` still exits 1.
+- **Measured (2026-09-20, Win11):** `cargo test` 2/2 OK; `check-env -Check`
+  OK (rustc/cargo 1.98.0, `x86_64-unknown-uefi` present);
+  `smoke.ps1 -RequireOvmf` SMOKE PASS exit 0, OVMF FOUND
+  `edk2-x86_64-code.fd`; no `Write-Error` remains in `smoke.ps1` (exit-1
+  path now explicit, semantics unchanged from prior measured exit-1).
+- **Final:** S00 done (foundation + hardening + conventions). Next: S01 UEFI
+  guest with serial marker + `tests/` integration harness; S01 smoke passes
+  `-RequireOvmf`.

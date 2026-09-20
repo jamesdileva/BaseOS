@@ -47,7 +47,7 @@ if ($ovmf) {
 } else {
   $msg = "OVMF: MISSING (S01 UEFI boot requires edk2-x86_64-code.fd; set OVMF_CODE env var)"
   if ($RequireOvmf) {
-    Write-Error ($msg + " [-RequireOvmf asserted]")
+    Write-Output ($msg + " [-RequireOvmf asserted]")
     exit 1
   }
   Write-Output $msg
