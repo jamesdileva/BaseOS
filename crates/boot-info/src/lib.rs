@@ -268,6 +268,98 @@ impl fmt::Display for MemoryKind {
     }
 }
 
+/// Write an ASCII string through a byte callback (serial/COM1 writer pattern).
+///
+/// Same sink style as `baseos-serial-marker::write_marker`: the UEFI guest
+/// passes a COM1 byte writer, host tests pass a `Vec` collector.
+pub fn write_str<E>(emit: &mut impl FnMut(u8) -> Result<(), E>, s: &str) -> Result<(), E> {
+    for &b in s.as_bytes() {
+        emit(b)?;
+    }
+    Ok(())
+}
+
+/// Write a `u64` as lowercase `0x...` hex (no leading-zero padding).
+pub fn write_u64_hex<E>(emit: &mut impl FnMut(u8) -> Result<(), E>, v: u64) -> Result<(), E> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    write_str(emit, "0x")?;
+    if v == 0 {
+        return write_str(emit, "0");
+    }
+    let mut buf = [0u8; 16];
+    let mut n = 0usize;
+    let mut x = v;
+    while x > 0 {
+        buf[n] = DIGITS[(x & 0xF) as usize];
+        n += 1;
+        x >>= 4;
+    }
+    while n > 0 {
+        n -= 1;
+        emit(buf[n])?;
+    }
+    Ok(())
+}
+
+/// Write a `u64` as decimal (no padding).
+pub fn write_u64_dec<E>(emit: &mut impl FnMut(u8) -> Result<(), E>, v: u64) -> Result<(), E> {
+    if v == 0 {
+        return write_str(emit, "0");
+    }
+    let mut buf = [0u8; 20];
+    let mut n = 0usize;
+    let mut x = v;
+    while x > 0 {
+        buf[n] = b'0' + (x % 10) as u8;
+        n += 1;
+        x /= 10;
+    }
+    while n > 0 {
+        n -= 1;
+        emit(buf[n])?;
+    }
+    Ok(())
+}
+
+/// Emit a two-line `BootInfo` serial summary through a byte callback.
+///
+/// Line 1: `BOOTINFO valid=<0|1> regions=<n> usable=<0x...>` — `usable` is
+/// `usable_bytes()` (0 on corrupt header, same mask as documented there).
+/// Line 2: raw framebuffer geometry plus the gated verdict, so a `None`
+/// verdict stays diagnosable on serial (review #25 suggestion):
+/// `FB present=<0|1> base=<0x...> size=<0x...> <WxH> pitch=<n> bpp=<n>`.
+///
+/// `no_std`-clean (core only); the UEFI guest reuses this for its COM1
+/// debug print once `GetMemoryMap`/GOP fill the struct.
+pub fn write_boot_summary<E>(
+    info: &BootInfo,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "BOOTINFO valid=")?;
+    write_u64_dec(emit, u64::from(info.is_valid()))?;
+    write_str(emit, " regions=")?;
+    write_u64_dec(emit, u64::from(info.region_count))?;
+    write_str(emit, " usable=")?;
+    write_u64_hex(emit, info.usable_bytes())?;
+    write_str(emit, "\n")?;
+    write_str(emit, "FB present=")?;
+    write_u64_dec(emit, u64::from(info.framebuffer_opt().is_some()))?;
+    write_str(emit, " base=")?;
+    write_u64_hex(emit, info.framebuffer.base)?;
+    write_str(emit, " size=")?;
+    write_u64_hex(emit, info.framebuffer.size)?;
+    write_str(emit, " ")?;
+    write_u64_dec(emit, u64::from(info.framebuffer.width))?;
+    write_str(emit, "x")?;
+    write_u64_dec(emit, u64::from(info.framebuffer.height))?;
+    write_str(emit, " pitch=")?;
+    write_u64_dec(emit, u64::from(info.framebuffer.pitch))?;
+    write_str(emit, " bpp=")?;
+    write_u64_dec(emit, u64::from(info.framebuffer.bpp))?;
+    write_str(emit, "\n")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +533,127 @@ mod tests {
         let r = MemoryRegion::new(u64::MAX - 0x1000, 4, MemoryKind::Usable);
         assert_eq!(r.size_bytes(), 4 * PAGE_SIZE);
         assert_eq!(r.end(), u64::MAX);
+    }
+
+    fn emit_to_vec(write: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut out = Vec::new();
+        write(&mut out);
+        out
+    }
+
+    #[test]
+    fn hex_and_dec_helpers_emit_expected_text() {
+        let hex = emit_to_vec(|out: &mut Vec<u8>| {
+            write_u64_hex::<core::convert::Infallible>(
+                &mut |b| {
+                    out.push(b);
+                    Ok(())
+                },
+                0,
+            )
+            .unwrap()
+        });
+        assert_eq!(hex, b"0x0");
+        let hex = emit_to_vec(|out: &mut Vec<u8>| {
+            write_u64_hex::<core::convert::Infallible>(
+                &mut |b| {
+                    out.push(b);
+                    Ok(())
+                },
+                0x8000_0000,
+            )
+            .unwrap()
+        });
+        assert_eq!(hex, b"0x80000000");
+        let hex = emit_to_vec(|out: &mut Vec<u8>| {
+            write_u64_hex::<core::convert::Infallible>(
+                &mut |b| {
+                    out.push(b);
+                    Ok(())
+                },
+                u64::MAX,
+            )
+            .unwrap()
+        });
+        assert_eq!(hex, b"0xffffffffffffffff");
+        let dec = emit_to_vec(|out: &mut Vec<u8>| {
+            write_u64_dec::<core::convert::Infallible>(
+                &mut |b| {
+                    out.push(b);
+                    Ok(())
+                },
+                0,
+            )
+            .unwrap()
+        });
+        assert_eq!(dec, b"0");
+        let dec = emit_to_vec(|out: &mut Vec<u8>| {
+            write_u64_dec::<core::convert::Infallible>(
+                &mut |b| {
+                    out.push(b);
+                    Ok(())
+                },
+                1024,
+            )
+            .unwrap()
+        });
+        assert_eq!(dec, b"1024");
+    }
+
+    #[test]
+    fn boot_summary_reports_valid_map_and_fb_geometry() {
+        // Valid map + good FB: both verdicts 1 and raw geometry visible.
+        let mut info = BootInfo::new();
+        assert!(info.push_region(MemoryRegion::new(0x1000, 4, MemoryKind::Usable)));
+        info.has_framebuffer = 1;
+        info.framebuffer = Framebuffer {
+            base: 0x8000_0000,
+            size: 8 * 1024 * 1024,
+            width: 1024,
+            height: 768,
+            pitch: 4096,
+            bpp: 32,
+        };
+        let mut out = Vec::new();
+        write_boot_summary::<core::convert::Infallible>(&info, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let text = std::string::String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("BOOTINFO valid=1 regions=1 usable=0x4000"),
+            "{text}"
+        );
+        assert!(
+            text.contains("FB present=1 base=0x80000000 size=0x800000 1024x768 pitch=4096 bpp=32"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn boot_summary_stays_diagnosable_when_fb_gated_to_none() {
+        // Review #25: corrupt geometry must still print raw fields so the
+        // serial capture shows WHY framebuffer_opt() is None.
+        let mut info = BootInfo::new();
+        info.has_framebuffer = 1;
+        info.framebuffer = Framebuffer {
+            base: 0x8000_0000,
+            size: 4096 * 100, // undersized vs pitch*height -> None
+            width: 1024,
+            height: 768,
+            pitch: 4096,
+            bpp: 32,
+        };
+        assert_eq!(info.framebuffer_opt(), None);
+        let mut out = Vec::new();
+        write_boot_summary::<core::convert::Infallible>(&info, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let text = std::string::String::from_utf8(out).unwrap();
+        assert!(text.contains("FB present=0"), "{text}");
+        assert!(text.contains("1024x768 pitch=4096 bpp=32"), "{text}");
     }
 }

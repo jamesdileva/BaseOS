@@ -402,3 +402,36 @@ Format per entry (per `implementation-guide.md` §31):
   no new deps). Next: S01 remainder — fill `BootInfo` from UEFI
   `GetMemoryMap` + serial print, then GOP; task #2 stays `active` until
   proven in `boot-uefi.ps1`.
+
+## S01 slice 4 — BootInfo serial-print helpers (2026-09-20)
+
+- **Decision:** Land the debug-print half of the S01 remainder as one
+  host-testable slice in `crates/boot-info`: `write_str` / `write_u64_hex`
+  / `write_u64_dec` plus `write_boot_summary` (two lines:
+  `BOOTINFO valid=<0|1> regions=<n> usable=<0x...>` and
+  `FB present=<0|1> base=<0x...> size=<0x...> <WxH> pitch=<n> bpp=<n>`),
+  reusing the `write_marker` byte-callback sink style so the UEFI guest
+  can pass its COM1 writer directly. Line 2 always prints raw geometry
+  plus the gated verdict, so a `None` stays diagnosable on serial.
+  Guest untouched this cycle; `GetMemoryMap`/GOP fill is the next slice.
+- **Why:** Review #25 concurrence left finding 4 (GetMemoryMap+GOP e2e)
+  open and warned the guest fill path must satisfy the new geometry gates
+  or `framebuffer_opt` will (correctly) yield `None` — with no serial
+  visibility into why. Pinning the print format + unit tests first keeps
+  the guest slice small and gives it a ready-made COM1 debug print.
+- **Alternatives:** Wire the guest to boot services in the same commit
+  (rejected: raw SystemTable parsing doubles single-cycle risk; print
+  contract must exist first); `core::fmt`/`format!` based printing
+  (rejected: pulls formatting machinery into the `no_std` guest; manual
+  hex/dec loops are core-only and already match the marker-callback style).
+- **Expected:** `cargo test` 24/24, `fmt --check` clean, host + UEFI
+  `clippy -D warnings` clean, `boot-uefi.ps1` still PASS 333 B FOUND.
+- **Measured (2026-09-20, Win11):** `cargo test` 24/24 OK (14 boot-info +
+  4 marker unit + 4 harness + 2 version); `cargo fmt --check` clean
+  (after one auto-format); `clippy --all-targets -D warnings` clean
+  (host) and `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS, serial 333 bytes,
+  marker FOUND, guest 4096 bytes (guest source untouched).
+- **Final:** Print contract pinned and tested (good-path + gated-None
+  diagnosability locked). Next: fill `BootInfo` from UEFI `GetMemoryMap`
+  + emit this summary from the guest, then GOP; task #2 stays `active`.
