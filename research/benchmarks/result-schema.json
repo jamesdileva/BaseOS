@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "BaseOS benchmark result (S00 baseline format)",
+  "description": "Every benchmark records these fields per architecture.md §8. Store one JSON object per run under research/benchmarks/reports/.",
+  "type": "object",
+  "required": ["os_build", "hardware", "workload", "result", "date", "commit"],
+  "properties": {
+    "os_build": { "type": "string" },
+    "hardware": { "type": "object" },
+    "firmware_config": { "type": "string" },
+    "kernel_config": { "type": "object" },
+    "scheduler": { "type": "string" },
+    "memory_policy": { "type": "string" },
+    "io_policy": { "type": "string" },
+    "filesystem": { "type": "string" },
+    "graphics_mode": { "type": "string" },
+    "workload": { "type": "string" },
+    "result": { "type": "object" },
+    "date": { "type": "string", "format": "date-time" },
+    "commit": { "type": "string" }
+  }
+}
