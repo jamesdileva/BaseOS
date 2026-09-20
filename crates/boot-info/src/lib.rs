@@ -71,7 +71,11 @@ pub struct Framebuffer {
 }
 
 /// Kernel handoff header: validate with BootInfo::is_valid before use.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// ~3 KB inline map: pass by reference (`&BootInfo`) — never by value —
+/// per the perf-first rule (review #19: `Copy` on this size risks
+/// stack/memcpy cost on every handoff call).
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct BootInfo {
     /// Must equal BOOTINFO_MAGIC.
@@ -148,7 +152,11 @@ impl BootInfo {
             && (self.region_count as usize) <= MAX_MEM_REGIONS
     }
 
-    /// Valid regions slice; empty when the header itself is invalid.
+    /// Valid regions slice.
+    ///
+    /// Returns empty when the header itself is invalid — callers MUST check
+    /// [`BootInfo::is_valid`] first: an empty slice alone cannot distinguish
+    /// "zero regions" from "corrupt header" (review #19 finding 3).
     pub fn memory_map(&self) -> &[MemoryRegion] {
         if self.is_valid() {
             &self.regions[..self.region_count as usize]
@@ -176,9 +184,18 @@ impl BootInfo {
             .fold(0u64, |acc, r| acc.saturating_add(r.size_bytes()))
     }
 
-    /// Framebuffer when present.
+    /// Framebuffer when present and sane.
+    ///
+    /// A non-zero flag alone is not enough (review #19 finding 2): the
+    /// descriptor must also carry a non-zero size and dimensions, otherwise
+    /// `None` (absent/invalid) is returned.
     pub fn framebuffer_opt(&self) -> Option<Framebuffer> {
-        if self.is_valid() && self.has_framebuffer != 0 {
+        if self.is_valid()
+            && self.has_framebuffer != 0
+            && self.framebuffer.size != 0
+            && self.framebuffer.width != 0
+            && self.framebuffer.height != 0
+        {
             Some(self.framebuffer)
         } else {
             None
@@ -264,6 +281,39 @@ mod tests {
         assert_eq!(info.framebuffer_opt(), None);
         info.has_framebuffer = 1;
         assert_eq!(info.framebuffer_opt(), Some(info.framebuffer));
+    }
+
+    #[test]
+    fn framebuffer_flag_with_empty_or_degenerate_descriptor_is_none() {
+        // Flag set but descriptor empty (review #19 finding 2).
+        let mut info = BootInfo::new();
+        info.has_framebuffer = 1;
+        assert_eq!(info.framebuffer_opt(), None);
+        // Size present but zero dimensions still absent.
+        info.framebuffer = Framebuffer {
+            base: 0x8000_0000,
+            size: 8 * 1024 * 1024,
+            width: 0,
+            height: 768,
+            pitch: 4096,
+            bpp: 32,
+        };
+        assert_eq!(info.framebuffer_opt(), None);
+        // Fully populated descriptor is present.
+        info.framebuffer.width = 1024;
+        assert_eq!(info.framebuffer_opt(), Some(info.framebuffer));
+    }
+
+    #[test]
+    fn handoff_passes_by_reference_and_clones() {
+        // BootInfo is Clone-only (no Copy): ~3 KB must not move by value.
+        fn accepts_ref(info: &BootInfo) -> bool {
+            info.is_valid()
+        }
+        let info = BootInfo::new();
+        assert!(accepts_ref(&info));
+        let dup = info.clone();
+        assert_eq!(dup, info);
     }
 
     #[test]

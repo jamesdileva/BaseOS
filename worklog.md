@@ -265,7 +265,7 @@ Format per entry (per `implementation-guide.md` §31):
   time, `boot-uefi.ps1` stays the proof vehicle; suggested first slice is
   UEFI memory-map retrieval printed to serial.
 
-## S01 slice 3 � boot-info handoff struct contract (2026-09-20)
+## S01 slice 3 � boot-info handoff struct contract (2026-09-20)
 
 - **Decision:** Land the S01-remainder handoff half as one committable slice:
   new no_std crates/boot-info (BootInfo magic/version header, inline
@@ -292,3 +292,37 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Handoff contract pinned and tested. Next: fill BootInfo from
   UEFI GetMemoryMap (plus boot-info print to serial) and assert it in
   boot-uefi.ps1; then GOP framebuffer discovery.
+
+## S01 slice 3 hardening — review #19 findings 1–3 (2026-09-20)
+
+- **Decision:** Harden `crates/boot-info` per agent-b review #19 without
+  starting the guest GetMemoryMap wire-up: (a) drop `Copy` from `BootInfo`
+  (keep `Clone`), document pass-by-`&BootInfo` for the ~3 KB struct
+  (perf-first: no per-call stack memcpy); small `MemoryRegion` /
+  `Framebuffer` stay `Copy`; (b) `framebuffer_opt()` now requires
+  `size != 0 && width != 0 && height != 0` in addition to the flag, so a
+  set flag with an empty/degenerate descriptor returns `None`;
+  (c) `memory_map()` keeps empty-on-invalid behavior but documents that
+  callers MUST check `is_valid()` first (empty alone masks corruption).
+  Two new tests: flag-with-empty/degenerate → `None`, Clone/`&`-passing.
+  Guest untouched; finding 4 (host-only, no end-to-end fill yet) stays
+  open by design — fill + serial print + GOP is the next slice.
+- **Why:** Review #19 accepted the contract but flagged a 3 KB `Copy`
+  handoff, a flag-only framebuffer gate, and a silent-empty map that
+  masks corruption — all cheap to close before the guest depends on them.
+- **Alternatives:** Wire the guest to boot services in the same commit
+  (rejected: raw SystemTable parsing doubles single-cycle risk; contract
+  must be right first); panic on invalid `memory_map()` (rejected: breaks
+  the valid-empty case and existing callers; explicit `is_valid()` + doc
+  keeps the distinction without a trap path).
+- **Expected:** `cargo test` 18/18, `fmt --check` clean, host + UEFI
+  `clippy -D warnings` clean, `boot-uefi.ps1` still PASS 333 B FOUND.
+- **Measured (2026-09-20, Win11):** `cargo test` 18/18 OK (8 boot-info +
+  4 marker unit + 4 harness + 2 version); `cargo fmt --check` clean;
+  `clippy --all-targets -D warnings` clean (host) and
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -D warnings`
+  clean; `boot-uefi.ps1` PASS, serial 333 bytes, marker FOUND, guest
+  4096 bytes (guest source untouched, baseline unchanged).
+- **Final:** Findings 1–3 closed on the current tree. Next: S01 remainder —
+  fill `BootInfo` from UEFI `GetMemoryMap` + serial print, then GOP;
+  task #2 stays `active` until proven in `boot-uefi.ps1`.
