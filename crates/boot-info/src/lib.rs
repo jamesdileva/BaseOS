@@ -94,6 +94,32 @@ pub struct BootInfo {
     pub framebuffer: Framebuffer,
 }
 
+impl MemoryKind {
+    /// Classify a UEFI memory type (`EFI_MEMORY_DESCRIPTOR.Type`) into the
+    /// handoff [`MemoryKind`].
+    ///
+    /// Mapping (pre-`ExitBootServices` view):
+    /// - `7` (`EfiConventionalMemory`) → [`MemoryKind::Usable`]
+    /// - `1..=4` (loader + boot-services code/data) → `Reclaimable` (free
+    ///   after `ExitBootServices`)
+    /// - `9..=10` (ACPI reclaim + NVS) → [`MemoryKind::Acpi`] (preserve)
+    /// - `5..=6` (runtime services) and `11..=13` (MMIO/port/PalCode) →
+    ///   [`MemoryKind::Firmware`] (never touch)
+    /// - everything else (`0`, `8`, `14`, future values) → `Reserved`.
+    ///
+    /// Unknown/future types map to `Reserved` so the kernel never allocates
+    /// from a region it does not understand.
+    pub const fn from_uefi_type(efi_type: u32) -> Self {
+        match efi_type {
+            7 => Self::Usable,
+            1..=4 => Self::Reclaimable,
+            9..=10 => Self::Acpi,
+            5..=6 | 11..=13 => Self::Firmware,
+            _ => Self::Reserved,
+        }
+    }
+}
+
 impl MemoryRegion {
     /// Create a region descriptor.
     pub const fn new(start: u64, page_count: u64, kind: MemoryKind) -> Self {
@@ -174,6 +200,49 @@ impl BootInfo {
         self.regions[n] = region;
         self.region_count = (n + 1) as u16;
         true
+    }
+
+    /// Append one UEFI descriptor as a region; returns false when full.
+    ///
+    /// Thin wrapper over [`BootInfo::push_region`] using
+    /// [`MemoryKind::from_uefi_type`], so the guest's `GetMemoryMap` loop
+    /// stays trivial and the mapping is host-unit-testable.
+    pub fn push_efi_descriptor(&mut self, efi_type: u32, phys_start: u64, page_count: u64) -> bool {
+        self.push_region(MemoryRegion::new(
+            phys_start,
+            page_count,
+            MemoryKind::from_uefi_type(efi_type),
+        ))
+    }
+
+    /// Fill the map from a raw UEFI `GetMemoryMap` byte buffer.
+    ///
+    /// Parses `raw` in `desc_size`-byte strides (the firmware's descriptor
+    /// size, `>= 40`): each stride contributes `Type` (u32 at +0),
+    /// `PhysicalStart` (u64 at +8), `NumberOfPages` (u64 at +24) via
+    /// [`MemoryKind::from_uefi_type`]. Stops when the inline map is full.
+    /// Returns the number of regions pushed. `no_std`-clean (byte loads,
+    /// no alignment assumptions) so the UEFI guest calls this directly on
+    /// its `GetMemoryMap` buffer and the layout is host-unit-testable.
+    pub fn fill_from_raw_descriptors(&mut self, raw: &[u8], desc_size: usize) -> usize {
+        if desc_size < 40 {
+            return 0;
+        }
+        let mut pushed = 0usize;
+        let mut off = 0usize;
+        while off.saturating_add(desc_size) <= raw.len() {
+            let d = &raw[off..off + desc_size];
+            let ty = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+            let phys = u64::from_le_bytes([d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]]);
+            let pages =
+                u64::from_le_bytes([d[24], d[25], d[26], d[27], d[28], d[29], d[30], d[31]]);
+            if !self.push_efi_descriptor(ty, phys, pages) {
+                break;
+            }
+            pushed += 1;
+            off += desc_size;
+        }
+        pushed
     }
 
     /// Total usable bytes across Usable regions (saturating).
@@ -655,5 +724,121 @@ mod tests {
         let text = std::string::String::from_utf8(out).unwrap();
         assert!(text.contains("FB present=0"), "{text}");
         assert!(text.contains("1024x768 pitch=4096 bpp=32"), "{text}");
+    }
+
+    #[test]
+    fn uefi_type_mapping_covers_arch_kinds() {
+        // Guest GetMemoryMap loop depends on this; unknown types must be Reserved.
+        assert_eq!(MemoryKind::from_uefi_type(7), MemoryKind::Usable);
+        for t in [1u32, 2, 3, 4] {
+            assert_eq!(
+                MemoryKind::from_uefi_type(t),
+                MemoryKind::Reclaimable,
+                "{t}"
+            );
+        }
+        for t in [9u32, 10] {
+            assert_eq!(MemoryKind::from_uefi_type(t), MemoryKind::Acpi, "{t}");
+        }
+        for t in [5u32, 6, 11, 12, 13] {
+            assert_eq!(MemoryKind::from_uefi_type(t), MemoryKind::Firmware, "{t}");
+        }
+        for t in [0u32, 8, 14, 15, u32::MAX] {
+            assert_eq!(MemoryKind::from_uefi_type(t), MemoryKind::Reserved, "{t}");
+        }
+        // End-to-end through push_efi_descriptor.
+        let mut info = BootInfo::new();
+        assert!(info.push_efi_descriptor(7, 0x1000, 1));
+        assert!(info.push_efi_descriptor(99, 0x5000, 2));
+        assert_eq!(info.memory_map()[0].kind, MemoryKind::Usable);
+        assert_eq!(info.memory_map()[1].kind, MemoryKind::Reserved);
+        assert_eq!(info.usable_bytes(), PAGE_SIZE);
+    }
+
+    #[test]
+    fn boot_summary_locks_corrupt_header_output() {
+        // Review #27 nit 1 (cheapest disconfirm): corrupt header prints
+        // valid=0 with usable=0x0 (same mask as valid-empty); the valid=
+        // flag is the disambiguator, locked here so any format change fails.
+        let mut info = BootInfo::new();
+        assert!(info.push_region(MemoryRegion::new(0x1000, 4, MemoryKind::Usable)));
+        info.magic = 0;
+        assert!(!info.is_valid());
+        let mut out = Vec::new();
+        write_boot_summary::<core::convert::Infallible>(&info, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let text = std::string::String::from_utf8(out).unwrap();
+        assert!(text.contains("BOOTINFO valid=0"), "{text}");
+        assert!(text.contains("usable=0x0"), "{text}");
+        // Contrast: valid-empty prints the same usable but valid=1.
+        let empty = BootInfo::new();
+        let mut out = Vec::new();
+        write_boot_summary::<core::convert::Infallible>(&empty, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let text = std::string::String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("BOOTINFO valid=1 regions=0 usable=0x0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn boot_summary_covers_valid_zero_region_path() {
+        // Review #27 nit 2: the valid=0 (corrupt) path had no summary test
+        // with the guest slice; pin the full two-line shape here.
+        let mut info = BootInfo::new();
+        info.version = BOOTINFO_VERSION + 1;
+        assert!(!info.is_valid());
+        assert_eq!(info.framebuffer_opt(), None);
+        let mut out = Vec::new();
+        write_boot_summary::<core::convert::Infallible>(&info, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let text = std::string::String::from_utf8(out).unwrap();
+        let mut lines = text.lines();
+        let l1 = lines.next().unwrap();
+        let l2 = lines.next().unwrap();
+        assert!(l1.starts_with("BOOTINFO valid=0 regions="), "{text}");
+        assert!(l2.starts_with("FB present=0 base="), "{text}");
+        assert!(lines.next().is_none(), "{text}");
+    }
+
+    fn fake_efi_desc(ty: u32, phys: u64, pages: u64, stride: usize) -> Vec<u8> {
+        // Minimal EFI_MEMORY_DESCRIPTOR bytes: Type@0, PhysicalStart@8,
+        // NumberOfPages@24; rest zero. Stride may exceed 40 (firmware pad).
+        let mut d = vec![0u8; stride];
+        d[0..4].copy_from_slice(&ty.to_le_bytes());
+        d[8..16].copy_from_slice(&phys.to_le_bytes());
+        d[24..32].copy_from_slice(&pages.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn fill_from_raw_descriptors_parses_firmware_stride() {
+        // Two descriptors with a 48-byte firmware stride (40 + 8 pad).
+        let mut raw = Vec::new();
+        raw.extend(fake_efi_desc(7, 0x1000, 4, 48));
+        raw.extend(fake_efi_desc(4, 0x5000, 2, 48));
+        let mut info = BootInfo::new();
+        assert_eq!(info.fill_from_raw_descriptors(&raw, 48), 2);
+        assert_eq!(info.memory_map().len(), 2);
+        assert_eq!(info.memory_map()[0].kind, MemoryKind::Usable);
+        assert_eq!(info.memory_map()[1].kind, MemoryKind::Reclaimable);
+        assert_eq!(info.usable_bytes(), 4 * PAGE_SIZE);
+        // Undersized stride parses nothing; trailing partial stride ignored.
+        let mut info = BootInfo::new();
+        assert_eq!(info.fill_from_raw_descriptors(&raw, 16), 0);
+        let mut cut = raw.clone();
+        cut.push(0xAA);
+        let mut info = BootInfo::new();
+        assert_eq!(info.fill_from_raw_descriptors(&cut, 48), 2);
     }
 }

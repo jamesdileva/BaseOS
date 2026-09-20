@@ -435,3 +435,58 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Print contract pinned and tested (good-path + gated-None
   diagnosability locked). Next: fill `BootInfo` from UEFI `GetMemoryMap`
   + emit this summary from the guest, then GOP; task #2 stays `active`.
+
+## S01 slice 5 — GetMemoryMap fill + guest serial summary (2026-09-20)
+
+- **Decision:** Land the memory-map half of the S01 remainder as one
+  committable slice: (a) `crates/boot-info`: `MemoryKind::from_uefi_type`
+  (7→Usable, 1–4→Reclaimable, 9–10→Acpi, 5–6/11–13→Firmware, rest→Reserved),
+  `BootInfo::push_efi_descriptor` and `fill_from_raw_descriptors`
+  (stride parser over raw `GetMemoryMap` bytes, `no_std`-clean, stops at
+  the 128-entry inline cap) plus 4 host tests (mapping, stride incl.
+  48-byte firmware pad + short-stride/trailing-byte guards, corrupt-header
+  summary lock, valid=0 two-line shape — closing review #27 nits 1+2 in
+  the cheapest test-only form; nit 3, `\n`-only line endings, deferred:
+  QEMU file capture renders fine, real COM1 terminal check rides with
+  bare-metal S35); (b) `crates/boot-uefi`: dependency-free raw
+  `EFI_SYSTEM_TABLE`/`EFI_BOOT_SERVICES` parsing (fixed x86-64 offsets 96
+  and 56, `extern "efiapi"`, null-link guards), 16 KiB static map buffer,
+  `fill_boot_info` (failure leaves a valid-but-empty `BootInfo` so serial
+  stays diagnosable), then marker → `write_boot_summary` → new
+  `MEMMAP ok=<0|1> status=<0x...> entries=<n>` diagnostic line on COM1;
+  (c) `boot-uefi.ps1` now REQUIRES `BOOTINFO valid=1` + `MEMMAP ok=1` in
+  the serial capture in addition to the marker (missing summary = FAIL).
+- **Why:** Roadmap S01 verification needs "memory map is visible" and
+  "failure states are diagnosable" end-to-end, not just a pinned struct;
+  host-testable mapping/stride code keeps the raw-firmware guest loop thin
+  while the script assert turns a silent empty map into a loud FAIL.
+- **Alternatives:** `uefi`-crate guest with `BootServices::memory_map`
+  (rejected: registry/API risk, heavier; raw offsets are two reads and
+  already proven here); heap/`Vec` map (rejected: no allocator pre-heap,
+  inline 128-cap kept); merging adjacent same-kind descriptors
+  (deferred: 100 QEMU entries fit the cap, coalescing is S03-allocator
+  work).
+- **Expected:** `cargo test` 28/28, `fmt --check` clean, host + UEFI
+  `clippy -D warnings` clean, `boot-uefi.ps1` PASS with
+  `BOOTINFO valid=1` + `MEMMAP ok=1`, `smoke -RequireOvmf` still PASS.
+- **Measured (2026-09-20, Win11):** `cargo test` 28/28 OK (18 boot-info +
+  4 marker unit + 4 harness + 2 version); `cargo fmt --check` clean;
+  `clippy --all-targets -D warnings` clean (host, after a
+  `manual_range_patterns` range fix) and
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -D warnings`
+  clean (after removing a dead status const + an
+  `not_unsafe_ptr_arg_deref` allow on the `efi_main` FFI entry);
+  `boot-uefi.ps1` UEFI BOOT PASS exit 0 on two consecutive runs (serial
+  463 bytes both: marker FOUND, `BOOTINFO valid=1 regions=100
+  usable=0xce95000`, `FB present=0` — no GOP yet, expected —,
+  `MEMMAP ok=1 status=0x0 entries=100`; guest `bootx64.efi` 18432 bytes);
+  `smoke -RequireOvmf` SMOKE PASS exit 0, serial 0 bytes (SeaBIOS path
+  untouched). Incidental: `boot-uefi.ps1` edit briefly broke PS 5.1
+  parsing via a non-ASCII em-dash in a UTF-8 string (script-wide parse
+  errors incl. untouched lines) — replaced with ASCII `--`, re-measured
+  PASS; lesson recorded (ASCII-only in `.ps1`).
+- **Final:** Memory map proven end-to-end (guest → COM1 → required
+  assert); review #27 nits 1+2 closed as tests. Next: GOP framebuffer
+  discovery + `framebuffer_opt`/`FB present=1` in the same summary;
+  task #2 stays `active` until then (S01 verification still needs
+  framebuffer discovery).

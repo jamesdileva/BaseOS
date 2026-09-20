@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S01 slice 2) ==="
+Write-Output "=== BaseOS UEFI guest boot (S01 slice 5: GetMemoryMap) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -135,8 +135,20 @@ if (Test-Path -LiteralPath $serialLog) {
 }
 if ($serialText -and $serialText.Contains($marker)) {
   Write-Output "Serial marker: FOUND ($marker)"
-  Write-Output "UEFI BOOT PASS"
-  exit 0
+  $bootinfo = "BOOTINFO valid=1"
+  $memmap = "MEMMAP ok=1"
+  $hasBootinfo = $serialText.Contains($bootinfo)
+  $hasMemmap = $serialText.Contains($memmap)
+  if ($hasBootinfo -and $hasMemmap) {
+    Write-Output "Boot summary: FOUND ($bootinfo + $memmap)"
+    Write-Output "UEFI BOOT PASS"
+    exit 0
+  } else {
+    Write-Output ("Boot summary: MISSING (BOOTINFO valid=1 present=$hasBootinfo, " +
+      "MEMMAP ok=1 present=$hasMemmap; guest GetMemoryMap fill failed -- see serial log)")
+    Write-Output "UEFI BOOT FAIL"
+    exit 1
+  }
 } else {
   Write-Output "Serial marker: MISSING ($marker not in $serialLog, ${size} bytes)"
   if (Test-Path -LiteralPath $stdoutLog) {
