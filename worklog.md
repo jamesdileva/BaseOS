@@ -49,3 +49,23 @@ Format per entry (per `implementation-guide.md` §31):
   guest output yet); `qemu -invalid-flag-xyz` exits 1 (old script would have
   reported SMOKE OK — false positive confirmed and now closed).
 - **Final:** S00 remainder narrowed to coding-conventions doc; S01 UEFI next.
+
+## S00 hardening — review #6 finding 1 (2026-09-20)
+
+- **Decision:** Add `-RequireOvmf` switch to `tools/qemu/smoke.ps1`: missing
+  firmware stays advisory by default, but fails fast (exit 1, before QEMU
+  launch) when the flag is passed. S01 smoke/entry will pass the flag.
+- **Why:** Agent-b review #6 showed `OVMF: MISSING` was report-only, so S01's
+  key prerequisite was advisory — smoke could PASS without firmware.
+- **Alternatives:** Make missing firmware always fatal (rejected: S00 SeaBIOS
+  smoke is still useful on hosts without EDK2; opt-in assert keeps both).
+- **Expected:** Firmware present + `-RequireOvmf` → PASS; firmware missing +
+  `-RequireOvmf` → FAIL at OVMF assert; firmware missing without flag →
+  advisory MISSING line, continues to QEMU launch attempt.
+- **Measured (2026-09-20, Win11):** Present + `-RequireOvmf` → SMOKE PASS
+  (exit 0, OVMF FOUND edk2-x86_64-code.fd); simulated-missing (PATH stripped,
+  bogus OVMF_CODE) + `-RequireOvmf` → exit 1 at `-RequireOvmf asserted`
+  before QEMU launch, vs without flag proceeds to QEMU launch; `check-env -Check`
+  OK; `cargo test` 2/2 OK.
+- **Final:** S01-entry risk (1) closed. Remaining for S01: serial-marker
+  end-to-end proof (risk 2) + `tests/` integration harness (risk 3).

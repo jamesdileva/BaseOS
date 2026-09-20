@@ -4,13 +4,15 @@
   S00 QEMU smoke test: verifies QEMU launches and stays up; captures
   serial output to a file; reports OVMF/EDK2 firmware presence explicitly.
   Exits 0 on PASS, non-zero on FAIL (no false-positive quick-exit pass).
-  Full UEFI-OS boot arrives in S01.
+  Full UEFI-OS boot arrives in S01. Pass -RequireOvmf when firmware
+  is mandatory (S01 entry); without it a missing OVMF is advisory only.
 
-  Addresses agent-b review #4 findings 1 and 5.
+  Addresses agent-b review #4 findings 1 and 5, review #6 finding 1.
 #>
 param(
   [int]$TimeoutSec = 5,
-  [string]$LogDir = "target"
+  [string]$LogDir = "target",
+  [switch]$RequireOvmf
 )
 $ErrorActionPreference = "Stop"
 
@@ -43,7 +45,12 @@ $ovmf = Find-OvmfCode
 if ($ovmf) {
   Write-Output "OVMF: FOUND at $ovmf"
 } else {
-  Write-Output "OVMF: MISSING (S01 UEFI boot requires edk2-x86_64-code.fd; set OVMF_CODE env var)"
+  $msg = "OVMF: MISSING (S01 UEFI boot requires edk2-x86_64-code.fd; set OVMF_CODE env var)"
+  if ($RequireOvmf) {
+    Write-Error ($msg + " [-RequireOvmf asserted]")
+    exit 1
+  }
+  Write-Output $msg
 }
 
 # --- Serial-to-file capture setup ---
