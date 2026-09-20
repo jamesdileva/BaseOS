@@ -82,11 +82,12 @@ New-Item -ItemType File -Force -Path $serialLog | Out-Null
 
 # --- 5. OVMF vars store (writable NVRAM, gitignored target/, local-only) ---
 # OVMF runs from split flash images: code (readonly) + vars (writable).
+# Regenerated every run (review #17 finding 1): a reused vars store carries
+# stale NVRAM boot-order across runs, which can mask ESP/boot-entry changes.
 # A blank 528 KiB store is enough — EDK2 reformats it on first boot.
 $varsFd = Join-Path $logAbs "ovmf-vars.fd"
-if (-not (Test-Path -LiteralPath $varsFd)) {
-  [System.IO.File]::WriteAllBytes($varsFd, [byte[]]::new(540672))
-}
+if (Test-Path -LiteralPath $varsFd) { Remove-Item -LiteralPath $varsFd -Force }
+[System.IO.File]::WriteAllBytes($varsFd, [byte[]]::new(540672))
 Write-Output "OVMF vars: $varsFd"
 
 # QEMU virtual-FAT drive: the ESP directory is exposed as a disk, so no

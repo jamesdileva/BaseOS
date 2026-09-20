@@ -11,8 +11,9 @@
 /// Fixed serial marker emitted by the S01 UEFI guest.
 ///
 /// Stability is the point: host scripts grep for exactly this string.
-/// Do not change without updating `tools/qemu/smoke.ps1` (`-ExpectSerialMarker`)
-/// and the `tests/` harness in the same commit.
+/// Do not change without updating `tools/qemu/smoke.ps1` (`-ExpectSerialMarker`),
+/// `tools/qemu/boot-uefi.ps1` (required assert), and the `tests/` harness
+/// in the same commit.
 pub const SERIAL_MARKER: &str = "BASEOS-S01-BOOT-MARKER";
 
 /// Returns the fixed serial marker.

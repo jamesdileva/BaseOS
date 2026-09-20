@@ -222,3 +222,45 @@ Format per entry (per `implementation-guide.md` §31):
   ready to flip to `done` once agent-b concurs the S01 verification
   bar (QEMU UEFI boot succeeds, boot info printed, memory map visible,
   failures diagnosable) is met by slices 1+2 or needs the remainder.
+
+## S01 slice 2 hardening — review #17 follow-up (2026-09-20)
+
+- **Decision:** Harden slice 2 per agent-b review #17 without starting
+  the S01 remainder: (a) `boot-uefi.ps1` regenerates `target/ovmf-vars.fd`
+  every run (delete + fresh blank 528 KiB) instead of create-once-reuse;
+  (b) the `tests/serial_marker.rs` sync test now asserts the contract
+  literal in BOTH `smoke.ps1` and `boot-uefi.ps1` (closes drift risk);
+  (c) `SERIAL_MARKER` doc comment lists both scripts as same-commit
+  update targets.
+- **Why:** (1) a reused vars store carries stale NVRAM boot-order across
+  runs and can mask ESP/boot-entry changes; (2) `boot-uefi.ps1` hardcodes
+  the same marker literal as `smoke.ps1` but only `smoke.ps1` was covered
+  by the sync test; (3)/(4) below are measured/documented, not code.
+- **Alternatives:** Keep create-once vars and document the staleness
+  (rejected: silent boot-order carryover is exactly the irreproducibility
+  S00/S01 plumbing exists to prevent; regeneration costs one file write);
+  single-script sync check (rejected: that was the drift hole).
+- **Expected:** `cargo test` 10/10, `fmt --check` clean, host + UEFI
+  `clippy -D warnings` clean, `boot-uefi.ps1` PASS on the regenerated-vars
+  version, simulated-missing OVMF + hidden QEMU exits 1 at the OVMF assert
+  before any QEMU launch, `smoke -RequireOvmf` still PASS (unchanged).
+- **Measured (2026-09-20, Win11):** `cargo test` 10/10 OK (4 unit + 4
+  harness incl. the extended two-script sync test + 2 version);
+  `cargo fmt --check` clean; `clippy --all-targets -D warnings` clean
+  (host) and `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` clean (both run explicitly — review #17 finding 4 stays
+  manual until CI exists, no enforcement script added); `check-env -Check`
+  OK; `boot-uefi.ps1` PASS exit 0 on two consecutive regenerated-vars
+  runs (serial 333 bytes both, marker FOUND, guest 4096 bytes);
+  simulated-missing (bogus `OVMF_CODE`, qemu hidden via PATH without
+  msys64/qemu entries) → `OVMF: MISSING ...` exit 1 before QEMU launch
+  (review #17 finding 3 OVMF-missing path now measured on the current
+  script version; guest-build-fail path is the same `exit 1` assert style,
+  verified by inspection only); `smoke -RequireOvmf` SMOKE PASS exit 0,
+  serial 0 bytes (SeaBIOS path untouched).
+- **Final:** Review #17 findings 1–3 closed on the current tree; finding 4
+  (dual clippy enforcement) remains a manual two-command discipline,
+  recorded here. Next: S01 remainder — memory-map print, boot-info print,
+  handoff struct (+ framebuffer discovery) — one committable slice at a
+  time, `boot-uefi.ps1` stays the proof vehicle; suggested first slice is
+  UEFI memory-map retrieval printed to serial.

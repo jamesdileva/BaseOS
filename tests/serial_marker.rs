@@ -57,22 +57,27 @@ fn guest_serial_log_parses_as_booted() {
     assert!(contains_marker(&text));
 }
 
-/// `smoke.ps1 -ExpectSerialMarker` greps for the same literal; fail here if
-/// the Rust contract and the PowerShell assert ever drift apart.
+/// Both PowerShell asserts grep for the same literal; fail here if the
+/// Rust contract and either script ever drift apart (review #17 finding 2:
+///
+/// `boot-uefi.ps1` hardcodes the marker just like `smoke.ps1` does).
 #[test]
 fn smoke_script_assert_stays_in_sync_with_contract() {
-    let ps1 = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let qemu_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("tools")
-        .join("qemu")
-        .join("smoke.ps1");
-    let script = std::fs::read_to_string(&ps1).unwrap_or_else(|_| panic!("missing {}", ps1.display()));
-    assert!(
-        script.contains(marker()),
-        "smoke.ps1 must grep for the contract marker {:?}",
-        marker()
-    );
+        .join("qemu");
+    for script_name in ["smoke.ps1", "boot-uefi.ps1"] {
+        let ps1 = qemu_dir.join(script_name);
+        let script =
+            std::fs::read_to_string(&ps1).unwrap_or_else(|_| panic!("missing {}", ps1.display()));
+        assert!(
+            script.contains(marker()),
+            "{script_name} must grep for the contract marker {:?}",
+            marker()
+        );
+    }
 }
 
 fn write_temp_log(contents: &[u8]) -> PathBuf {
