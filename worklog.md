@@ -6,7 +6,7 @@ Format per entry (per `implementation-guide.md` §31):
 
 ---
 
-## S00 — Repository and Development Environment (in progress)
+## S00 — Repository and Development Environment (done)
 
 - **Decision:** Establish reproducible foundation first: pinned toolchain,
   Cargo workspace, env-check script, QEMU smoke path, benchmark result schema,
@@ -93,3 +93,34 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** S00 done (foundation + hardening + conventions). Next: S01 UEFI
   guest with serial marker + `tests/` integration harness; S01 smoke passes
   `-RequireOvmf`.
+
+## S00 close-out — review #10 follow-up (2026-09-20)
+
+- **Decision:** Close agent-b review #10 leftovers without starting S01:
+  (a) fix S00 header `(in progress)` → `(done)`; (b) re-measure the
+  `-RequireOvmf` missing-firmware path on the post-nit (`Write-Output` +
+  `exit 1`) script version.
+- **Why:** Review #10 accepted S00 as closed foundation but flagged the
+  missing-path exit-1 claim as measured only on the pre-nit `Write-Error`
+  version, plus the stale header nit. Cheapest disconfirm is a direct
+  re-run, not inspection.
+- **Alternatives:** Roll the re-measure into S01 (rejected: S01 must start
+  from a verified assert gate; keeps S01 slice small).
+- **Expected:** Present + `-RequireOvmf` → PASS exit 0, OVMF FOUND;
+  simulated-missing (bogus `OVMF_CODE`, qemu hidden via stripped PATH) +
+  `-RequireOvmf` → `Write-Output` MISSING + `[-RequireOvmf asserted]`,
+  exit 1 before QEMU launch; same simulated-missing without flag →
+  advisory MISSING, proceeds to QEMU launch attempt; no `Write-Error` in
+  `smoke.ps1`.
+- **Measured (2026-09-20, Win11):** `cargo test` 2/2 OK; `check-env -Check`
+  OK (rustc/cargo 1.98.0, `x86_64-unknown-uefi` present); present +
+  `-RequireOvmf` → SMOKE PASS exit 0, OVMF FOUND
+  `ucrt64/share/qemu/edk2-x86_64-code.fd`, serial log 0 bytes (no guest
+  output yet); simulated-missing + `-RequireOvmf` → MISSING +
+  `[-RequireOvmf asserted]`, EXIT 1, no QEMU launch; simulated-missing
+  without flag → advisory MISSING then `Start-Process` qemu-not-found
+  (proves assert gate passed, launch attempted); `Write-Error` absent
+  from `smoke.ps1` (only `check-env.ps1` fail-loud asserts retain it).
+- **Final:** Review #10 risk (3) closed on the current script version;
+  header nit fixed. S00 done. Next: S01 UEFI guest serial-marker +
+  `tests/` harness (risks 1+2); S02+ blocked until S01 proves them.
