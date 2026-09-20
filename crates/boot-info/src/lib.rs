@@ -180,13 +180,28 @@ impl BootInfo {
     ///
     /// Returns 0 for an invalid header (via [`BootInfo::memory_map`]) exactly
     /// like a valid-but-empty map — callers MUST check [`BootInfo::is_valid`]
-    /// first; a bare `usable_bytes() == 0` check cannot distinguish
-    /// "zero usable RAM" from "corrupt header" (review #21 residual b).
+    /// first or use [`BootInfo::try_usable_bytes`]; a bare
+    /// `usable_bytes() == 0` check cannot distinguish "zero usable RAM" from
+    /// "corrupt header" (review #21 residual b, review #23).
     pub fn usable_bytes(&self) -> u64 {
-        self.memory_map()
-            .iter()
-            .filter(|r| r.kind == MemoryKind::Usable)
-            .fold(0u64, |acc, r| acc.saturating_add(r.size_bytes()))
+        self.try_usable_bytes().unwrap_or(0)
+    }
+
+    /// Total usable bytes, or `None` when the header is invalid.
+    ///
+    /// Prefer this over [`BootInfo::usable_bytes`] in new code: `Some(0)`
+    /// means "valid header, zero usable RAM" while `None` means "corrupt
+    /// header" (review #23 — closes the doc-only caveat on `usable_bytes`).
+    pub fn try_usable_bytes(&self) -> Option<u64> {
+        if !self.is_valid() {
+            return None;
+        }
+        Some(
+            self.memory_map()
+                .iter()
+                .filter(|r| r.kind == MemoryKind::Usable)
+                .fold(0u64, |acc, r| acc.saturating_add(r.size_bytes())),
+        )
     }
 
     /// Framebuffer when present and sane.
@@ -195,23 +210,44 @@ impl BootInfo {
     /// residual a): the descriptor must also carry a non-zero base, size,
     /// dimensions, pitch, and bpp, otherwise `None` (absent/invalid) is
     /// returned. A zero base or zero pitch/bpp with nonzero size+dims would
-    /// hand the kernel an unmappable descriptor.
+    /// hand the kernel an unmappable descriptor. Geometry must also be
+    /// self-consistent (review #23): `pitch` must cover `width * bpp` and
+    /// `size` must cover `pitch * height`, else `None`.
     pub fn framebuffer_opt(&self) -> Option<Framebuffer> {
-        if self.is_valid()
+        let fb = self.framebuffer;
+        if !(self.is_valid()
             && self.has_framebuffer != 0
-            && self.framebuffer.base != 0
-            && self.framebuffer.size != 0
-            && self.framebuffer.width != 0
-            && self.framebuffer.height != 0
-            && self.framebuffer.pitch != 0
-            && self.framebuffer.bpp != 0
+            && fb.base != 0
+            && fb.size != 0
+            && fb.width != 0
+            && fb.height != 0
+            && fb.pitch != 0
+            && fb.bpp != 0)
         {
-            Some(self.framebuffer)
-        } else {
-            None
+            return None;
         }
+        let bytes_per_pixel = u64::from(fb.bpp).div_ceil(8);
+        let min_pitch = u64::from(fb.width).saturating_mul(bytes_per_pixel);
+        let min_size = u64::from(fb.pitch).saturating_mul(u64::from(fb.height));
+        if u64::from(fb.pitch) < min_pitch || fb.size < min_size {
+            return None;
+        }
+        Some(fb)
     }
 }
+
+// Compile-time guards (review #23): BootInfo is Clone-only by perf-first
+// rule. Re-adding `Copy` trips E0119 here (verified: !Copy compiles, Copy
+// conflicts), so the regression cannot slip in silently.
+trait _BootInfoMustNotBeCopy {}
+impl _BootInfoMustNotBeCopy for BootInfo {}
+impl<T: Copy> _BootInfoMustNotBeCopy for T {}
+
+// Exact layout guard: 16 header + 128*24 regions + 4 flag + 32 fb = 3124
+// payload, padded to 8-byte alignment = 3128. Tightens the old `> 2048`
+// check so accidental field growth/shrinkage fails fast (bump the literal +
+// BOOTINFO_VERSION on intentional change).
+const _: () = assert!(core::mem::size_of::<BootInfo>() == 3128);
 
 impl Default for BootInfo {
     fn default() -> Self {
@@ -345,25 +381,52 @@ mod tests {
         // Review #21 residual (b): invalid header reports 0, same as
         // valid-empty — locks the mask behavior so callers remember to
         // check is_valid() instead of relying on usable_bytes() alone.
+        // Review #23 adds try_usable_bytes(): None on corrupt, Some on valid.
         let mut info = BootInfo::new();
         assert!(info.push_region(MemoryRegion::new(0x1000, 4, MemoryKind::Usable)));
         assert_eq!(info.usable_bytes(), 4 * PAGE_SIZE);
+        assert_eq!(info.try_usable_bytes(), Some(4 * PAGE_SIZE));
         info.magic = 0;
         assert!(!info.is_valid());
         assert_eq!(info.memory_map().len(), 0);
         assert_eq!(info.usable_bytes(), 0);
+        assert_eq!(info.try_usable_bytes(), None);
+        // Valid-but-empty stays Some(0): distinct from corrupt None.
+        let empty = BootInfo::new();
+        assert_eq!(empty.try_usable_bytes(), Some(0));
+    }
+
+    #[test]
+    fn framebuffer_inconsistent_geometry_is_none() {
+        // Review #23: pitch must cover width*bpp, size must cover pitch*height.
+        let mut info = BootInfo::new();
+        info.has_framebuffer = 1;
+        let good = Framebuffer {
+            base: 0x8000_0000,
+            size: 8 * 1024 * 1024,
+            width: 1024,
+            height: 768,
+            pitch: 4096,
+            bpp: 32,
+        };
+        info.framebuffer = good;
+        assert_eq!(info.framebuffer_opt(), Some(good));
+        // Undersized: size smaller than pitch*height.
+        info.framebuffer.size = 4096 * 100;
+        assert_eq!(info.framebuffer_opt(), None);
+        // Narrow pitch: pitch smaller than width * bytes_per_pixel.
+        info.framebuffer = good;
+        info.framebuffer.pitch = 1000;
+        assert_eq!(info.framebuffer_opt(), None);
     }
 
     #[test]
     fn handoff_passes_by_reference_and_clones() {
         // BootInfo is Clone-only (no Copy): ~3 KB must not move by value.
-        // Regression guard (review #21 residual c): size assert locks the
-        // perf-first rule — re-adding `Copy` must stay a conscious review
-        // decision, not a silent one-liner. The line below must NOT compile
-        // (kept as a comment as the negative check):
-        // fn _must_not_be_copy<T: Copy>(_: T) {}
-        // _must_not_be_copy(BootInfo::new());
-        assert!(core::mem::size_of::<BootInfo>() > 2048);
+        // Regression guards (review #21 residual c, tightened review #23):
+        // exact size_of == 3128 plus a compile-time E0119 conflict guard at
+        // module scope (re-adding `Copy` fails the build, verified).
+        assert_eq!(core::mem::size_of::<BootInfo>(), 3128);
         fn accepts_ref(info: &BootInfo) -> bool {
             info.is_valid()
         }

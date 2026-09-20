@@ -361,3 +361,44 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Review #21 residuals (a)–(c) closed on the current tree.
   Next: S01 remainder — fill `BootInfo` from UEFI `GetMemoryMap` + serial
   print, then GOP; task #2 stays `active` until proven in `boot-uefi.ps1`.
+
+## S01 slice 3 hardening — review #23 follow-up (2026-09-20)
+
+- **Decision:** Close agent-b review #23 caveats in `crates/boot-info` without
+  starting the guest GetMemoryMap wire-up: (a) new
+  `try_usable_bytes() -> Option<u64>` (`None` on invalid header,
+  `Some(n)` on valid) with `usable_bytes()` delegating via `unwrap_or(0)`,
+  so new code can distinguish corrupt from valid-empty; (b) real Clone-only
+  guard — module-scope coherence-conflict trait (`_BootInfoMustNotBeCopy`
+  for `BootInfo` + blanket for all `T: Copy`, verified E0119 on Copy,
+  clean on !Copy) plus exact `size_of::<BootInfo>() == 3128` const assert
+  and unit assert (16 header + 3072 regions + 4 flag + 32 fb = 3124 payload,
+  padded to 3128); (c) `framebuffer_opt()` geometry check —
+  `pitch >= width*ceil(bpp/8)` and `size >= pitch*height` (saturating),
+  closing the pitch*height-vs-size gap. Three tests extended/added:
+  corrupt-vs-empty `try_usable_bytes`, inconsistent-geometry `None`, exact
+  size. Guest untouched; finding 4 (GetMemoryMap + GOP e2e) stays open.
+- **Why:** Review #23 concurred (a)–(b) closed but showed `usable_bytes`
+  still doc-only, the `Copy` check still a comment, the size guard still
+  loose (`> 2048` vs true 3128), and pitch*height-vs-size ungated — all
+  cheap to pin before the guest depends on the contract.
+- **Alternatives:** Add `static_assertions` dependency for `assert_not_impl`
+  (rejected: same E0119 guarantee with zero new deps via the coherence
+  trick); change `usable_bytes()` return to `Option` (rejected: breaks the
+  existing helper contract; new `try_` method keeps compat while giving
+  callers the real fix); defer to the GetMemoryMap slice (rejected: guest
+  slice should build on a locked contract, each residual is unit-test-only
+  with no QEMU risk).
+- **Expected:** `cargo test` 21/21, `fmt --check` clean, host + UEFI
+  `clippy -D warnings` clean, `boot-uefi.ps1` still PASS 333 B FOUND.
+- **Measured (2026-09-20, Win11):** `cargo test` 21/21 OK (11 boot-info +
+  4 marker unit + 4 harness + 2 version); `cargo fmt --check` clean;
+  `clippy --all-targets -D warnings` clean (host, after one `div_ceil`
+  fix for `manual_div_ceil`) and
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -D warnings`
+  clean; `boot-uefi.ps1` UEFI BOOT PASS, serial 333 bytes, marker FOUND,
+  guest 4096 bytes (guest source untouched, baseline unchanged).
+- **Final:** Review #23 residuals closed on the current tree (real guards,
+  no new deps). Next: S01 remainder — fill `BootInfo` from UEFI
+  `GetMemoryMap` + serial print, then GOP; task #2 stays `active` until
+  proven in `boot-uefi.ps1`.
