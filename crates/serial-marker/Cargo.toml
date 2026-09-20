@@ -1,0 +1,9 @@
+[package]
+name = "baseos-serial-marker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "baseos_serial_marker"
+path = "src/lib.rs"

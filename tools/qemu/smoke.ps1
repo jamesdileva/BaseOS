@@ -4,15 +4,21 @@
   S00 QEMU smoke test: verifies QEMU launches and stays up; captures
   serial output to a file; reports OVMF/EDK2 firmware presence explicitly.
   Exits 0 on PASS, non-zero on FAIL (no false-positive quick-exit pass).
-  Full UEFI-OS boot arrives in S01. Pass -RequireOvmf when firmware
-  is mandatory (S01 entry); without it a missing OVMF is advisory only.
+   Full UEFI-OS boot arrives in S01. Pass -RequireOvmf when firmware
+   is mandatory (S01 entry); without it a missing OVMF is advisory only.
+   Pass -ExpectSerialMarker to assert the S01 guest marker
+   (BASEOS-S01-BOOT-MARKER, see crates/serial-marker/src/lib.rs) is present
+   in the serial log — opt-in until the UEFI guest boots, so the default
+   SeaBIOS path stays green while the 0-byte-serial gap is closable on demand.
 
-  Addresses agent-b review #4 findings 1 and 5, review #6 finding 1.
+   Addresses agent-b review #4 findings 1 and 5, review #6 finding 1,
+   review #12 / TASK #13 (S01 serial proof).
 #>
 param(
   [int]$TimeoutSec = 5,
   [string]$LogDir = "target",
-  [switch]$RequireOvmf
+  [switch]$RequireOvmf,
+  [switch]$ExpectSerialMarker
 )
 $ErrorActionPreference = "Stop"
 
@@ -84,6 +90,23 @@ if (-not $proc.HasExited) {
   if (Test-Path -LiteralPath $serialLog) { $size = (Get-Item -LiteralPath $serialLog).Length }
   Write-Output "QEMU stayed running for ${TimeoutSec}s (killed after smoke window)"
   Write-Output "Serial log: $serialLog (${size} bytes)"
+  if ($ExpectSerialMarker) {
+    # Must match crates/serial-marker/src/lib.rs::SERIAL_MARKER (see also
+    # tests/serial_marker.rs sync test); literal here because PS cannot
+    # import the Rust const without a build step.
+    $marker = "BASEOS-S01-BOOT-MARKER"
+    $serialText = ""
+    if (Test-Path -LiteralPath $serialLog) {
+      $serialText = (Get-Content -LiteralPath $serialLog -Raw -ErrorAction SilentlyContinue)
+    }
+    if ($serialText -and $serialText.Contains($marker)) {
+      Write-Output "Serial marker: FOUND ($marker)"
+    } else {
+      Write-Output "Serial marker: MISSING ($marker not in $serialLog, ${size} bytes) [-ExpectSerialMarker asserted]"
+      Write-Output "SMOKE FAIL"
+      exit 1
+    }
+  }
   Write-Output "SMOKE PASS"
   exit 0
 } else {

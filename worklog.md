@@ -124,3 +124,44 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Review #10 risk (3) closed on the current script version;
   header nit fixed. S00 done. Next: S01 UEFI guest serial-marker +
   `tests/` harness (risks 1+2); S02+ blocked until S01 proves them.
+
+## S01 slice 1 — serial-marker contract + tests/ harness + opt-in smoke assert (2026-09-20)
+
+- **Decision:** Land S01's host-side half first as one committable slice:
+  (a) new `crates/serial-marker` defining the fixed contract
+  `BASEOS-S01-BOOT-MARKER` with `write_marker` (byte-callback, so the
+  future UEFI guest's COM1 writer reuses it) and `contains_marker[_bytes]`
+  log parsers, core-only / `no_std` outside `cfg(test)`; (b) canonical
+  `tests/serial_marker.rs` harness (marker-path emission, 0-byte log parses
+  as no-guest, guest capture parses as booted, smoke.ps1/marker sync check),
+  executed by `cargo test` via a one-line `include!` wrapper in
+  `crates/serial-marker/tests/` (virtual workspace root owns no test target);
+  (c) `smoke.ps1 -ExpectSerialMarker` opt-in assert (exit 1 on absent marker).
+  Real `.efi` guest + ESP/QEMU-OVMF boot is slice 2, not this commit.
+- **Why:** TASK #13's full slice (UEFI guest + enforced smoke + harness) is
+  too big for one safe cycle; the contract + assert gate are independently
+  committable and keep every existing check green while making the 0-byte
+  gap closable on demand.
+- **Alternatives:** Full UEFI guest (`.efi` + FAT ESP + OVMF pflash boot)
+  in one commit (rejected: registry/`uefi`-crate build, image tooling, and
+  Windows QEMU pflash flags are each unproven here — high single-cycle
+  risk); enforce marker unconditionally in smoke now (rejected: SeaBIOS
+  path has no guest yet, would turn current PASS red with no new signal).
+- **Expected:** `cargo test` 10/10 (2 version + 4 marker unit + 4 harness),
+  `fmt --check` clean, `clippy -D warnings` clean, `check-env -Check` OK,
+  `smoke -RequireOvmf` PASS (default, marker not asserted), `smoke
+  -RequireOvmf -ExpectSerialMarker` FAIL exit 1 with explicit MISSING line.
+- **Measured (2026-09-20, Win11):** `cargo test` 10/10 OK (4+4+2, 0 failed);
+  `cargo fmt --check` clean (one fmt fix applied to a long assert line;
+  `rustfmt`/`clippy` components added to the local pinned toolchain only,
+  repo pin untouched); `cargo clippy --all-targets -- -D warnings` clean;
+  `check-env -Check` OK (rustc/cargo 1.98.0, `x86_64-unknown-uefi` present);
+  `smoke -RequireOvmf` SMOKE PASS exit 0, serial 0 bytes (unchanged
+  default); `smoke -RequireOvmf -ExpectSerialMarker` SMOKE FAIL exit 1,
+  `Serial marker: MISSING (… 0 bytes) [-ExpectSerialMarker asserted]`;
+  positive-branch `.Contains` logic sanity-checked true on a marker-bearing
+  string (end-to-end FOUND awaits the slice-2 guest).
+- **Final:** Slice 1 committed; `tests/` gap closed (was crates-unit-only
+  2/2), marker assert gate proven fail-loud. Next (slice 2): minimal UEFI
+  guest writing the marker via `write_marker`, ESP image + OVMF QEMU boot,
+  then flip S01 smoke to pass `-ExpectSerialMarker`.
