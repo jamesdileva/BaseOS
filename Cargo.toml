@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/version", "crates/serial-marker", "crates/boot-uefi"]
+members = ["crates/version", "crates/serial-marker", "crates/boot-info", "crates/boot-uefi"]
 # S01 slice 2: the UEFI guest is a no_main/no_std firmware binary that only
 # builds for --target x86_64-unknown-uefi; keep it out of default host
-# `cargo build/test/clippy` so those stay green, and check the guest via
-# `cargo build|clippy -p baseos-boot-uefi --target x86_64-unknown-uefi`.
-default-members = ["crates/version", "crates/serial-marker"]
+# cargo build/test/clippy so those stay green, and check the guest via
+# cargo build|clippy -p baseos-boot-uefi --target x86_64-unknown-uefi.
+default-members = ["crates/version", "crates/serial-marker", "crates/boot-info"]
 
 [workspace.package]
 version = "0.0.0"
@@ -15,3 +15,4 @@ license = "MIT OR Apache-2.0"
 [workspace.lints.rust]
 unsafe_code = "warn"
 missing_docs = "warn"
+

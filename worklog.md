@@ -264,3 +264,31 @@ Format per entry (per `implementation-guide.md` §31):
   handoff struct (+ framebuffer discovery) — one committable slice at a
   time, `boot-uefi.ps1` stays the proof vehicle; suggested first slice is
   UEFI memory-map retrieval printed to serial.
+
+## S01 slice 3 � boot-info handoff struct contract (2026-09-20)
+
+- **Decision:** Land the S01-remainder handoff half as one committable slice:
+  new no_std crates/boot-info (BootInfo magic/version header, inline
+  MemoryRegion map up to 128 entries, optional Framebuffer descriptor,
+  is_valid plus push_region plus usable_bytes plus framebuffer_opt helpers,
+  saturating address math), wired into workspace members and default-members,
+  with 6 host unit tests. UEFI GetMemoryMap and GOP wire-up stays for later
+  slices; boot-uefi guest untouched this cycle.
+- **Why:** Roadmap S01 requires memory-map retrieval plus kernel handoff
+  structure; the struct contract is independently committable and testable
+  on the host, keeping the guest/QEMU proof vehicle stable while the next
+  slice fills the map from real boot services.
+- **Alternatives:** Wire the guest to boot services in the same commit
+  (rejected: raw SystemTable parsing is unproven here and doubles
+  single-cycle risk); heap-allocated map with Vec (rejected: no allocator
+  in early boot, inline array keeps the handoff usable pre-heap).
+- **Expected:** cargo test 16/16, fmt clean, host plus UEFI clippy clean,
+  boot-uefi.ps1 still UEFI BOOT PASS, smoke default untouched.
+- **Measured (2026-09-20, Win11):** cargo test 16/16 OK (6 boot-info plus
+  4 marker unit plus 4 harness plus 2 version); cargo fmt clean after one
+  auto-format; clippy host clean and clippy UEFI guest clean;
+  boot-uefi.ps1 PASS exit 0, serial 333 bytes, marker FOUND, guest 4096
+  bytes (same as slice-2 baseline, guest source untouched).
+- **Final:** Handoff contract pinned and tested. Next: fill BootInfo from
+  UEFI GetMemoryMap (plus boot-info print to serial) and assert it in
+  boot-uefi.ps1; then GOP framebuffer discovery.
