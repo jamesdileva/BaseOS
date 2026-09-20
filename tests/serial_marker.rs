@@ -9,6 +9,11 @@
 
 use baseos_serial_marker::{contains_marker, contains_marker_bytes, marker, write_marker};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-process sequence so parallel same-length cases never share a name
+/// (review #15 finding 2: pid+len alone can collide across tests/runs).
+static LOG_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Collects the marker path output the way a serial driver would consume it.
 #[test]
@@ -28,11 +33,11 @@ fn marker_path_emits_contract_bytes() {
 fn empty_serial_log_parses_as_no_guest() {
     let log = write_temp_log(b"");
     let bytes = std::fs::read(&log).unwrap();
+    std::fs::remove_file(&log).ok();
     assert!(
         !contains_marker_bytes(&bytes),
         "empty serial log must not contain the marker"
     );
-    std::fs::remove_file(&log).ok();
 }
 
 /// A guest-written capture must parse as booted, via both bytes and str APIs.
@@ -46,10 +51,10 @@ fn guest_serial_log_parses_as_booted() {
     .unwrap();
     let log = write_temp_log(&capture);
     let bytes = std::fs::read(&log).unwrap();
+    std::fs::remove_file(&log).ok();
     assert!(contains_marker_bytes(&bytes));
     let text = String::from_utf8_lossy(&bytes);
     assert!(contains_marker(&text));
-    std::fs::remove_file(&log).ok();
 }
 
 /// `smoke.ps1 -ExpectSerialMarker` greps for the same literal; fail here if
@@ -71,9 +76,12 @@ fn smoke_script_assert_stays_in_sync_with_contract() {
 }
 
 fn write_temp_log(contents: &[u8]) -> PathBuf {
+    let seq = LOG_SEQ.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "baseos-s01-serial-{}-{}.log",
+        "baseos-s01-serial-{}-{:?}-{}-{}.log",
         std::process::id(),
+        std::thread::current().id(),
+        seq,
         contents.len()
     ));
     std::fs::write(&path, contents).unwrap();

@@ -1,0 +1,148 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+  S01 UEFI guest boot: builds baseos-boot-uefi for x86_64-unknown-uefi,
+  stages it as EFI/BOOT/BOOTX64.EFI on a QEMU virtual-FAT ESP, boots OVMF
+  with serial-to-file capture, and asserts the S01 guest marker
+  (BASEOS-S01-BOOT-MARKER, see crates/serial-marker/src/lib.rs) is present.
+  Exits 0 on PASS, non-zero on FAIL (no false-positive passes).
+
+  Unlike tools/qemu/smoke.ps1 (SeaBIOS, no guest), the marker assert here is
+  REQUIRED: a missing marker means the guest never ran. OVMF firmware is
+  likewise required (fail fast when absent).
+#>
+param(
+  [int]$TimeoutSec = 20,
+  [string]$LogDir = "target"
+)
+$ErrorActionPreference = "Stop"
+
+Write-Output "=== BaseOS UEFI guest boot (S01 slice 2) ==="
+
+# --- 1. Build the guest (debug; .efi artifact, never committed) ---
+cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
+if ($LASTEXITCODE -ne 0) {
+  Write-Output "GUEST BUILD FAIL (cargo build exit $LASTEXITCODE)"
+  exit 1
+}
+$efi = Join-Path $PSScriptRoot "../../target/x86_64-unknown-uefi/debug/bootx64.efi"
+$efi = [System.IO.Path]::GetFullPath($efi)
+if (-not (Test-Path -LiteralPath $efi)) {
+  Write-Output "GUEST BUILD FAIL (missing artifact $efi)"
+  exit 1
+}
+Write-Output ("Guest: " + $efi + " (" + (Get-Item -LiteralPath $efi).Length + " bytes)")
+
+# --- 2. Stage the ESP (gitignored target/, local-only) ---
+$esp = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../../target/esp"))
+$bootdir = Join-Path $esp "EFI/BOOT"
+New-Item -ItemType Directory -Force -Path $bootdir | Out-Null
+Copy-Item -LiteralPath $efi -Destination (Join-Path $bootdir "BOOTX64.EFI") -Force
+Write-Output "ESP staged at $bootdir\BOOTX64.EFI"
+
+# --- 3. OVMF/EDK2 firmware (required for S01: fail fast when absent) ---
+function Find-OvmfCode {
+  $candidates = @()
+  if ($env:OVMF_CODE) { $candidates += $env:OVMF_CODE }
+  try {
+    $qemuExe = (Get-Command "qemu-system-x86_64" -ErrorAction Stop).Source
+    $qemuBin = Split-Path $qemuExe
+    $qemuShare = Join-Path (Split-Path $qemuBin) "share/qemu"
+    $candidates += (Join-Path $qemuShare "edk2-x86_64-code.fd")
+    $candidates += (Join-Path $qemuShare "OVMF_CODE.fd")
+  } catch { }
+  $candidates += @(
+    "/usr/share/OVMF/OVMF_CODE.fd",
+    "/usr/share/edk2/x86_64/OVMF_CODE.fd",
+    "/usr/share/qemu/edk2-x86_64-code.fd",
+    "C:\Program Files\qemu\share\edk2-x86_64-code.fd"
+  )
+  foreach ($c in $candidates) {
+    if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+  }
+  return $null
+}
+
+$ovmf = Find-OvmfCode
+if (-not $ovmf) {
+  Write-Output "OVMF: MISSING (S01 UEFI boot requires edk2-x86_64-code.fd; set OVMF_CODE env var)"
+  exit 1
+}
+Write-Output "OVMF: FOUND at $ovmf"
+
+# --- 4. Serial-to-file capture setup (log dir first: vars live here too) ---
+$logAbs = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../../$LogDir"))
+New-Item -ItemType Directory -Force -Path $logAbs | Out-Null
+$serialLog = Join-Path $logAbs "qemu-uefi-serial.log"
+$stdoutLog = Join-Path $logAbs "qemu-uefi-stdout.log"
+foreach ($f in @($serialLog, $stdoutLog)) {
+  if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force }
+}
+New-Item -ItemType File -Force -Path $serialLog | Out-Null
+
+# --- 5. OVMF vars store (writable NVRAM, gitignored target/, local-only) ---
+# OVMF runs from split flash images: code (readonly) + vars (writable).
+# A blank 528 KiB store is enough — EDK2 reformats it on first boot.
+$varsFd = Join-Path $logAbs "ovmf-vars.fd"
+if (-not (Test-Path -LiteralPath $varsFd)) {
+  [System.IO.File]::WriteAllBytes($varsFd, [byte[]]::new(540672))
+}
+Write-Output "OVMF vars: $varsFd"
+
+# QEMU virtual-FAT drive: the ESP directory is exposed as a disk, so no
+# FAT-image tooling (mtools) is needed on the Windows host. OVMF boots via
+# pflash (its standard path: code readonly + vars writable) — `-bios` cannot
+# load the 3.5 MB code image ("could not load PC BIOS"). Forward slashes
+# keep backslashes (and the drive-letter colon) unambiguous to QEMU's option
+# parser.
+$espFat = $esp -replace "\\", "/"
+$ovmfQemu = $ovmf -replace "\\", "/"
+$varsQemu = $varsFd -replace "\\", "/"
+$serialQemu = $serialLog -replace "\\", "/"
+$qemuArgs = @(
+  "-display", "none",
+  "-m", "256",
+  "-drive", ("if=pflash,format=raw,unit=0,file=" + $ovmfQemu + ",readonly=on"),
+  "-drive", ("if=pflash,format=raw,unit=1,file=" + $varsQemu),
+  "-drive", ("file=fat:rw:" + $espFat + ",format=raw"),
+  "-serial", ("file:" + $serialQemu),
+  "-no-reboot"
+)
+Write-Output ("QEMU args: qemu-system-x86_64 " + ($qemuArgs -join " "))
+
+$proc = Start-Process -FilePath "qemu-system-x86_64" -ArgumentList $qemuArgs `
+  -PassThru -NoNewWindow `
+  -RedirectStandardOutput $stdoutLog -RedirectStandardError ($stdoutLog + ".err")
+Start-Sleep -Seconds $TimeoutSec
+
+if (-not $proc.HasExited) {
+  Stop-Process -Id $proc.Id -Force
+  $proc.WaitForExit(5000) | Out-Null
+}
+
+$size = 0
+if (Test-Path -LiteralPath $serialLog) { $size = (Get-Item -LiteralPath $serialLog).Length }
+Write-Output "Serial log: $serialLog (${size} bytes)"
+
+# Must match crates/serial-marker/src/lib.rs::SERIAL_MARKER (see also
+# tests/serial_marker.rs sync test); literal here because PS cannot
+# import the Rust const without a build step.
+$marker = "BASEOS-S01-BOOT-MARKER"
+$serialText = ""
+if (Test-Path -LiteralPath $serialLog) {
+  $serialText = (Get-Content -LiteralPath $serialLog -Raw -ErrorAction SilentlyContinue)
+}
+if ($serialText -and $serialText.Contains($marker)) {
+  Write-Output "Serial marker: FOUND ($marker)"
+  Write-Output "UEFI BOOT PASS"
+  exit 0
+} else {
+  Write-Output "Serial marker: MISSING ($marker not in $serialLog, ${size} bytes)"
+  if (Test-Path -LiteralPath $stdoutLog) {
+    $tail = (Get-Content -LiteralPath $stdoutLog -Raw -ErrorAction SilentlyContinue)
+    if ($tail -and $tail.Length -gt 2000) { $tail = $tail.Substring(0, 2000) }
+    if ($tail) { Write-Output ("--- qemu stdout (truncated) ---`n" + $tail) }
+  }
+  Write-Output "UEFI BOOT FAIL"
+  exit 1
+}

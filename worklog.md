@@ -165,3 +165,60 @@ Format per entry (per `implementation-guide.md` §31):
   2/2), marker assert gate proven fail-loud. Next (slice 2): minimal UEFI
   guest writing the marker via `write_marker`, ESP image + OVMF QEMU boot,
   then flip S01 smoke to pass `-ExpectSerialMarker`.
+
+## S01 slice 2 — UEFI guest boots under OVMF, marker FOUND end-to-end (2026-09-20)
+
+- **Decision:** Land S01's guest half as one committable slice:
+  (a) new `crates/boot-uefi` (`bootx64` bin): dependency-free `no_std`
+  UEFI app (`efi_main`, no boot-services calls yet) that inits COM1
+  (16550A 115200 8N1) and emits the contract via
+  `baseos-serial-marker::write_marker` (single-sourced bytes), then parks
+  the CPU with `hlt`; unsafe (port I/O, `hlt`) isolated behind documented
+  `uart_init` / `com1_write_byte` wrappers with a crate-level
+  `#![allow(unsafe_code)]` justification per `docs/coding-conventions.md`;
+  (b) new `tools/qemu/boot-uefi.ps1`: builds the guest for
+  `x86_64-unknown-uefi`, stages `target/esp/EFI/BOOT/BOOTX64.EFI` (QEMU
+  virtual-FAT ESP — no mtools needed), boots OVMF from split pflash
+  (code readonly + blank 528 KiB vars store EDK2 reformats, both
+  gitignored `target/` local-only), captures COM1 to
+  `target/qemu-uefi-serial.log`, and asserts marker FOUND (required, not
+  opt-in); (c) `Cargo.toml` `default-members` keeps the `no_main` guest
+  out of default host `cargo build/test/clippy` (checked explicitly with
+  `--target x86_64-unknown-uefi`); guest test-build uses the std harness
+  (`cfg_attr(not(test), no_std/no_main)`, panic handler `cfg(not(test))`);
+  (d) review #15 finding 2 fix in `tests/serial_marker.rs`: temp names now
+  pid+thread-id+atomic-seq (no pid+len collisions), files removed before
+  asserts (cleanup on failure too). `smoke.ps1` default intentionally
+  unchanged (SeaBIOS path stays green; S01 proof = `boot-uefi.ps1`).
+- **Why:** Closes the review #15 BLOCKER (FOUND branch end-to-end
+  unproven): the marker now travels guest-COM1 → QEMU serial file →
+  required assert, reusing the slice-1 contract on both ends.
+- **Alternatives:** `uefi`-crate guest with Serial I/O Protocol
+  (rejected: registry/API risk, heavier; raw COM1 is sufficient for the
+  serial proof and keeps the slice dependency-free); `-bios <code.fd>`
+  boot (rejected: QEMU refuses the 3.5 MB image — measured "could not
+  load PC BIOS" on backslash and forward-slash paths — pflash is OVMF's
+  standard path); real FAT image via mtools (rejected: no Windows
+  tooling; vvfat exposes the staged dir directly); enforcing the marker
+  in `smoke.ps1` default (rejected: SeaBIOS path has no guest by design).
+- **Expected:** `cargo test` 10/10, `fmt --check` clean, host + UEFI
+  `clippy -D warnings` clean, `check-env -Check` OK, `boot-uefi.ps1`
+  UEFI BOOT PASS exit 0 with marker FOUND, `smoke -RequireOvmf` still
+  PASS (unchanged default).
+- **Measured (2026-09-20, Win11):** `cargo test` 10/10 OK (4 unit + 4
+  harness + 2 version; guest bin 0 tests); `fmt --check` clean;
+  `clippy --all-targets -D warnings` clean (host) and
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -D warnings`
+  clean; `check-env -Check` OK (1.98.0, uefi target present);
+  `boot-uefi.ps1` PASS exit 0 on two consecutive runs (serial 333 bytes
+  both, `BdsDxe: starting Boot0001 ...` then `BASEOS-S01-BOOT-MARKER`;
+  guest `bootx64.efi` 4096 bytes, valid PE32+ subsystem 10/EFI_APP);
+  `smoke -RequireOvmf` SMOKE PASS exit 0, serial 0 bytes (SeaBIOS path
+  untouched). Debug path that proved it: manual pflash run showed OVMF
+  console + marker as the serial tail.
+- **Final:** S01 FOUND branch proven end-to-end; slice 2 committable.
+  Next: S01 remainder (boot-info print, memory map, handoff structure
+  per roadmap) or close S01 per Definition of Done review; task #1
+  ready to flip to `done` once agent-b concurs the S01 verification
+  bar (QEMU UEFI boot succeeds, boot info printed, memory map visible,
+  failures diagnosable) is met by slices 1+2 or needs the remainder.
