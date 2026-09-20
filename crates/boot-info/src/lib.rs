@@ -177,6 +177,11 @@ impl BootInfo {
     }
 
     /// Total usable bytes across Usable regions (saturating).
+    ///
+    /// Returns 0 for an invalid header (via [`BootInfo::memory_map`]) exactly
+    /// like a valid-but-empty map — callers MUST check [`BootInfo::is_valid`]
+    /// first; a bare `usable_bytes() == 0` check cannot distinguish
+    /// "zero usable RAM" from "corrupt header" (review #21 residual b).
     pub fn usable_bytes(&self) -> u64 {
         self.memory_map()
             .iter()
@@ -186,15 +191,20 @@ impl BootInfo {
 
     /// Framebuffer when present and sane.
     ///
-    /// A non-zero flag alone is not enough (review #19 finding 2): the
-    /// descriptor must also carry a non-zero size and dimensions, otherwise
-    /// `None` (absent/invalid) is returned.
+    /// A non-zero flag alone is not enough (review #19 finding 2, review #21
+    /// residual a): the descriptor must also carry a non-zero base, size,
+    /// dimensions, pitch, and bpp, otherwise `None` (absent/invalid) is
+    /// returned. A zero base or zero pitch/bpp with nonzero size+dims would
+    /// hand the kernel an unmappable descriptor.
     pub fn framebuffer_opt(&self) -> Option<Framebuffer> {
         if self.is_valid()
             && self.has_framebuffer != 0
+            && self.framebuffer.base != 0
             && self.framebuffer.size != 0
             && self.framebuffer.width != 0
             && self.framebuffer.height != 0
+            && self.framebuffer.pitch != 0
+            && self.framebuffer.bpp != 0
         {
             Some(self.framebuffer)
         } else {
@@ -305,8 +315,55 @@ mod tests {
     }
 
     #[test]
+    fn framebuffer_zero_base_pitch_or_bpp_is_none() {
+        // Review #21 residual (a): size+dims nonzero is not enough — a
+        // zero base or zero pitch/bpp would hand the kernel a bad descriptor.
+        let mut info = BootInfo::new();
+        info.has_framebuffer = 1;
+        let good = Framebuffer {
+            base: 0x8000_0000,
+            size: 8 * 1024 * 1024,
+            width: 1024,
+            height: 768,
+            pitch: 4096,
+            bpp: 32,
+        };
+        info.framebuffer = good;
+        assert_eq!(info.framebuffer_opt(), Some(good));
+        info.framebuffer.base = 0;
+        assert_eq!(info.framebuffer_opt(), None);
+        info.framebuffer = good;
+        info.framebuffer.pitch = 0;
+        assert_eq!(info.framebuffer_opt(), None);
+        info.framebuffer = good;
+        info.framebuffer.bpp = 0;
+        assert_eq!(info.framebuffer_opt(), None);
+    }
+
+    #[test]
+    fn corrupt_header_masks_usable_bytes_to_zero() {
+        // Review #21 residual (b): invalid header reports 0, same as
+        // valid-empty — locks the mask behavior so callers remember to
+        // check is_valid() instead of relying on usable_bytes() alone.
+        let mut info = BootInfo::new();
+        assert!(info.push_region(MemoryRegion::new(0x1000, 4, MemoryKind::Usable)));
+        assert_eq!(info.usable_bytes(), 4 * PAGE_SIZE);
+        info.magic = 0;
+        assert!(!info.is_valid());
+        assert_eq!(info.memory_map().len(), 0);
+        assert_eq!(info.usable_bytes(), 0);
+    }
+
+    #[test]
     fn handoff_passes_by_reference_and_clones() {
         // BootInfo is Clone-only (no Copy): ~3 KB must not move by value.
+        // Regression guard (review #21 residual c): size assert locks the
+        // perf-first rule — re-adding `Copy` must stay a conscious review
+        // decision, not a silent one-liner. The line below must NOT compile
+        // (kept as a comment as the negative check):
+        // fn _must_not_be_copy<T: Copy>(_: T) {}
+        // _must_not_be_copy(BootInfo::new());
+        assert!(core::mem::size_of::<BootInfo>() > 2048);
         fn accepts_ref(info: &BootInfo) -> bool {
             info.is_valid()
         }

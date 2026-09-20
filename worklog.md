@@ -326,3 +326,38 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Findings 1–3 closed on the current tree. Next: S01 remainder —
   fill `BootInfo` from UEFI `GetMemoryMap` + serial print, then GOP;
   task #2 stays `active` until proven in `boot-uefi.ps1`.
+
+## S01 slice 3 hardening — review #21 residuals (2026-09-20)
+
+- **Decision:** Close agent-b review #21 residual risks in `crates/boot-info`
+  without starting the guest GetMemoryMap wire-up: (a) `framebuffer_opt()`
+  now also requires `base != 0 && pitch != 0 && bpp != 0` (zero-base or
+  zero-pitch/bpp with nonzero size+dims returns `None`); (b) `usable_bytes()`
+  documents it returns 0 on an invalid header exactly like valid-empty, so
+  callers MUST check `is_valid()` first (empty/zero alone masks corruption);
+  (c) `handoff_passes_by_reference_and_clones` gains a
+  `size_of::<BootInfo>() > 2048` regression guard plus a commented-out
+  negative `Copy` check (`_must_not_be_copy(BootInfo::new())` must NOT
+  compile) to lock the Clone-only perf-first rule. Two new tests:
+  zero-base/pitch/bpp → `None`, corrupt-header masks `usable_bytes()` to 0.
+  Guest untouched; finding 4 (GetMemoryMap + GOP end-to-end) stays open.
+- **Why:** Review #21 concurred findings 1–3 closed in 69cb0d6 but showed a
+  degenerate FB (base/pitch/bpp zero) still passes, `usable_bytes()` inherits
+  the empty-on-invalid mask, and Clone-only has no guard against a silent
+  `Copy` re-add — all cheap to pin before the guest depends on the contract.
+- **Alternatives:** Defer to the GetMemoryMap slice (rejected: the guest
+  slice should build on a locked contract, and each residual is a unit-test
+  + doc change with no QEMU risk); panic/Option-return on invalid
+  `usable_bytes()` (rejected: changes the helper contract mid-stream; doc +
+  locked mask behavior keeps valid-empty working while warning callers).
+- **Expected:** `cargo test` 20/20, `fmt --check` clean, host + UEFI
+  `clippy -D warnings` clean, `boot-uefi.ps1` still PASS 333 B FOUND.
+- **Measured (2026-09-20, Win11):** `cargo test` 20/20 OK (10 boot-info +
+  4 marker unit + 4 harness + 2 version); `cargo fmt --check` clean
+  (exit 0); `clippy --all-targets -D warnings` clean (host) and
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -D warnings`
+  clean; `boot-uefi.ps1` UEFI BOOT PASS, serial 333 bytes, marker FOUND,
+  guest 4096 bytes (guest source untouched, baseline unchanged).
+- **Final:** Review #21 residuals (a)–(c) closed on the current tree.
+  Next: S01 remainder — fill `BootInfo` from UEFI `GetMemoryMap` + serial
+  print, then GOP; task #2 stays `active` until proven in `boot-uefi.ps1`.
