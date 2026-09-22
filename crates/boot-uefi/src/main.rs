@@ -40,6 +40,11 @@ const LSR_THR_EMPTY: u8 = 0x20;
 /// (header 24 + vendor 8 + revision 4 + pad 4 + six handles/pointers 48 +
 /// `RuntimeServices` 8 = 96).
 const SYSTEM_TABLE_BOOT_SERVICES_OFF: usize = 96;
+/// Expected `EFI_TABLE_HEADER.Signature` for the system table (`"IBI SYST"`
+/// little-endian: 0x5453595320494249). Checked before any offset deref so a
+/// stale/non-UEFI pointer fails closed instead of mis-parsing (review #29
+/// risk 3).
+const SYSTEM_TABLE_SIGNATURE: u64 = 0x5453_5953_2049_4249;
 /// Byte offset of `GetMemoryMap` in `EFI_BOOT_SERVICES`
 /// (header 24 + `RaiseTPL`/`RestoreTPL`/`AllocatePages`/`FreePages` 32 = 56).
 const BOOT_SERVICES_GET_MEMORY_MAP_OFF: usize = 56;
@@ -128,12 +133,17 @@ type GetMemoryMapFn = unsafe extern "efiapi" fn(
 /// Load the `GetMemoryMap` entry point from the raw system table.
 ///
 /// # Safety
-/// `system_table` must point to a live `EFI_SYSTEM_TABLE`; reads the
-/// `BootServices` pointer at the fixed x86-64 offset, then the
-/// `GetMemoryMap` slot at its fixed offset. Returns `None` on null links
-/// instead of dereferencing them.
+/// `system_table` must point to a live `EFI_SYSTEM_TABLE`; validates the
+/// header signature, then reads the `BootServices` pointer at the fixed
+/// x86-64 offset, then the `GetMemoryMap` slot at its fixed offset.
+/// Returns `None` on null links or a signature mismatch instead of
+/// dereferencing them.
 unsafe fn load_get_memory_map(system_table: *const u8) -> Option<GetMemoryMapFn> {
     if system_table.is_null() {
+        return None;
+    }
+    let sig = (system_table as *const u64).read_unaligned();
+    if sig != SYSTEM_TABLE_SIGNATURE {
         return None;
     }
     let boot_services = (system_table.add(SYSTEM_TABLE_BOOT_SERVICES_OFF) as *const *const u8)
@@ -152,17 +162,30 @@ unsafe fn load_get_memory_map(system_table: *const u8) -> Option<GetMemoryMapFn>
 
 /// Call `GetMemoryMap` into the static buffer and fill `info`.
 ///
-/// Returns `(ok, status, entries)`: `ok` is true only when the firmware
-/// call succeeded; `status` is the raw `EFI_STATUS`; `entries` is the
-/// number of regions pushed (0 on failure). Never panics; a failure still
-/// leaves `info` valid-but-empty so the serial summary stays diagnosable.
+/// Returns `(ok, status, pushed, total)`: `ok` is true only when the
+/// firmware call succeeded; `status` is the raw `EFI_STATUS`; `pushed` is
+/// the number of regions stored (0 on failure); `total` is the firmware
+/// descriptor count (`map_size / desc_size`, 0 on failure). `pushed < total`
+/// means the 128-entry inline map truncated the firmware map — reported on
+/// serial as `truncated=1` so e2e fails loudly (review #29 risk 1). Never
+/// panics; a failure still leaves `info` valid-but-empty so the serial
+/// summary stays diagnosable.
+///
+/// Deferred (review #29 risk 2, candidate S03): single-shot 16 KiB call
+/// with no `BUFFER_TOO_SMALL` retry. Fine for QEMU (~100 entries) but a
+/// larger bare-metal map fails loudly with `(false, status, 0, 0)` and no
+/// recovery path — recorded here so it is not mistaken for a complete
+/// driver.
 ///
 /// # Safety
 /// Must run pre-`ExitBootServices` on the boot thread with `system_table`
 /// live. Exclusively borrows the static buffer for the call duration.
-unsafe fn fill_boot_info(system_table: *const u8, info: &mut BootInfo) -> (bool, usize, usize) {
+unsafe fn fill_boot_info(
+    system_table: *const u8,
+    info: &mut BootInfo,
+) -> (bool, usize, usize, usize) {
     let Some(get_map) = load_get_memory_map(system_table) else {
-        return (false, usize::MAX, 0);
+        return (false, usize::MAX, 0, 0);
     };
     let buf = &mut *core::ptr::addr_of_mut!(MEMMAP_BUF);
     let mut map_size = buf.len();
@@ -177,22 +200,27 @@ unsafe fn fill_boot_info(system_table: *const u8, info: &mut BootInfo) -> (bool,
         &mut desc_version,
     );
     if status != 0 || desc_size < 40 || map_size > buf.len() {
-        return (false, status, 0);
+        return (false, status, 0, 0);
     }
+    let total = map_size / desc_size;
     let pushed = info.fill_from_raw_descriptors(&buf[..map_size], desc_size);
-    (true, status, pushed)
+    (true, status, pushed, total)
 }
 
 /// Emit the one-line `MEMMAP` diagnostic after the two-line boot summary:
-/// `MEMMAP ok=<0|1> status=<0x...> entries=<n>`.
-fn write_memmap_line(ok: bool, status: usize, entries: usize) {
+/// `MEMMAP ok=<0|1> status=<0x...> entries=<pushed>/<total> truncated=<0|1>`.
+fn write_memmap_line(ok: bool, status: usize, pushed: usize, total: usize) {
     let mut emit = com1_emit;
     let _ = write_str(&mut emit, "MEMMAP ok=");
     let _ = write_u64_dec(&mut emit, u64::from(ok));
     let _ = write_str(&mut emit, " status=");
     let _ = write_u64_hex(&mut emit, status as u64);
     let _ = write_str(&mut emit, " entries=");
-    let _ = write_u64_dec(&mut emit, entries as u64);
+    let _ = write_u64_dec(&mut emit, pushed as u64);
+    let _ = write_str(&mut emit, "/");
+    let _ = write_u64_dec(&mut emit, total as u64);
+    let _ = write_str(&mut emit, " truncated=");
+    let _ = write_u64_dec(&mut emit, u64::from(pushed < total));
     let _ = write_str(&mut emit, "\n");
 }
 
@@ -214,10 +242,10 @@ pub extern "efiapi" fn efi_main(_image_handle: *const (), system_table: *const u
         })
         .unwrap();
         let mut info = BootInfo::new();
-        let (ok, status, entries) = fill_boot_info(system_table, &mut info);
+        let (ok, status, pushed, total) = fill_boot_info(system_table, &mut info);
         let mut emit = com1_emit;
         write_boot_summary::<Infallible>(&info, &mut emit).unwrap();
-        write_memmap_line(ok, status, entries);
+        write_memmap_line(ok, status, pushed, total);
         loop {
             asm!("hlt", options(nomem, nostack, preserves_flags));
         }
@@ -239,5 +267,52 @@ fn panic(_info: &PanicInfo) -> ! {
         unsafe {
             asm!("hlt", options(nomem, nostack, preserves_flags));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "efiapi" fn dummy_get_map(
+        _a: *mut usize,
+        _b: *mut u8,
+        _c: *mut usize,
+        _d: *mut usize,
+        _e: *mut u32,
+    ) -> usize {
+        0
+    }
+
+    fn fake_table(sig: u64, boot_services: *const u8) -> Vec<u8> {
+        let mut st = vec![0u8; 112];
+        st[0..8].copy_from_slice(&sig.to_le_bytes());
+        st[SYSTEM_TABLE_BOOT_SERVICES_OFF..SYSTEM_TABLE_BOOT_SERVICES_OFF + 8]
+            .copy_from_slice(&(boot_services as usize).to_le_bytes());
+        st
+    }
+
+    #[test]
+    fn system_table_signature_gates_get_memory_map() {
+        // Review #29 risk 3: stale/non-UEFI pointer must fail closed.
+        let mut bs = [0u8; 64];
+        let slot = dummy_get_map as *const () as usize;
+        bs[BOOT_SERVICES_GET_MEMORY_MAP_OFF..BOOT_SERVICES_GET_MEMORY_MAP_OFF + 8]
+            .copy_from_slice(&slot.to_le_bytes());
+        // Null table -> None.
+        assert!(unsafe { load_get_memory_map(core::ptr::null()) }.is_none());
+        // Bad signature with otherwise-valid links -> None.
+        let bad = fake_table(0xDEAD_BEEF_DEAD_BEEF, bs.as_ptr());
+        assert!(unsafe { load_get_memory_map(bad.as_ptr()) }.is_none());
+        // Good signature but null BootServices -> None.
+        let null_bs = fake_table(SYSTEM_TABLE_SIGNATURE, core::ptr::null());
+        assert!(unsafe { load_get_memory_map(null_bs.as_ptr()) }.is_none());
+        // Good signature + valid links -> Some.
+        let good = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
+        assert!(unsafe { load_get_memory_map(good.as_ptr()) }.is_some());
+        // Good signature + null GetMemoryMap slot -> None.
+        let bs_empty = [0u8; 64];
+        let no_slot = fake_table(SYSTEM_TABLE_SIGNATURE, bs_empty.as_ptr());
+        assert!(unsafe { load_get_memory_map(no_slot.as_ptr()) }.is_none());
     }
 }

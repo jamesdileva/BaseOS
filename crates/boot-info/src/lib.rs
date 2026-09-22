@@ -224,6 +224,14 @@ impl BootInfo {
     /// Returns the number of regions pushed. `no_std`-clean (byte loads,
     /// no alignment assumptions) so the UEFI guest calls this directly on
     /// its `GetMemoryMap` buffer and the layout is host-unit-testable.
+    ///
+    /// Truncation contract (review #29 risk 1): when the firmware reports
+    /// more descriptors than [`MAX_MEM_REGIONS`], only the first 128 are
+    /// stored and the excess is silently dropped by this helper — the
+    /// caller MUST compare the return against `raw.len() / desc_size`
+    /// (total descriptors) to detect truncation. The UEFI guest reports
+    /// both as `MEMMAP entries=<pushed>/<total> truncated=<0|1>` so the
+    /// e2e script fails loudly instead of passing truncated.
     pub fn fill_from_raw_descriptors(&mut self, raw: &[u8], desc_size: usize) -> usize {
         if desc_size < 40 {
             return 0;
@@ -840,5 +848,28 @@ mod tests {
         cut.push(0xAA);
         let mut info = BootInfo::new();
         assert_eq!(info.fill_from_raw_descriptors(&cut, 48), 2);
+    }
+
+    #[test]
+    fn fill_from_raw_descriptors_truncates_at_inline_cap() {
+        // Review #29 risk 1: 130 firmware descriptors exceed the 128-entry
+        // inline map. Only the first 128 are stored; the caller detects the
+        // loss via pushed (128) vs total (raw.len() / desc_size = 130).
+        let mut raw = Vec::new();
+        for i in 0..130u64 {
+            raw.extend(fake_efi_desc(7, 0x1000 + i * 0x1000, 1, 48));
+        }
+        let total = raw.len() / 48;
+        assert_eq!(total, 130);
+        let mut info = BootInfo::new();
+        let pushed = info.fill_from_raw_descriptors(&raw, 48);
+        assert_eq!(pushed, MAX_MEM_REGIONS);
+        assert_eq!(pushed, 128);
+        assert_eq!(info.memory_map().len(), MAX_MEM_REGIONS);
+        assert_eq!(info.region_count as usize, MAX_MEM_REGIONS);
+        assert!(
+            pushed < total,
+            "truncation must be detectable: {pushed}/{total}"
+        );
     }
 }
