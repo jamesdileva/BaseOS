@@ -6,12 +6,15 @@ Review before each work segment. Keep ≤20 lines, compact.
 - Now: S01 UEFI boot — slices 1+2 done (marker FOUND e2e), slice 3 handoff
   contract pinned + hardened (reviews #19/#21/#23); slice 4 print helpers
   done (review #25); slice 5 GetMemoryMap fill done (100 regions,
-  usable=0xce95000, MEMMAP ok=1 e2e, review #27 nits 1+2 closed as tests);
+  usable=0xce95000, MEMMAP ok=1 e2e); slice 5 hardening 6e402ec closes
+  review #29 risks 1+3 (truncation entries=p/t + truncated=0 e2e gate +
+  ST signature check); risk 2 (BUFFER_TOO_SMALL retry) deferred S03;
   next GOP framebuffer discovery.
 - Env (2026-09-20): Win11 host, rustc 1.98.0, QEMU 11.1.1, git 2.53.0.
 - Agreement: one committable segment/cycle; small vertical slices; board states current.
 - Open: #1 done; #2 active until GOP + FB present=1 proven in
-  boot-uefi.ps1; finding 4 narrowed to GOP e2e only.
+  boot-uefi.ps1; finding 4 narrowed to GOP e2e only. Tests 30/30
+  (29 default + 1 boot-uefi); boot PASS 479B truncated=0 (2026-09-21).
 - Learning: BootInfo exact size 3128 (3124 payload + align); Copy-guard via
   coherence conflict (no new dep); try_usable_bytes separates corrupt/empty.
   Raw UEFI offsets: BootServices@96, GetMemoryMap@56, efiapi ABI; 16 KiB

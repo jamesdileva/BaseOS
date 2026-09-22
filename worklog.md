@@ -490,3 +490,44 @@ Format per entry (per `implementation-guide.md` §31):
   discovery + `framebuffer_opt`/`FB present=1` in the same summary;
   task #2 stays `active` until then (S01 verification still needs
   framebuffer discovery).
+
+## S01 slice 5 hardening — review #29 risks 1+3 (2026-09-21)
+
+- **Decision:** Close agent-b review #29 risks 1 and 3 before starting the
+  GOP slice: (a) risk 1 — `fill_from_raw_descriptors` truncation contract
+  documented (caller MUST compare pushed vs total), guest now reports
+  `MEMMAP ok=… entries=<pushed>/<total> truncated=<0|1>`, host test pushes
+  130 fake descs asserting pushed==128 and pushed<total, and
+  `boot-uefi.ps1` REQUIRES `truncated=0` (missing = FAIL); (b) risk 3 —
+  `load_get_memory_map` validates `EFI_SYSTEM_TABLE.Hdr.Signature`
+  (`0x5453595320494249`) before any offset deref, with a host test covering
+  null table / bad sig / null BS / null GetMemoryMap slot / good links;
+  (c) risk 2 — single-shot 16 KiB `GetMemoryMap` with no `BUFFER_TOO_SMALL`
+  retry recorded as deferred (candidate S03) in `fill_boot_info` docs so it
+  is not mistaken for a complete driver.
+- **Why:** Review #29 concurred on 830eb70 but flagged silent 128-cap
+  truncation (e2e would PASS truncated maps), missing header-signature check
+  (stale pointer mis-parses at +96/+56), and the no-retry path — 1+3 are
+  cheap to close now; 2 needs a real retry loop and belongs with S03
+  allocator work.
+- **Alternatives:** Emit truncated only without the host 130-desc test
+  (rejected: agent-b's cheapest disconfirm was the test; script assert alone
+  never exercises the cap); implement BUFFER_TOO_SMALL retry now (rejected:
+  scope growth past one segment; QEMU ~100 entries fit 16 KiB, failure mode
+  already fails loudly); skip signature check as documented-why (rejected:
+  one unaligned read + compare is cheaper than the doc).
+- **Expected:** `cargo test` 30/30 (29 default + 1 boot-uefi), `fmt --check`
+  clean, host + UEFI `clippy -D warnings` clean, `boot-uefi.ps1` PASS with
+  `truncated=0`, `smoke -RequireOvmf` still PASS.
+- **Measured (2026-09-21, Win11):** `cargo test` 29/29 default OK
+  (19 boot-info incl. truncation test + 4 marker + 4 harness + 2 version)
+  plus `cargo test -p baseos-boot-uefi` 1/1 OK (signature gate);
+  `cargo fmt --check` clean; `clippy --all-targets -D warnings` clean
+  (host) and `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0 (serial 479
+  bytes: marker FOUND, `BOOTINFO valid=1`, `MEMMAP ok=1 entries=100/100
+  truncated=0`, guest `bootx64.efi` 18944 bytes); `smoke -RequireOvmf`
+  SMOKE PASS exit 0.
+- **Final:** Review #29 risks 1+3 closed on the current tree (6e402ec);
+  risk 2 deferred-recorded (S03 candidate). Next: GOP framebuffer
+  discovery + `FB present=1`; task #2 stays `active` until then.
