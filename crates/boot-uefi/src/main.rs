@@ -808,4 +808,82 @@ mod tests {
 
         GOP_PTR.store(0, Ordering::Relaxed);
     }
+
+    /// S03 #5: stale-map-key retry of [`exit_boot_services`] — fake BS with
+    /// BOTH GetMemoryMap (+56) and EBS (+232) slots: zero input key fails
+    /// closed without calling EBS; `EFI_INVALID_PARAMETER` once refreshes
+    /// the key and succeeds on the second call; a second stale failure
+    /// fails closed (no infinite retry). Takes `MEMMAP_TEST_LOCK`
+    /// (`refresh_map_key` writes the shared static `MEMMAP_BUF`).
+    #[test]
+    fn exit_boot_services_retries_stale_map_key_once() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static EBS_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static EBS_ALWAYS_STALE: AtomicUsize = AtomicUsize::new(0);
+        static REFRESH_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "efiapi" fn get_map_refresh_key(
+            _map_size: *mut usize,
+            _buf: *mut u8,
+            key: *mut usize,
+            desc_size: *mut usize,
+            _desc_version: *mut u32,
+        ) -> usize {
+            REFRESH_CALLS.fetch_add(1, Ordering::Relaxed);
+            *key = 0xABCD;
+            *desc_size = 48;
+            0
+        }
+
+        unsafe extern "efiapi" fn ebs_scripted(_ih: *const (), key: usize) -> usize {
+            assert_ne!(key, 0);
+            let call = EBS_CALLS.fetch_add(1, Ordering::Relaxed);
+            if EBS_ALWAYS_STALE.load(Ordering::Relaxed) != 0 {
+                return EFI_INVALID_PARAMETER;
+            }
+            if call == 0 {
+                EFI_INVALID_PARAMETER
+            } else {
+                0
+            }
+        }
+
+        let _guard = MEMMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut bs = fake_bs_with_slot(
+            BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF,
+            ebs_scripted as *const (),
+        );
+        bs[BOOT_SERVICES_GET_MEMORY_MAP_OFF..BOOT_SERVICES_GET_MEMORY_MAP_OFF + 8]
+            .copy_from_slice(&(get_map_refresh_key as *const () as usize).to_le_bytes());
+        let st = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
+        EBS_CALLS.store(0, Ordering::Relaxed);
+        EBS_ALWAYS_STALE.store(0, Ordering::Relaxed);
+        REFRESH_CALLS.store(0, Ordering::Relaxed);
+
+        // Zero input key: structural fail, EBS never invoked.
+        let (ok, status) = unsafe { exit_boot_services(core::ptr::null(), st.as_ptr(), 0) };
+        assert!(!ok);
+        assert_eq!(status, STRUCTURAL_FAIL);
+        assert_eq!(EBS_CALLS.load(Ordering::Relaxed), 0);
+
+        // Stale first attempt -> refresh key once -> succeed on retry.
+        let (ok, status) = unsafe { exit_boot_services(core::ptr::null(), st.as_ptr(), 0x1234) };
+        assert!(ok);
+        assert_eq!(status, 0);
+        assert_eq!(EBS_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(REFRESH_CALLS.load(Ordering::Relaxed), 1);
+
+        // Second stale failure: fail closed with the raw status, one refresh.
+        EBS_CALLS.store(0, Ordering::Relaxed);
+        EBS_ALWAYS_STALE.store(1, Ordering::Relaxed);
+        let (ok, status) = unsafe { exit_boot_services(core::ptr::null(), st.as_ptr(), 0x1234) };
+        assert!(!ok);
+        assert_eq!(status, EFI_INVALID_PARAMETER);
+        assert_eq!(EBS_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(REFRESH_CALLS.load(Ordering::Relaxed), 2);
+
+        EBS_ALWAYS_STALE.store(0, Ordering::Relaxed);
+    }
 }

@@ -709,3 +709,45 @@ Format per entry (per `implementation-guide.md` §31):
   contention) and then `BUFFER_TOO_SMALL` handling + frame allocator over
   BootInfo regions with double-free/invalid-range detection. Sitrep
   harness stale dirty(3)+SKIPPED now 5th cycle - still human/orchestrator.
+
+## S03 slice 2 - stale-map-key ExitBootServices retry host test (2026-09-21)
+
+- **Decision:** Second committable slice of task #5: one host test
+  `exit_boot_services_retries_stale_map_key_once` covering the full retry
+  contract of `exit_boot_services` with a fake boot-services stand that
+  populates BOTH the GetMemoryMap (+56) and ExitBootServices (+232) slots.
+  Three phases: (1) zero input map key -> `(false, STRUCTURAL_FAIL)` and
+  EBS never invoked; (2) first EBS returns `EFI_INVALID_PARAMETER` ->
+  `refresh_map_key` runs exactly once (writes a nonzero key) and the
+  second EBS call succeeds -> `(true, 0)`; (3) EBS stales twice -> fails
+  closed with the raw `EFI_INVALID_PARAMETER` after exactly one refresh
+  (no infinite retry). The test takes `MEMMAP_TEST_LOCK` because
+  `refresh_map_key` writes the shared static `MEMMAP_BUF`.
+- **Why:** The stale-key retry path shipped in S02 slice 2 was
+  known-untested on the host (e2e could not force a stale key); agent-b
+  review and DoD require tests for failure behavior, and this is the last
+  must-have host test before the allocator slice.
+- **Alternatives:** Force a stale key in QEMU e2e (rejected: firmware
+  timing is nondeterministic, flaky gates are worse than none); split into
+  three tests (rejected: the scripted EBS stand is one fixture, one lock
+  acquisition keeps MEMMAP_BUF contention trivial).
+- **Expected:** default `cargo test` 37 (new test lives in boot-uefi,
+  outside default-members) + `cargo test -p baseos-boot-uefi` 6 (1 new);
+  fmt clean; workspace clippy only the known host-bin unwinding noise;
+  boot-uefi `--tests` and `--target x86_64-unknown-uefi` clippy clean;
+  `boot-uefi.ps1` PASS; `smoke -RequireOvmf` PASS.
+- **Measured (2026-09-21, Win11):** `cargo test` 37/37 default OK;
+  `cargo test -p baseos-boot-uefi` 6/6 OK (3 slot-gate + 2 diagnosability
+  + 1 new retry); `cargo fmt --check` clean; `cargo clippy` (default
+  members) exit 0; `cargo clippy -p baseos-boot-uefi --tests -- -D
+  warnings` clean; `cargo clippy -p baseos-boot-uefi --target
+  x86_64-unknown-uefi -- -D warnings` clean; workspace `--all-targets`
+  still only the known `unwinding panics` host-bin error (agent-b finding
+  2); `boot-uefi.ps1` UEFI BOOT PASS (marker + BOOTINFO/MEMMAP/FB/GOP/EBS/
+  KERNEL/EXC all ok, guest 30720 bytes); `smoke.ps1 -RequireOvmf` SMOKE
+  PASS (0-byte SeaBIOS serial unchanged).
+- **Final:** Stale-key retry contract now host-tested and committed
+  pending agent-b review. #5 stays active: remaining slice is
+  BUFFER_TOO_SMALL handling + frame allocator over BootInfo regions with
+  double-free/invalid-range detection. Sitrep harness stale dirty(3)+SKIPPED
+  still escalated for human/orchestrator (tree was clean this cycle).
