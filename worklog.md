@@ -531,3 +531,44 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Review #29 risks 1+3 closed on the current tree (6e402ec);
   risk 2 deferred-recorded (S03 candidate). Next: GOP framebuffer
   discovery + `FB present=1`; task #2 stays `active` until then.
+
+## S01 slice 6 -- GOP framebuffer discovery (2026-09-21)
+
+- **Decision:** Close finding 4 (the last S01-remainder item) with a
+  dependency-free GOP slice: (a) `BootInfo::fill_from_gop_mode` parses raw
+  `EFI_GRAPHICS_OUTPUT_MODE_INFORMATION` (36 bytes; format 0/1 -> 32 bpp,
+  format 2 bitmask -> mask popcount, format 3+ BltOnly/unknown fails closed);
+  (b) guest loads `LocateProtocol` (+320) through the same signature-gated
+  `load_boot_services` as `GetMemoryMap`, locates GOP GUID, reads active-mode
+  `Info`/`FrameBufferBase`/`FrameBufferSize`, fills the handoff; (c) serial
+  adds `GOP ok=<0|1> status=<0x...>` after the MEMMAP line; (d)
+  `boot-uefi.ps1` now hard-requires `FB present=1` AND `GOP ok=1` (missing
+  = FAIL, per review #33/#35 fail-loud gate requirement); (e) host tests:
+  2 fill_from_gop_mode (RGB parse + geometry gate; bitmask bpp + BltOnly/
+  unknown fail-closed) + 1 LocateProtocol signature gate (null/bad-sig/
+  null-BS/null-slot/good, mirroring the GetMemoryMap gate).
+- **Why:** Task #2 stays active until GOP + `FB present=1` proven e2e;
+  agent-b reviews #33/#35 both demanded the fail-loud pattern (hard-require,
+  not warn-only) on the GOP path before starting it.
+- **Alternatives:** uefi-rs crate for GOP (rejected: dependency-free S01
+  slice, raw-offset pattern already proven); QueryMode/SetMode mode picking
+  (rejected: use firmware-active mode -- no mode change needed for discovery);
+  warn-only FB assert (rejected: agent-b explicit standing risk).
+- **Expected:** `cargo test` 31 default + 2 boot-uefi; fmt + clippy clean
+  both targets; `boot-uefi.ps1` PASS with `FB present=1`/`GOP ok=1`;
+  `smoke -RequireOvmf` still PASS.
+- **Measured (2026-09-21, Win11):** `cargo test` 31/31 default (21 boot-info
+  incl. 2 GOP fill tests + 4 marker + 4 harness + 2 version) + `cargo test -p
+  baseos-boot-uefi` 2/2 (both signature gates) = 33; `cargo fmt --check`
+  clean; `clippy --all-targets -D warnings` clean (host; one
+  `chunks_exact_to_as_chunks` fix) and `clippy -p baseos-boot-uefi --target
+  x86_64-unknown-uefi -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS
+  exit 0, serial 517 bytes: marker FOUND, `BOOTINFO valid=1 regions=98
+  usable=0xce94000`, `FB present=1 base=0x80000000 size=0x3e8000 1280x800
+  pitch=5120 bpp=32`, `MEMMAP ok=1 entries=98/98 truncated=0`,
+  `GOP ok=1 status=0x0`, guest `bootx64.efi` 25600 bytes;
+  `smoke -RequireOvmf` SMOKE PASS exit 0. Region count 98 vs prior 100 =
+  OVMF map variance across boots, both well under the 128 cap.
+- **Final:** Finding 4 closed: GOP framebuffer proven end-to-end with
+  hard-require gates; task #2 ready to close pending agent-b review of this
+  commit. Deferred risk 2 (BUFFER_TOO_SMALL retry) remains S03 candidate.

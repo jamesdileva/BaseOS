@@ -6,8 +6,9 @@
 //! future kernel crate can depend on it without pulling in std or allocator.
 //! The UEFI guest fills a BootInfo (memory regions plus optional framebuffer)
 //! and the kernel validates it via BootInfo::is_valid. Wire-up to real
-//! UEFI GetMemoryMap and GOP arrives in later S01 slices; this slice pins the
-//! struct contract plus host-side unit tests.
+//! UEFI GetMemoryMap ([`BootInfo::fill_from_raw_descriptors`]) and GOP mode
+//! info ([`BootInfo::fill_from_gop_mode`]) is host-unit-tested here and
+//! driven by the UEFI guest end-to-end.
 #[cfg(test)]
 extern crate std;
 
@@ -251,6 +252,64 @@ impl BootInfo {
             off += desc_size;
         }
         pushed
+    }
+
+    /// Fill the framebuffer from a raw `EFI_GRAPHICS_OUTPUT_MODE_INFORMATION`
+    /// plus the GOP `Mode` fields; returns false (no mutation) when there is
+    /// nothing to hand the kernel.
+    ///
+    /// Parses `info` (must be >= 36 bytes: `Version`+0, `HorizontalResolution`
+    /// +4, `VerticalResolution` +8, `PixelFormat` +12, `PixelInformation`
+    /// bitmask +16, `PixelsPerScanLine` +32): pixel formats 0/1
+    /// (8-bits-per-color) yield 32 bpp, format 2 (`PixelBitMask`) yields the
+    /// popcount of the four channel masks, anything else (incl. 3 =
+    /// `PixelBltOnly`, no linear framebuffer) fails closed. `fb_base`/
+    /// `fb_size` come from `EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE` and must be
+    /// non-zero. On success stores the descriptor, sets `has_framebuffer`,
+    /// and returns true; final geometry still gates via
+    /// [`BootInfo::framebuffer_opt`] so a bad descriptor reports
+    /// `FB present=0` with raw fields on serial instead of passing e2e.
+    ///
+    /// `no_std`-clean (byte loads, no alignment assumptions) so the UEFI
+    /// guest calls this directly and the layout is host-unit-testable.
+    pub fn fill_from_gop_mode(&mut self, fb_base: u64, fb_size: u64, info: &[u8]) -> bool {
+        if info.len() < 36 || fb_base == 0 || fb_size == 0 {
+            return false;
+        }
+        let hres = u32::from_le_bytes([info[4], info[5], info[6], info[7]]);
+        let vres = u32::from_le_bytes([info[8], info[9], info[10], info[11]]);
+        let format = u32::from_le_bytes([info[12], info[13], info[14], info[15]]);
+        let ppsl = u32::from_le_bytes([info[32], info[33], info[34], info[35]]);
+        let bpp = match format {
+            0 | 1 => 32u32,
+            2 => {
+                let mut masks = 0u32;
+                for off in (16..32).step_by(4) {
+                    masks |= u32::from_le_bytes([
+                        info[off],
+                        info[off + 1],
+                        info[off + 2],
+                        info[off + 3],
+                    ]);
+                }
+                masks.count_ones()
+            }
+            _ => return false,
+        };
+        if hres == 0 || vres == 0 || ppsl == 0 || bpp == 0 {
+            return false;
+        }
+        let bytes_per_pixel = bpp.div_ceil(8);
+        self.framebuffer = Framebuffer {
+            base: fb_base,
+            size: fb_size,
+            width: hres,
+            height: vres,
+            pitch: ppsl.saturating_mul(bytes_per_pixel),
+            bpp,
+        };
+        self.has_framebuffer = 1;
+        true
     }
 
     /// Total usable bytes across Usable regions (saturating).
@@ -817,6 +876,69 @@ mod tests {
         assert!(l1.starts_with("BOOTINFO valid=0 regions="), "{text}");
         assert!(l2.starts_with("FB present=0 base="), "{text}");
         assert!(lines.next().is_none(), "{text}");
+    }
+
+    #[test]
+    fn fill_from_gop_mode_parses_rgb_format_and_gates_geometry() {
+        // Format 0 (RGB 8-bit-per-color): 32 bpp, pitch = ppsl * 4.
+        let mut info_bytes = vec![0u8; 36];
+        info_bytes[4..8].copy_from_slice(&1024u32.to_le_bytes());
+        info_bytes[8..12].copy_from_slice(&768u32.to_le_bytes());
+        info_bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
+        info_bytes[32..36].copy_from_slice(&1024u32.to_le_bytes());
+        let mut info = BootInfo::new();
+        assert!(info.fill_from_gop_mode(0x8000_0000, 8 * 1024 * 1024, &info_bytes));
+        assert_eq!(info.has_framebuffer, 1);
+        assert_eq!(
+            info.framebuffer_opt(),
+            Some(Framebuffer {
+                base: 0x8000_0000,
+                size: 8 * 1024 * 1024,
+                width: 1024,
+                height: 768,
+                pitch: 4096,
+                bpp: 32,
+            })
+        );
+        // Zero base or size fails closed (no mutation of the flag).
+        let mut info = BootInfo::new();
+        assert!(!info.fill_from_gop_mode(0, 8 * 1024 * 1024, &info_bytes));
+        assert!(!info.fill_from_gop_mode(0x8000_0000, 0, &info_bytes));
+        assert_eq!(info.has_framebuffer, 0);
+        // Undersized info buffer fails closed.
+        assert!(!info.fill_from_gop_mode(0x8000_0000, 4096, &info_bytes[..35]));
+    }
+
+    #[test]
+    fn fill_from_gop_mode_bitmask_bpp_and_blt_only_fails() {
+        // Format 2 (PixelBitMask): bpp = popcount of the four channel masks.
+        let mut info_bytes = vec![0u8; 36];
+        info_bytes[4..8].copy_from_slice(&800u32.to_le_bytes());
+        info_bytes[8..12].copy_from_slice(&600u32.to_le_bytes());
+        info_bytes[12..16].copy_from_slice(&2u32.to_le_bytes());
+        // Red/green/blue 8-bit masks + no reserved bits -> 24 bpp.
+        info_bytes[16..20].copy_from_slice(&0x00FF_0000u32.to_le_bytes());
+        info_bytes[20..24].copy_from_slice(&0x0000_FF00u32.to_le_bytes());
+        info_bytes[24..28].copy_from_slice(&0x0000_00FFu32.to_le_bytes());
+        info_bytes[28..32].copy_from_slice(&0u32.to_le_bytes());
+        info_bytes[32..36].copy_from_slice(&800u32.to_le_bytes());
+        let mut info = BootInfo::new();
+        assert!(info.fill_from_gop_mode(0x8000_0000, 800 * 600 * 3, &info_bytes));
+        assert_eq!(info.framebuffer.bpp, 24);
+        assert_eq!(info.framebuffer.pitch, 2400);
+        assert!(info.framebuffer_opt().is_some());
+        // Format 3 (PixelBltOnly): no linear framebuffer -> fail closed.
+        info_bytes[12..16].copy_from_slice(&3u32.to_le_bytes());
+        let mut info = BootInfo::new();
+        assert!(!info.fill_from_gop_mode(0x8000_0000, 4096, &info_bytes));
+        assert_eq!(info.has_framebuffer, 0);
+        // Format 4+ (PixelFormatMax / unknown) -> fail closed.
+        info_bytes[12..16].copy_from_slice(&4u32.to_le_bytes());
+        assert!(!info.fill_from_gop_mode(0x8000_0000, 4096, &info_bytes));
+        // Zero resolution or ppsl -> fail closed.
+        info_bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
+        info_bytes[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert!(!info.fill_from_gop_mode(0x8000_0000, 4096, &info_bytes));
     }
 
     fn fake_efi_desc(ty: u32, phys: u64, pages: u64, stride: usize) -> Vec<u8> {

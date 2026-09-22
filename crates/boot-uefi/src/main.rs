@@ -1,16 +1,19 @@
 //! S01 UEFI guest: emits the serial-marker contract on COM1, fills a
-//! [`baseos_boot_info::BootInfo`] from UEFI `GetMemoryMap`, prints the
-//! [`baseos_boot_info::write_boot_summary`] debug summary, then parks the CPU.
+//! [`baseos_boot_info::BootInfo`] from UEFI `GetMemoryMap` plus the GOP
+//! framebuffer, prints the [`baseos_boot_info::write_boot_summary`] debug
+//! summary, then parks the CPU.
 //!
 //! Minimal `no_std` UEFI application (`efi_main`): it parses the raw
 //! `EFI_SYSTEM_TABLE`/`EFI_BOOT_SERVICES` tables with fixed byte offsets
 //! (no `uefi` crate — dependency-free slice), calls `GetMemoryMap` into a
-//! static 16 KiB buffer, fills `BootInfo` via
-//! [`baseos_boot_info::BootInfo::fill_from_raw_descriptors`], and reports the
+//! static 16 KiB buffer, locates the Graphics Output Protocol via
+//! `LocateProtocol`, fills `BootInfo` via
+//! [`baseos_boot_info::BootInfo::fill_from_raw_descriptors`] /
+//! [`baseos_boot_info::BootInfo::fill_from_gop_mode`], and reports the
 //! result on COM1. `tools/qemu/boot-uefi.ps1` builds this for
 //! `x86_64-unknown-uefi`, boots OVMF, and asserts the marker plus the
-//! `BOOTINFO valid=1` summary in the serial capture. Framebuffer (GOP)
-//! discovery arrives in a later S01 slice.
+//! `BOOTINFO valid=1`, `MEMMAP ok=1`, and `FB present=1` summary lines in
+//! the serial capture.
 
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
@@ -48,6 +51,34 @@ const SYSTEM_TABLE_SIGNATURE: u64 = 0x5453_5953_2049_4249;
 /// Byte offset of `GetMemoryMap` in `EFI_BOOT_SERVICES`
 /// (header 24 + `RaiseTPL`/`RestoreTPL`/`AllocatePages`/`FreePages` 32 = 56).
 const BOOT_SERVICES_GET_MEMORY_MAP_OFF: usize = 56;
+/// Byte offset of `LocateProtocol` in `EFI_BOOT_SERVICES` (header 24 + the
+/// 37 preceding function pointers/reserved slots through
+/// `LocateHandleBuffer`, 8 bytes each = 320).
+const BOOT_SERVICES_LOCATE_PROTOCOL_OFF: usize = 320;
+/// `EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID` (`9042a9de-23dc-4a38-96fb-7aded080516a`)
+/// as a raw `EFI_GUID` (mixed-endian: `Data1`/`Data2`/`Data3` little-endian,
+/// `Data4` byte array).
+const GOP_GUID: [u8; 16] = [
+    0xDE, 0xA9, 0x42, 0x90, 0xDC, 0x23, 0x38, 0x4A, 0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A,
+];
+/// Byte offset of `Mode` in `EFI_GRAPHICS_OUTPUT_PROTOCOL`
+/// (`QueryMode`/`SetMode`/`Blt` 24 = 24).
+const GOP_MODE_OFF: usize = 24;
+/// Byte offset of `Info` in `EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE`
+/// (`MaxMode`/`Mode` 8).
+const GOP_MODE_INFO_OFF: usize = 8;
+/// Byte offset of `SizeOfInfo` in `EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE`
+/// (after `Info` pointer, 8-aligned).
+const GOP_MODE_SIZE_OF_INFO_OFF: usize = 16;
+/// Byte offset of `FrameBufferBase` in `EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE`
+/// (after `SizeOfInfo`).
+const GOP_MODE_FB_BASE_OFF: usize = 24;
+/// Byte offset of `FrameBufferSize` in `EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE`
+/// (after `FrameBufferBase`).
+const GOP_MODE_FB_SIZE_OFF: usize = 32;
+/// Minimum `EFI_GRAPHICS_OUTPUT_MODE_INFORMATION` size we parse
+/// (through `PixelsPerScanLine` at +32, 4 bytes = 36).
+const GOP_INFO_MIN: usize = 36;
 
 /// Raw `GetMemoryMap` scratch: 16 KiB holds ~340 descriptors at the usual
 /// 48-byte stride; QEMU/OVMF reports far fewer. Static (not stack) so the
@@ -130,15 +161,15 @@ type GetMemoryMapFn = unsafe extern "efiapi" fn(
     *mut u32,   // DescriptorVersion (out)
 ) -> usize;
 
-/// Load the `GetMemoryMap` entry point from the raw system table.
+/// Load the `EFI_BOOT_SERVICES` pointer from the raw system table.
 ///
 /// # Safety
-/// `system_table` must point to a live `EFI_SYSTEM_TABLE`; validates the
-/// header signature, then reads the `BootServices` pointer at the fixed
-/// x86-64 offset, then the `GetMemoryMap` slot at its fixed offset.
-/// Returns `None` on null links or a signature mismatch instead of
-/// dereferencing them.
-unsafe fn load_get_memory_map(system_table: *const u8) -> Option<GetMemoryMapFn> {
+/// `system_table` must point to a live `EFI_SYSTEM_TABLE` or be null;
+/// validates the header signature before reading `BootServices` at the
+/// fixed x86-64 offset. Returns `None` on null input, a signature
+/// mismatch, or a null `BootServices` pointer instead of dereferencing
+/// them (shared fail-loud gate for `GetMemoryMap` and `LocateProtocol`).
+unsafe fn load_boot_services(system_table: *const u8) -> Option<*const u8> {
     if system_table.is_null() {
         return None;
     }
@@ -152,12 +183,46 @@ unsafe fn load_get_memory_map(system_table: *const u8) -> Option<GetMemoryMapFn>
     if boot_services.is_null() {
         return None;
     }
+    Some(boot_services)
+}
+
+/// Load the `GetMemoryMap` entry point from the raw system table.
+///
+/// # Safety
+/// `system_table` must point to a live `EFI_SYSTEM_TABLE`; validates the
+/// header signature (via [`load_boot_services`]), then reads the
+/// `GetMemoryMap` slot at its fixed offset. Returns `None` on null links
+/// or a signature mismatch instead of dereferencing them.
+unsafe fn load_get_memory_map(system_table: *const u8) -> Option<GetMemoryMapFn> {
+    let boot_services = load_boot_services(system_table)?;
     let slot =
         (boot_services.add(BOOT_SERVICES_GET_MEMORY_MAP_OFF) as *const *const ()).read_unaligned();
     if slot.is_null() {
         return None;
     }
     Some(core::mem::transmute::<*const (), GetMemoryMapFn>(slot))
+}
+
+/// Raw `LocateProtocol` signature (x86-64 UEFI = `efiapi` calling convention).
+type LocateProtocolFn = unsafe extern "efiapi" fn(
+    *const u8,    // Protocol (EFI_GUID*)
+    *const u8,    // Registration (VOID*, always null here)
+    *mut *mut u8, // Interface (VOID**)
+) -> usize;
+
+/// Load the `LocateProtocol` entry point from the raw system table.
+///
+/// # Safety
+/// Same contract as [`load_get_memory_map`]: live `EFI_SYSTEM_TABLE`,
+/// signature-gated, null-slot fails closed.
+unsafe fn load_locate_protocol(system_table: *const u8) -> Option<LocateProtocolFn> {
+    let boot_services = load_boot_services(system_table)?;
+    let slot =
+        (boot_services.add(BOOT_SERVICES_LOCATE_PROTOCOL_OFF) as *const *const ()).read_unaligned();
+    if slot.is_null() {
+        return None;
+    }
+    Some(core::mem::transmute::<*const (), LocateProtocolFn>(slot))
 }
 
 /// Call `GetMemoryMap` into the static buffer and fill `info`.
@@ -224,10 +289,62 @@ fn write_memmap_line(ok: bool, status: usize, pushed: usize, total: usize) {
     let _ = write_str(&mut emit, "\n");
 }
 
-/// UEFI entry point: marker, memory-map fill, summary, then park the CPU.
+/// Locate the GOP instance and fill `info.framebuffer` from its active mode.
+///
+/// Returns `(ok, status)`: `ok` is true only when `LocateProtocol` succeeded
+/// and [`BootInfo::fill_from_gop_mode`] accepted the mode info; `status` is
+/// the raw `EFI_STATUS` of `LocateProtocol` (0 also for structural failures
+/// after a successful locate — diagnose via the `FB present=` line's raw
+/// fields). Never panics; a failure leaves the framebuffer unset so
+/// `framebuffer_opt()` reports `FB present=0` and the e2e script fails
+/// loudly (review #33/#35 fail-loud gate requirement).
+///
+/// # Safety
+/// Must run pre-`ExitBootServices` on the boot thread with `system_table`
+/// live; dereferences firmware-owned GOP `Mode`/`Info` pointers for the
+/// duration of the call only.
+unsafe fn fill_framebuffer(system_table: *const u8, info: &mut BootInfo) -> (bool, usize) {
+    let Some(locate) = load_locate_protocol(system_table) else {
+        return (false, usize::MAX);
+    };
+    let mut gop: *mut u8 = core::ptr::null_mut();
+    let status = locate(GOP_GUID.as_ptr(), core::ptr::null(), &mut gop);
+    if status != 0 || gop.is_null() {
+        return (false, status);
+    }
+    let mode = (gop.add(GOP_MODE_OFF) as *const *const u8).read_unaligned();
+    if mode.is_null() {
+        return (false, status);
+    }
+    let info_ptr = (mode.add(GOP_MODE_INFO_OFF) as *const *const u8).read_unaligned();
+    let size_of_info = (mode.add(GOP_MODE_SIZE_OF_INFO_OFF) as *const usize).read_unaligned();
+    let fb_base = (mode.add(GOP_MODE_FB_BASE_OFF) as *const u64).read_unaligned();
+    let fb_size = (mode.add(GOP_MODE_FB_SIZE_OFF) as *const usize).read_unaligned();
+    if info_ptr.is_null() || size_of_info < GOP_INFO_MIN {
+        return (false, status);
+    }
+    let mode_info = core::slice::from_raw_parts(info_ptr, GOP_INFO_MIN);
+    let ok = info.fill_from_gop_mode(fb_base, fb_size as u64, mode_info);
+    (ok, status)
+}
+
+/// Emit the one-line `GOP` diagnostic after the `MEMMAP` line:
+/// `GOP ok=<0|1> status=<0x...>` — `ok` covers locate + mode-info parse;
+/// `status` is the raw `LocateProtocol` `EFI_STATUS`.
+fn write_gop_line(ok: bool, status: usize) {
+    let mut emit = com1_emit;
+    let _ = write_str(&mut emit, "GOP ok=");
+    let _ = write_u64_dec(&mut emit, u64::from(ok));
+    let _ = write_str(&mut emit, " status=");
+    let _ = write_u64_hex(&mut emit, status as u64);
+    let _ = write_str(&mut emit, "\n");
+}
+
+/// UEFI entry point: marker, memory-map + framebuffer fill, summary, park.
 ///
 /// The firmware passes `(image_handle, system_table)` per the UEFI spec;
-/// the handle is unused (no `Unload` path), the table feeds `GetMemoryMap`.
+/// the handle is unused (no `Unload` path), the table feeds `GetMemoryMap`
+/// and GOP `LocateProtocol`.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "efiapi" fn efi_main(_image_handle: *const (), system_table: *const u8) -> usize {
@@ -243,9 +360,11 @@ pub extern "efiapi" fn efi_main(_image_handle: *const (), system_table: *const u
         .unwrap();
         let mut info = BootInfo::new();
         let (ok, status, pushed, total) = fill_boot_info(system_table, &mut info);
+        let (gop_ok, gop_status) = fill_framebuffer(system_table, &mut info);
         let mut emit = com1_emit;
         write_boot_summary::<Infallible>(&info, &mut emit).unwrap();
         write_memmap_line(ok, status, pushed, total);
+        write_gop_line(gop_ok, gop_status);
         loop {
             asm!("hlt", options(nomem, nostack, preserves_flags));
         }
@@ -284,6 +403,14 @@ mod tests {
         0
     }
 
+    unsafe extern "efiapi" fn dummy_locate(
+        _a: *const u8,
+        _b: *const u8,
+        _c: *mut *mut u8,
+    ) -> usize {
+        0
+    }
+
     fn fake_table(sig: u64, boot_services: *const u8) -> Vec<u8> {
         let mut st = vec![0u8; 112];
         st[0..8].copy_from_slice(&sig.to_le_bytes());
@@ -292,13 +419,18 @@ mod tests {
         st
     }
 
+    /// Boot-services stand with one populated slot (rest zero); sized to
+    /// cover `LocateProtocol` at +320.
+    fn fake_bs_with_slot(off: usize, f: *const ()) -> Vec<u8> {
+        let mut bs = vec![0u8; off + 8];
+        bs[off..off + 8].copy_from_slice(&(f as usize).to_le_bytes());
+        bs
+    }
+
     #[test]
     fn system_table_signature_gates_get_memory_map() {
         // Review #29 risk 3: stale/non-UEFI pointer must fail closed.
-        let mut bs = [0u8; 64];
-        let slot = dummy_get_map as *const () as usize;
-        bs[BOOT_SERVICES_GET_MEMORY_MAP_OFF..BOOT_SERVICES_GET_MEMORY_MAP_OFF + 8]
-            .copy_from_slice(&slot.to_le_bytes());
+        let bs = fake_bs_with_slot(BOOT_SERVICES_GET_MEMORY_MAP_OFF, dummy_get_map as *const ());
         // Null table -> None.
         assert!(unsafe { load_get_memory_map(core::ptr::null()) }.is_none());
         // Bad signature with otherwise-valid links -> None.
@@ -311,8 +443,24 @@ mod tests {
         let good = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
         assert!(unsafe { load_get_memory_map(good.as_ptr()) }.is_some());
         // Good signature + null GetMemoryMap slot -> None.
-        let bs_empty = [0u8; 64];
+        let bs_empty = vec![0u8; BOOT_SERVICES_GET_MEMORY_MAP_OFF + 8];
         let no_slot = fake_table(SYSTEM_TABLE_SIGNATURE, bs_empty.as_ptr());
         assert!(unsafe { load_get_memory_map(no_slot.as_ptr()) }.is_none());
+    }
+
+    #[test]
+    fn system_table_signature_gates_locate_protocol() {
+        // GOP slice: LocateProtocol reuses the review #29 risk-3 gate.
+        let bs = fake_bs_with_slot(BOOT_SERVICES_LOCATE_PROTOCOL_OFF, dummy_locate as *const ());
+        assert!(unsafe { load_locate_protocol(core::ptr::null()) }.is_none());
+        let bad = fake_table(0xDEAD_BEEF_DEAD_BEEF, bs.as_ptr());
+        assert!(unsafe { load_locate_protocol(bad.as_ptr()) }.is_none());
+        let null_bs = fake_table(SYSTEM_TABLE_SIGNATURE, core::ptr::null());
+        assert!(unsafe { load_locate_protocol(null_bs.as_ptr()) }.is_none());
+        let good = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
+        assert!(unsafe { load_locate_protocol(good.as_ptr()) }.is_some());
+        let bs_empty = vec![0u8; BOOT_SERVICES_LOCATE_PROTOCOL_OFF + 8];
+        let no_slot = fake_table(SYSTEM_TABLE_SIGNATURE, bs_empty.as_ptr());
+        assert!(unsafe { load_locate_protocol(no_slot.as_ptr()) }.is_none());
     }
 }

@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S01 slice 5 hardening: review #29) ==="
+Write-Output "=== BaseOS UEFI guest boot (S01 slice 6: GOP framebuffer discovery) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -138,16 +138,22 @@ if ($serialText -and $serialText.Contains($marker)) {
   $bootinfo = "BOOTINFO valid=1"
   $memmap = "MEMMAP ok=1"
   $notrunc = "truncated=0"
+  $fb = "FB present=1"
+  $gop = "GOP ok=1"
   $hasBootinfo = $serialText.Contains($bootinfo)
   $hasMemmap = $serialText.Contains($memmap)
   $hasNotrunc = $serialText.Contains($notrunc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc) {
-    Write-Output "Boot summary: FOUND ($bootinfo + $memmap + $notrunc)"
+  $hasFb = $serialText.Contains($fb)
+  $hasGop = $serialText.Contains($gop)
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasFb -and $hasGop) {
+    Write-Output "Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $fb + $gop)"
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
     Write-Output ("Boot summary: MISSING (BOOTINFO valid=1 present=$hasBootinfo, " +
-      "MEMMAP ok=1 present=$hasMemmap, truncated=0 present=$hasNotrunc; guest GetMemoryMap fill failed -- see serial log)")
+      "MEMMAP ok=1 present=$hasMemmap, truncated=0 present=$hasNotrunc, " +
+      "FB present=1 present=$hasFb, GOP ok=1 present=$hasGop; " +
+      "guest GetMemoryMap/GOP fill failed -- see serial log)")
     Write-Output "UEFI BOOT FAIL"
     exit 1
   }
