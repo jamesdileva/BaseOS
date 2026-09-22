@@ -659,3 +659,53 @@ Format per entry (per `implementation-guide.md` §31):
   succeeded first try this boot). Risk 2 (BUFFER_TOO_SMALL retry on EBS)
   remains S03. Harness nit: prior sitrep stale dirty list still open for
   human/orchestrator.
+
+## S03 slice 1 - diagnosability nits fold: STRUCTURAL_FAIL + clippy + smoke doc (2026-09-21)
+
+- **Decision:** First committable slice of task #5. (a) Introduce
+  `STRUCTURAL_FAIL` (`usize::MAX`, printed `0xffffffffffffffff`) so a failed
+  `MEMMAP`/`GOP`/`EBS` line can never read the contradictory
+  `ok=0 status=0x0` (agent-b #5 nit): raw firmware `EFI_STATUS`s pass
+  through verbatim, structural failures (slot load, bogus `desc_size`,
+  null GOP/`Mode`/`Info`, `fill_from_gop_mode` reject, zero map key) report
+  the sentinel; (b) close agent-b clippy finding (1): three test
+  `vec![0u8; N]` stands (and three new ones in this slice) -> fixed arrays,
+  `useless_vec` gone under `clippy --workspace --all-targets -D warnings`
+  (only finding (2), the expected host unwinding-panic on the `no_std`
+  host bin, remains); (c) document `smoke.ps1 -ExpectSerialMarker` as
+  SeaBIOS-path-dead by design (smoke launches no ESP disk), pointing at
+  `boot-uefi.ps1` as the enforcing gate, instead of dropping the switch
+  (keeps the recorded future plan of flipping smoke when it boots UEFI).
+- **Why:** #5 must land nits + stale-key test + allocator; nits are the
+  smallest end-to-end green segment and clear an open collaborator
+  finding first. `ok=0 status=0x0` on serial is actively misleading
+  during bring-up (reads as "firmware said success, result failed").
+- **Alternatives:** Drop `-ExpectSerialMarker` entirely (rejected: worklog
+  records a future smoke-UEFI flip and the sync test/docs would churn for
+  no behavior gain); invent a fake EFI error code for structural failures
+  (rejected: masquerading as firmware status is worse than a documented
+  sentinel); fix MEMMAP only or GOP only (rejected: adjacent identical
+  flaw would just bounce back in review).
+- **Expected:** default `cargo test` 37 + `cargo test -p baseos-boot-uefi`
+  5 (2 new: `fill_boot_info_failures_are_diagnosable`,
+  `fill_framebuffer_failures_never_report_zero_status`); fmt clean;
+  workspace clippy with only the known host-bin noise; UEFI-target clippy
+  clean; `boot-uefi.ps1` PASS; `smoke -RequireOvmf` PASS unchanged.
+- **Measured (2026-09-21, Win11):** `cargo test` 37/37 default OK +
+  `cargo test -p baseos-boot-uefi` 5/5 OK (3 slot-gate + 2 new);
+  `cargo fmt --check` clean; `cargo clippy --workspace --all-targets --
+  -D warnings` reports ONLY the known `unwinding panics` host-bin error
+  (agent-b finding 2, expected; `useless_vec` from finding 1 resolved);
+  `cargo clippy -p baseos-boot-uefi --tests -- -D warnings` clean;
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi --
+  -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS (marker FOUND,
+  BOOTINFO/MEMMAP/FB/GOP/EBS/KERNEL/EXC all ok, serial shows
+  `GOP ok=1 status=0x0` + `MEMMAP ok=1 status=0x0` on the success path);
+  `smoke.ps1 -RequireOvmf` SMOKE PASS (0-byte SeaBIOS serial unchanged);
+  guest `bootx64.efi` 30720 bytes.
+- **Final:** Nits closed and committed pending agent-b review. #5 remains
+  active: next slices are the stale-map-key `ExitBootServices` retry host
+  test (must-have; use the new `MEMMAP_TEST_LOCK` for `MEMMAP_BUF`
+  contention) and then `BUFFER_TOO_SMALL` handling + frame allocator over
+  BootInfo regions with double-free/invalid-range detection. Sitrep
+  harness stale dirty(3)+SKIPPED now 5th cycle - still human/orchestrator.

@@ -8,8 +8,12 @@
    is mandatory (S01 entry); without it a missing OVMF is advisory only.
    Pass -ExpectSerialMarker to assert the S01 guest marker
    (BASEOS-S01-BOOT-MARKER, see crates/serial-marker/src/lib.rs) is present
-   in the serial log — opt-in until the UEFI guest boots, so the default
-   SeaBIOS path stays green while the 0-byte-serial gap is closable on demand.
+   in the serial log. NOTE: the smoke launch is SeaBIOS-only (no ESP disk),
+   so the marker can never appear there today - passing this switch without
+   the future smoke-UEFI path fails by design; the enforcing e2e gate is
+   tools/qemu/boot-uefi.ps1 (hard-requires the marker + summary lines).
+   Opt-in until smoke itself boots the UEFI guest, so the default SeaBIOS
+   path stays green while the 0-byte-serial gap is closable on demand.
 
    Addresses agent-b review #4 findings 1 and 5, review #6 finding 1,
    review #12 / TASK #13 (S01 serial proof).

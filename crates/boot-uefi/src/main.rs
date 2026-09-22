@@ -68,6 +68,13 @@ const BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF: usize = 232;
 /// `GetMemoryMap` is stale — the UEFI-mandated signal to refresh the key
 /// and retry `ExitBootServices` once before failing closed.
 const EFI_INVALID_PARAMETER: usize = 0x8000_0000_0000_0002;
+/// Synthetic failure `status` for structural/internal errors that have no
+/// raw `EFI_STATUS` (slot load failed, GOP located but `Mode`/`Info` unusable,
+/// `fill_from_gop_mode` rejected, descriptor layout invalid). Printed as
+/// `0xffffffffffffffff` so serial never shows the contradictory
+/// `ok=0 status=0x0` pair (agent-b #5 nit): any other status is a genuine
+/// firmware `EFI_STATUS` and `0x0` only ever accompanies `ok=1`.
+const STRUCTURAL_FAIL: usize = usize::MAX;
 /// `EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID` (`9042a9de-23dc-4a38-96fb-7aded080516a`)
 /// as a raw `EFI_GUID` (mixed-endian: `Data1`/`Data2`/`Data3` little-endian,
 /// `Data4` byte array).
@@ -268,6 +275,9 @@ unsafe fn load_locate_protocol(system_table: *const u8) -> Option<LocateProtocol
 /// truncated the firmware map — reported on serial as `truncated=1` so e2e
 /// fails loudly (review #29 risk 1). Never panics; a failure still leaves
 /// `info` valid-but-empty so the serial summary stays diagnosable.
+/// Structural failures (slot load, `desc_size < 40`, oversized map) report
+/// `status = `[`STRUCTURAL_FAIL`] instead of a misleading `0x0` (agent-b #5
+/// nit: `ok=0 status=0x0` reads as "status succeeded, result failed").
 ///
 /// Deferred (review #29 risk 2, candidate S03): single-shot 16 KiB call
 /// with no `BUFFER_TOO_SMALL` retry. Fine for QEMU (~100 entries) but a
@@ -283,7 +293,7 @@ unsafe fn fill_boot_info(
     info: &mut BootInfo,
 ) -> (bool, usize, usize, usize, usize) {
     let Some(get_map) = load_get_memory_map(system_table) else {
-        return (false, usize::MAX, 0, 0, 0);
+        return (false, STRUCTURAL_FAIL, 0, 0, 0);
     };
     let buf = &mut *core::ptr::addr_of_mut!(MEMMAP_BUF);
     let mut map_size = buf.len();
@@ -297,8 +307,11 @@ unsafe fn fill_boot_info(
         &mut desc_size,
         &mut desc_version,
     );
-    if status != 0 || desc_size < 40 || map_size > buf.len() {
+    if status != 0 {
         return (false, status, 0, 0, 0);
+    }
+    if desc_size < 40 || map_size > buf.len() {
+        return (false, STRUCTURAL_FAIL, 0, 0, 0);
     }
     let total = map_size / desc_size;
     let pushed = info.fill_from_raw_descriptors(&buf[..map_size], desc_size);
@@ -357,10 +370,10 @@ unsafe fn exit_boot_services(
     map_key: usize,
 ) -> (bool, usize) {
     let Some(ebs) = load_exit_boot_services(system_table) else {
-        return (false, usize::MAX);
+        return (false, STRUCTURAL_FAIL);
     };
     if map_key == 0 {
-        return (false, usize::MAX);
+        return (false, STRUCTURAL_FAIL);
     }
     let status = ebs(image_handle, map_key);
     if status == 0 {
@@ -379,6 +392,8 @@ unsafe fn exit_boot_services(
 
 /// Emit the one-line `MEMMAP` diagnostic after the two-line boot summary:
 /// `MEMMAP ok=<0|1> status=<0x...> entries=<pushed>/<total> truncated=<0|1>`.
+/// `status` is the raw `GetMemoryMap` `EFI_STATUS`, or `0xffffffffffffffff`
+/// ([`STRUCTURAL_FAIL`]) for structural failures (never `ok=0 status=0x0`).
 fn write_memmap_line(ok: bool, status: usize, pushed: usize, total: usize) {
     let mut emit = com1_emit;
     let _ = write_str(&mut emit, "MEMMAP ok=");
@@ -398,11 +413,13 @@ fn write_memmap_line(ok: bool, status: usize, pushed: usize, total: usize) {
 ///
 /// Returns `(ok, status)`: `ok` is true only when `LocateProtocol` succeeded
 /// and [`BootInfo::fill_from_gop_mode`] accepted the mode info; `status` is
-/// the raw `EFI_STATUS` of `LocateProtocol` (0 also for structural failures
-/// after a successful locate — diagnose via the `FB present=` line's raw
-/// fields). Never panics; a failure leaves the framebuffer unset so
-/// `framebuffer_opt()` reports `FB present=0` and the e2e script fails
-/// loudly (review #33/#35 fail-loud gate requirement).
+/// the raw `EFI_STATUS` of `LocateProtocol` on firmware failures, or
+/// [`STRUCTURAL_FAIL`] when a later structural step fails (null protocol /
+/// `Mode` / `Info`, undersized info, rejected mode info) so serial never
+/// prints `GOP ok=0 status=0x0` (agent-b #5 nit). Never panics; a failure
+/// leaves the framebuffer unset so `framebuffer_opt()` reports
+/// `FB present=0` and the e2e script fails loudly (review #33/#35 fail-loud
+/// gate requirement).
 ///
 /// # Safety
 /// Must run pre-`ExitBootServices` on the boot thread with `system_table`
@@ -410,32 +427,38 @@ fn write_memmap_line(ok: bool, status: usize, pushed: usize, total: usize) {
 /// duration of the call only.
 unsafe fn fill_framebuffer(system_table: *const u8, info: &mut BootInfo) -> (bool, usize) {
     let Some(locate) = load_locate_protocol(system_table) else {
-        return (false, usize::MAX);
+        return (false, STRUCTURAL_FAIL);
     };
     let mut gop: *mut u8 = core::ptr::null_mut();
     let status = locate(GOP_GUID.as_ptr(), core::ptr::null(), &mut gop);
-    if status != 0 || gop.is_null() {
+    if status != 0 {
         return (false, status);
+    }
+    if gop.is_null() {
+        return (false, STRUCTURAL_FAIL);
     }
     let mode = (gop.add(GOP_MODE_OFF) as *const *const u8).read_unaligned();
     if mode.is_null() {
-        return (false, status);
+        return (false, STRUCTURAL_FAIL);
     }
     let info_ptr = (mode.add(GOP_MODE_INFO_OFF) as *const *const u8).read_unaligned();
     let size_of_info = (mode.add(GOP_MODE_SIZE_OF_INFO_OFF) as *const usize).read_unaligned();
     let fb_base = (mode.add(GOP_MODE_FB_BASE_OFF) as *const u64).read_unaligned();
     let fb_size = (mode.add(GOP_MODE_FB_SIZE_OFF) as *const usize).read_unaligned();
     if info_ptr.is_null() || size_of_info < GOP_INFO_MIN {
-        return (false, status);
+        return (false, STRUCTURAL_FAIL);
     }
     let mode_info = core::slice::from_raw_parts(info_ptr, GOP_INFO_MIN);
-    let ok = info.fill_from_gop_mode(fb_base, fb_size as u64, mode_info);
-    (ok, status)
+    if !info.fill_from_gop_mode(fb_base, fb_size as u64, mode_info) {
+        return (false, STRUCTURAL_FAIL);
+    }
+    (true, status)
 }
 
 /// Emit the one-line `GOP` diagnostic after the `MEMMAP` line:
 /// `GOP ok=<0|1> status=<0x...>` — `ok` covers locate + mode-info parse;
-/// `status` is the raw `LocateProtocol` `EFI_STATUS`.
+/// `status` is the raw `LocateProtocol` `EFI_STATUS`, or
+/// `0xffffffffffffffff` ([`STRUCTURAL_FAIL`]) for structural failures.
 fn write_gop_line(ok: bool, status: usize) {
     let mut emit = com1_emit;
     let _ = write_str(&mut emit, "GOP ok=");
@@ -578,7 +601,7 @@ mod tests {
         let good = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
         assert!(unsafe { load_get_memory_map(good.as_ptr()) }.is_some());
         // Good signature + null GetMemoryMap slot -> None.
-        let bs_empty = vec![0u8; BOOT_SERVICES_GET_MEMORY_MAP_OFF + 8];
+        let bs_empty = [0u8; BOOT_SERVICES_GET_MEMORY_MAP_OFF + 8];
         let no_slot = fake_table(SYSTEM_TABLE_SIGNATURE, bs_empty.as_ptr());
         assert!(unsafe { load_get_memory_map(no_slot.as_ptr()) }.is_none());
     }
@@ -594,7 +617,7 @@ mod tests {
         assert!(unsafe { load_locate_protocol(null_bs.as_ptr()) }.is_none());
         let good = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
         assert!(unsafe { load_locate_protocol(good.as_ptr()) }.is_some());
-        let bs_empty = vec![0u8; BOOT_SERVICES_LOCATE_PROTOCOL_OFF + 8];
+        let bs_empty = [0u8; BOOT_SERVICES_LOCATE_PROTOCOL_OFF + 8];
         let no_slot = fake_table(SYSTEM_TABLE_SIGNATURE, bs_empty.as_ptr());
         assert!(unsafe { load_locate_protocol(no_slot.as_ptr()) }.is_none());
     }
@@ -610,7 +633,7 @@ mod tests {
         assert!(unsafe { load_exit_boot_services(null_bs.as_ptr()) }.is_none());
         let good = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
         assert!(unsafe { load_exit_boot_services(good.as_ptr()) }.is_some());
-        let bs_empty = vec![0u8; BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF + 8];
+        let bs_empty = [0u8; BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF + 8];
         let no_slot = fake_table(SYSTEM_TABLE_SIGNATURE, bs_empty.as_ptr());
         assert!(unsafe { load_exit_boot_services(no_slot.as_ptr()) }.is_none());
         // Offset sanity: +232 must not collide with GetMemoryMap (+56) or
@@ -624,5 +647,165 @@ mod tests {
             BOOT_SERVICES_LOCATE_PROTOCOL_OFF
         );
         assert_eq!(BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF, 232);
+    }
+
+    /// Serializes host tests that touch the static `MEMMAP_BUF` fill path
+    /// (the Rust test harness runs tests in parallel threads).
+    static MEMMAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `GetMemoryMap` stand: firmware `EFI_STATUS` 0 but an implausible
+    /// descriptor stride, i.e. the structural-failure branch of
+    /// [`fill_boot_info`] with no raw error to report.
+    unsafe extern "efiapi" fn get_map_structural(
+        _map_size: *mut usize,
+        _buf: *mut u8,
+        _key: *mut usize,
+        desc_size: *mut usize,
+        _desc_version: *mut u32,
+    ) -> usize {
+        *desc_size = 8;
+        0
+    }
+
+    /// `GetMemoryMap` stand: raw firmware error (`EFI_NOT_FOUND` encoding)
+    /// that must pass through verbatim, not be masked by a sentinel.
+    unsafe extern "efiapi" fn get_map_raw_error(
+        _map_size: *mut usize,
+        _buf: *mut u8,
+        _key: *mut usize,
+        _desc_size: *mut usize,
+        _desc_version: *mut u32,
+    ) -> usize {
+        0x8000_0000_0000_000E
+    }
+
+    /// agent-b #5 nit: a failed `MEMMAP` line must never read
+    /// `ok=0 status=0x0` — structural failures report [`STRUCTURAL_FAIL`],
+    /// raw firmware errors keep their exact `EFI_STATUS`.
+    #[test]
+    fn fill_boot_info_failures_are_diagnosable() {
+        let _guard = MEMMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Structural: locate slot present, status 0, bogus desc_size.
+        let bs = fake_bs_with_slot(
+            BOOT_SERVICES_GET_MEMORY_MAP_OFF,
+            get_map_structural as *const (),
+        );
+        let st = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
+        let mut info = BootInfo::new();
+        let (ok, status, pushed, total, key) = unsafe { fill_boot_info(st.as_ptr(), &mut info) };
+        assert!(!ok);
+        assert_eq!(status, STRUCTURAL_FAIL);
+        assert_eq!((pushed, total, key), (0, 0, 0));
+        // Raw firmware error passes through unchanged.
+        let bs = fake_bs_with_slot(
+            BOOT_SERVICES_GET_MEMORY_MAP_OFF,
+            get_map_raw_error as *const (),
+        );
+        let st = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
+        let (ok, status, pushed, total, key) = unsafe { fill_boot_info(st.as_ptr(), &mut info) };
+        assert!(!ok);
+        assert_eq!(status, 0x8000_0000_0000_000E);
+        assert_eq!((pushed, total, key), (0, 0, 0));
+        // Missing/stale system table (slot load fails) is structural too.
+        let (ok, status, pushed, total, key) =
+            unsafe { fill_boot_info(core::ptr::null(), &mut info) };
+        assert!(!ok);
+        assert_eq!(status, STRUCTURAL_FAIL);
+        assert_eq!((pushed, total, key), (0, 0, 0));
+    }
+
+    /// agent-b #5 nit, GOP half: structural GOP failures (null protocol,
+    /// null `Mode`/`Info`, rejected mode info) report [`STRUCTURAL_FAIL`],
+    /// raw `LocateProtocol` errors pass through, and the accepted path still
+    /// returns `(true, 0)`.
+    #[test]
+    fn fill_framebuffer_failures_never_report_zero_status() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static GOP_PTR: AtomicUsize = AtomicUsize::new(0);
+        static LOCATE_STATUS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "efiapi" fn locate_probe(
+            _protocol: *const u8,
+            _registration: *const u8,
+            out: *mut *mut u8,
+        ) -> usize {
+            let status = LOCATE_STATUS.load(Ordering::Relaxed);
+            if status == 0 {
+                *out = GOP_PTR.load(Ordering::Relaxed) as *mut u8;
+            }
+            status
+        }
+
+        let bs = fake_bs_with_slot(BOOT_SERVICES_LOCATE_PROTOCOL_OFF, locate_probe as *const ());
+        let st = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
+        let mut info = BootInfo::new();
+        let run = |info: &mut BootInfo| unsafe { fill_framebuffer(st.as_ptr(), info) };
+
+        // Locate ok, protocol pointer left null -> structural.
+        GOP_PTR.store(0, Ordering::Relaxed);
+        LOCATE_STATUS.store(0, Ordering::Relaxed);
+        let (ok, status) = run(&mut info);
+        assert!(!ok);
+        assert_eq!(status, STRUCTURAL_FAIL);
+
+        // Raw firmware error preserved verbatim (no sentinel overwrite).
+        LOCATE_STATUS.store(0x8000_0000_0000_000E, Ordering::Relaxed);
+        let (ok, status) = run(&mut info);
+        assert!(!ok);
+        assert_eq!(status, 0x8000_0000_0000_000E);
+        LOCATE_STATUS.store(0, Ordering::Relaxed);
+
+        // Locate ok, GOP present but Mode pointer null -> structural.
+        let gop_null_mode = [0u8; 40];
+        GOP_PTR.store(gop_null_mode.as_ptr() as usize, Ordering::Relaxed);
+        let (ok, status) = run(&mut info);
+        assert!(!ok);
+        assert_eq!(status, STRUCTURAL_FAIL);
+
+        // Mode present, Info pointer null -> structural.
+        let mode = [0u8; 40];
+        let mut gop = [0u8; 32];
+        gop[GOP_MODE_OFF..GOP_MODE_OFF + 8]
+            .copy_from_slice(&(mode.as_ptr() as usize).to_le_bytes());
+        GOP_PTR.store(gop.as_ptr() as usize, Ordering::Relaxed);
+        let (ok, status) = run(&mut info);
+        assert!(!ok);
+        assert_eq!(status, STRUCTURAL_FAIL);
+
+        // Full parse, PixelBltOnly (format 3) fails closed in
+        // fill_from_gop_mode -> structural, framebuffer stays unset.
+        let mut mode_info = [0u8; 36];
+        mode_info[4..8].copy_from_slice(&1024u32.to_le_bytes());
+        mode_info[8..12].copy_from_slice(&768u32.to_le_bytes());
+        mode_info[12..16].copy_from_slice(&3u32.to_le_bytes());
+        mode_info[32..36].copy_from_slice(&1024u32.to_le_bytes());
+        let mut mode = [0u8; 40];
+        mode[GOP_MODE_INFO_OFF..GOP_MODE_INFO_OFF + 8]
+            .copy_from_slice(&(mode_info.as_ptr() as usize).to_le_bytes());
+        mode[GOP_MODE_SIZE_OF_INFO_OFF..GOP_MODE_SIZE_OF_INFO_OFF + 8]
+            .copy_from_slice(&36usize.to_le_bytes());
+        mode[GOP_MODE_FB_BASE_OFF..GOP_MODE_FB_BASE_OFF + 8]
+            .copy_from_slice(&0x8000_0000u64.to_le_bytes());
+        mode[GOP_MODE_FB_SIZE_OFF..GOP_MODE_FB_SIZE_OFF + 8]
+            .copy_from_slice(&(8 * 1024 * 1024usize).to_le_bytes());
+        let mut gop = [0u8; 32];
+        gop[GOP_MODE_OFF..GOP_MODE_OFF + 8]
+            .copy_from_slice(&(mode.as_ptr() as usize).to_le_bytes());
+        GOP_PTR.store(gop.as_ptr() as usize, Ordering::Relaxed);
+        let (ok, status) = run(&mut info);
+        assert!(!ok);
+        assert_eq!(status, STRUCTURAL_FAIL);
+        assert_eq!(info.has_framebuffer, 0);
+
+        // Accepted path unchanged: format 0 -> (true, raw status 0).
+        mode_info[12..16].copy_from_slice(&0u32.to_le_bytes());
+        let (ok, status) = run(&mut info);
+        assert!(ok);
+        assert_eq!(status, 0);
+        assert_eq!(info.has_framebuffer, 1);
+
+        GOP_PTR.store(0, Ordering::Relaxed);
     }
 }
