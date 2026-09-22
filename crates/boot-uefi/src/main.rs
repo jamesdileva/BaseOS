@@ -1,7 +1,8 @@
 //! S01 UEFI guest: emits the serial-marker contract on COM1, fills a
 //! [`baseos_boot_info::BootInfo`] from UEFI `GetMemoryMap` plus the GOP
 //! framebuffer, prints the [`baseos_boot_info::write_boot_summary`] debug
-//! summary, then parks the CPU.
+//! summary, transfers the handoff to [`baseos_kernel::kernel_entry`]
+//! (S02), then parks the CPU.
 //!
 //! Minimal `no_std` UEFI application (`efi_main`): it parses the raw
 //! `EFI_SYSTEM_TABLE`/`EFI_BOOT_SERVICES` tables with fixed byte offsets
@@ -12,8 +13,8 @@
 //! [`baseos_boot_info::BootInfo::fill_from_gop_mode`], and reports the
 //! result on COM1. `tools/qemu/boot-uefi.ps1` builds this for
 //! `x86_64-unknown-uefi`, boots OVMF, and asserts the marker plus the
-//! `BOOTINFO valid=1`, `MEMMAP ok=1`, and `FB present=1` summary lines in
-//! the serial capture.
+//! `BOOTINFO valid=1`, `MEMMAP ok=1`, `FB present=1`, and `KERNEL ok=1`
+//! summary lines in the serial capture.
 
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
@@ -27,6 +28,7 @@
 #![allow(unsafe_code)]
 
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
+use baseos_kernel::kernel_entry;
 use baseos_serial_marker::write_marker;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -365,6 +367,9 @@ pub extern "efiapi" fn efi_main(_image_handle: *const (), system_table: *const u
         write_boot_summary::<Infallible>(&info, &mut emit).unwrap();
         write_memmap_line(ok, status, pushed, total);
         write_gop_line(gop_ok, gop_status);
+        // S02 kernel entry: transfer the handoff to crates/kernel and emit
+        // the KERNEL ok=<0|1> proof line (e2e hard-require in boot-uefi.ps1).
+        kernel_entry::<Infallible>(&info, &mut emit).unwrap();
         loop {
             asm!("hlt", options(nomem, nostack, preserves_flags));
         }

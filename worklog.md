@@ -572,3 +572,43 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Finding 4 closed: GOP framebuffer proven end-to-end with
   hard-require gates; task #2 ready to close pending agent-b review of this
   commit. Deferred risk 2 (BUFFER_TOO_SMALL retry) remains S03 candidate.
+
+## S02 slice 1 — kernel entry handoff (2026-09-21)
+
+- **Decision:** Open S02 with the handoff half as one committable slice:
+  (a) new no_std `crates/kernel` (`baseos-kernel`, workspace
+  members+default-members) exposing `kernel_entry(&BootInfo, emit)` which
+  validates the S01 handoff and emits one line
+  `KERNEL ok=<0|1> regions=<n> usable=<0x...> fb=<0|1>` through the same
+  byte-callback sink style as the boot summary (corrupt header prints
+  `ok=0` with usable/fb gated to 0 — fail-loud, never panics); (b)
+  `crates/boot-uefi` calls `kernel_entry` on COM1 after the GOP line,
+  still parking with `hlt` (no ExitBootServices/GDT/IDT this slice);
+  (c) `boot-uefi.ps1` hard-requires `KERNEL ok=1` in the serial capture
+  (missing = FAIL) and its banner now says S02 slice 1; (d) 3 host tests:
+  valid map+fb exact line, corrupt-magic `ok=0` exact line, valid-empty
+  exact line.
+- **Why:** S01 produced a filled BootInfo but nothing ever received it —
+  roadmap S01 end goal ("reach its own kernel entry point") and S02 title
+  both need an actual transfer; smallest end-to-end proof is the entry
+  function + serial gate before CPU-init slices.
+- **Alternatives:** ExitBootServices + separate kernel image first
+  (rejected: multi-risk single cycle — map-key dance, PE staging, GDT all
+  unproven; entry-as-call keeps one committable slice); fold entry into
+  boot-uefi main (rejected: kernel logic must live in crates/kernel to
+  grow into GDT/IDT/panic slices without bloating the loader).
+- **Expected:** `cargo test` 34 default (3 new kernel) + 2 boot-uefi,
+  fmt + clippy clean both targets, `boot-uefi.ps1` PASS with
+  `KERNEL ok=1`, `smoke -RequireOvmf` still PASS.
+- **Measured (2026-09-21, Win11):** `cargo test` 34/34 default OK
+  (21 boot-info + 3 kernel + 4 marker + 4 harness + 2 version);
+  `cargo fmt --check` clean; `clippy --all-targets -D warnings` clean
+  (host) and `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 562
+  bytes: marker FOUND, BOOTINFO/MEMMAP/truncated/FB/GOP all ok,
+  `KERNEL ok=1 regions=98 usable=0xce94000 fb=1`, guest `bootx64.efi`
+  26624 bytes.
+- **Final:** Kernel entry proven end-to-end with hard-require gate. Next:
+  ExitBootServices + park-after-handoff (or GDT slice) as S02 slice 2;
+  risk 2 (BUFFER_TOO_SMALL retry) stays S03; nit 3 (`\n` endings) stays
+  S35.

@@ -1,0 +1,11 @@
+[package]
+name = "baseos-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+baseos-boot-info = { path = "../boot-info" }
+
+[lints]
+workspace = true

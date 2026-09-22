@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 baseos-serial-marker = { path = "../serial-marker" }
 baseos-boot-info = { path = "../boot-info" }
+baseos-kernel = { path = "../kernel" }
 
 [lints]
 workspace = true
