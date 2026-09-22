@@ -1,8 +1,8 @@
 //! S01 UEFI guest: emits the serial-marker contract on COM1, fills a
 //! [`baseos_boot_info::BootInfo`] from UEFI `GetMemoryMap` plus the GOP
 //! framebuffer, prints the [`baseos_boot_info::write_boot_summary`] debug
-//! summary, transfers the handoff to [`baseos_kernel::kernel_entry`]
-//! (S02), then parks the CPU.
+//! summary, crosses `ExitBootServices`, then transfers the handoff to
+//! [`baseos_kernel::kernel_entry`] and the S02 GDT/IDT/`#DE` bring-up.
 //!
 //! Minimal `no_std` UEFI application (`efi_main`): it parses the raw
 //! `EFI_SYSTEM_TABLE`/`EFI_BOOT_SERVICES` tables with fixed byte offsets
@@ -10,11 +10,13 @@
 //! static 16 KiB buffer, locates the Graphics Output Protocol via
 //! `LocateProtocol`, fills `BootInfo` via
 //! [`baseos_boot_info::BootInfo::fill_from_raw_descriptors`] /
-//! [`baseos_boot_info::BootInfo::fill_from_gop_mode`], and reports the
-//! result on COM1. `tools/qemu/boot-uefi.ps1` builds this for
+//! [`baseos_boot_info::BootInfo::fill_from_gop_mode`], reports the result
+//! on COM1, exits boot services (map-key retry on `EFI_INVALID_PARAMETER`),
+//! and enters the kernel. `tools/qemu/boot-uefi.ps1` builds this for
 //! `x86_64-unknown-uefi`, boots OVMF, and asserts the marker plus the
-//! `BOOTINFO valid=1`, `MEMMAP ok=1`, `FB present=1`, and `KERNEL ok=1`
-//! summary lines in the serial capture.
+//! `BOOTINFO valid=1`, `MEMMAP ok=1`, `FB present=1`, `GOP ok=1`,
+//! `EBS ok=1`, `KERNEL ok=1`, and `EXC ok=1 vector=0` summary lines in the
+//! serial capture.
 
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
@@ -57,6 +59,15 @@ const BOOT_SERVICES_GET_MEMORY_MAP_OFF: usize = 56;
 /// 37 preceding function pointers/reserved slots through
 /// `LocateHandleBuffer`, 8 bytes each = 320).
 const BOOT_SERVICES_LOCATE_PROTOCOL_OFF: usize = 320;
+/// Byte offset of `ExitBootServices` in `EFI_BOOT_SERVICES` (header 24 +
+/// the 25 preceding function pointers/reserved slots through
+/// `UnloadImage`, 8 bytes each = 232). Verified against the UEFI spec table
+/// layout (RaiseTPL at 24 … ExitBootServices after UnloadImage).
+const BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF: usize = 232;
+/// `EFI_INVALID_PARAMETER` (bit 63 set + code 2): the map key from the last
+/// `GetMemoryMap` is stale — the UEFI-mandated signal to refresh the key
+/// and retry `ExitBootServices` once before failing closed.
+const EFI_INVALID_PARAMETER: usize = 0x8000_0000_0000_0002;
 /// `EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID` (`9042a9de-23dc-4a38-96fb-7aded080516a`)
 /// as a raw `EFI_GUID` (mixed-endian: `Data1`/`Data2`/`Data3` little-endian,
 /// `Data4` byte array).
@@ -154,6 +165,25 @@ fn com1_emit(byte: u8) -> Result<(), Infallible> {
     Ok(())
 }
 
+/// Raw `ExitBootServices` signature (x86-64 UEFI = `efiapi` calling
+/// convention): `(ImageHandle, MapKey) -> EFI_STATUS`.
+type ExitBootServicesFn = unsafe extern "efiapi" fn(*const (), usize) -> usize;
+
+/// Load the `ExitBootServices` entry point from the raw system table.
+///
+/// # Safety
+/// Same contract as [`load_get_memory_map`]: live `EFI_SYSTEM_TABLE`,
+/// signature-gated via [`load_boot_services`], null-slot fails closed.
+unsafe fn load_exit_boot_services(system_table: *const u8) -> Option<ExitBootServicesFn> {
+    let boot_services = load_boot_services(system_table)?;
+    let slot = (boot_services.add(BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF) as *const *const ())
+        .read_unaligned();
+    if slot.is_null() {
+        return None;
+    }
+    Some(core::mem::transmute::<*const (), ExitBootServicesFn>(slot))
+}
+
 /// Raw `GetMemoryMap` signature (x86-64 UEFI = `efiapi` calling convention).
 type GetMemoryMapFn = unsafe extern "efiapi" fn(
     *mut usize, // MemoryMapSize (in/out bytes)
@@ -229,18 +259,19 @@ unsafe fn load_locate_protocol(system_table: *const u8) -> Option<LocateProtocol
 
 /// Call `GetMemoryMap` into the static buffer and fill `info`.
 ///
-/// Returns `(ok, status, pushed, total)`: `ok` is true only when the
-/// firmware call succeeded; `status` is the raw `EFI_STATUS`; `pushed` is
+/// Returns `(ok, status, pushed, total, map_key)`: `ok` is true only when
+/// the firmware call succeeded; `status` is the raw `EFI_STATUS`; `pushed` is
 /// the number of regions stored (0 on failure); `total` is the firmware
-/// descriptor count (`map_size / desc_size`, 0 on failure). `pushed < total`
-/// means the 128-entry inline map truncated the firmware map — reported on
-/// serial as `truncated=1` so e2e fails loudly (review #29 risk 1). Never
-/// panics; a failure still leaves `info` valid-but-empty so the serial
-/// summary stays diagnosable.
+/// descriptor count (`map_size / desc_size`, 0 on failure); `map_key` is the
+/// opaque key [`ExitBootServices`] will validate (0 on failure — never pass
+/// a zero key to EBS). `pushed < total` means the 128-entry inline map
+/// truncated the firmware map — reported on serial as `truncated=1` so e2e
+/// fails loudly (review #29 risk 1). Never panics; a failure still leaves
+/// `info` valid-but-empty so the serial summary stays diagnosable.
 ///
 /// Deferred (review #29 risk 2, candidate S03): single-shot 16 KiB call
 /// with no `BUFFER_TOO_SMALL` retry. Fine for QEMU (~100 entries) but a
-/// larger bare-metal map fails loudly with `(false, status, 0, 0)` and no
+/// larger bare-metal map fails loudly with `(false, status, 0, 0, 0)` and no
 /// recovery path — recorded here so it is not mistaken for a complete
 /// driver.
 ///
@@ -250,9 +281,9 @@ unsafe fn load_locate_protocol(system_table: *const u8) -> Option<LocateProtocol
 unsafe fn fill_boot_info(
     system_table: *const u8,
     info: &mut BootInfo,
-) -> (bool, usize, usize, usize) {
+) -> (bool, usize, usize, usize, usize) {
     let Some(get_map) = load_get_memory_map(system_table) else {
-        return (false, usize::MAX, 0, 0);
+        return (false, usize::MAX, 0, 0, 0);
     };
     let buf = &mut *core::ptr::addr_of_mut!(MEMMAP_BUF);
     let mut map_size = buf.len();
@@ -267,11 +298,83 @@ unsafe fn fill_boot_info(
         &mut desc_version,
     );
     if status != 0 || desc_size < 40 || map_size > buf.len() {
-        return (false, status, 0, 0);
+        return (false, status, 0, 0, 0);
     }
     let total = map_size / desc_size;
     let pushed = info.fill_from_raw_descriptors(&buf[..map_size], desc_size);
-    (true, status, pushed, total)
+    (true, status, pushed, total, map_key)
+}
+
+/// Refresh only the map key (ignore descriptor contents) for an EBS retry.
+///
+/// Returns `(ok, map_key)`: `ok` is true only when `GetMemoryMap` succeeded
+/// and returned a non-zero key; the caller must not use `info` from this
+/// call (this is key-refresh only after a stale-key `EFI_INVALID_PARAMETER`).
+///
+/// # Safety
+/// Pre-`ExitBootServices` only; same static-buffer exclusivity contract as
+/// [`fill_boot_info`].
+unsafe fn refresh_map_key(system_table: *const u8) -> (bool, usize) {
+    let Some(get_map) = load_get_memory_map(system_table) else {
+        return (false, 0);
+    };
+    let buf = &mut *core::ptr::addr_of_mut!(MEMMAP_BUF);
+    let mut map_size = buf.len();
+    let mut map_key: usize = 0;
+    let mut desc_size: usize = 0;
+    let mut desc_version: u32 = 0;
+    let status = get_map(
+        &mut map_size,
+        buf.as_mut_ptr(),
+        &mut map_key,
+        &mut desc_size,
+        &mut desc_version,
+    );
+    if status != 0 || map_key == 0 {
+        return (false, 0);
+    }
+    (true, map_key)
+}
+
+/// Cross `ExitBootServices`: validate the map key and hand the CPU to the
+/// kernel world (no more boot-service calls after success).
+///
+/// Returns `(ok, status)`: `ok` is true only when EBS returned 0; `status`
+/// is the raw `EFI_STATUS` of the *last* attempt. On
+/// `EFI_INVALID_PARAMETER` (stale key — GOP/summary activity may have
+/// allocated) the map key is refreshed once and EBS retried, per the UEFI
+/// spec; a second failure fails closed (no infinite retry, no silent
+/// success). Never panics.
+///
+/// # Safety
+/// Must run on the boot thread with `system_table` live and `image_handle`
+/// from `efi_main`. On success the caller must not invoke any boot-service
+/// function again (the firmware tables are invalid); on failure the caller
+/// still owns boot services and may park.
+unsafe fn exit_boot_services(
+    image_handle: *const (),
+    system_table: *const u8,
+    map_key: usize,
+) -> (bool, usize) {
+    let Some(ebs) = load_exit_boot_services(system_table) else {
+        return (false, usize::MAX);
+    };
+    if map_key == 0 {
+        return (false, usize::MAX);
+    }
+    let status = ebs(image_handle, map_key);
+    if status == 0 {
+        return (true, 0);
+    }
+    if status != EFI_INVALID_PARAMETER {
+        return (false, status);
+    }
+    let (refreshed, new_key) = refresh_map_key(system_table);
+    if !refreshed {
+        return (false, status);
+    }
+    let status2 = ebs(image_handle, new_key);
+    (status2 == 0, status2)
 }
 
 /// Emit the one-line `MEMMAP` diagnostic after the two-line boot summary:
@@ -342,14 +445,28 @@ fn write_gop_line(ok: bool, status: usize) {
     let _ = write_str(&mut emit, "\n");
 }
 
-/// UEFI entry point: marker, memory-map + framebuffer fill, summary, park.
+/// Emit the one-line `EBS` diagnostic after the GOP line:
+/// `EBS ok=<0|1> status=<0x...>` — `ok` is 1 only when `ExitBootServices`
+/// returned success (hard-require in `boot-uefi.ps1`); `status` is the raw
+/// `EFI_STATUS` of the last attempt (includes any stale-key retry).
+fn write_ebs_line(ok: bool, status: usize) {
+    let mut emit = com1_emit;
+    let _ = write_str(&mut emit, "EBS ok=");
+    let _ = write_u64_dec(&mut emit, u64::from(ok));
+    let _ = write_str(&mut emit, " status=");
+    let _ = write_u64_hex(&mut emit, status as u64);
+    let _ = write_str(&mut emit, "\n");
+}
+
+/// UEFI entry point: marker, memory-map + framebuffer fill, summary,
+/// `ExitBootServices`, kernel handoff + CPU bring-up, park.
 ///
 /// The firmware passes `(image_handle, system_table)` per the UEFI spec;
-/// the handle is unused (no `Unload` path), the table feeds `GetMemoryMap`
-/// and GOP `LocateProtocol`.
+/// the handle feeds `ExitBootServices`, the table feeds `GetMemoryMap`,
+/// GOP `LocateProtocol`, and the EBS slot load.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
-pub extern "efiapi" fn efi_main(_image_handle: *const (), system_table: *const u8) -> usize {
+pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8) -> usize {
     // SAFETY: single-threaded boot environment, COM1 is ours exclusively;
     // init-then-write order upheld by construction here. Sinks are
     // infallible, so `unwrap` cannot panic.
@@ -361,15 +478,24 @@ pub extern "efiapi" fn efi_main(_image_handle: *const (), system_table: *const u
         })
         .unwrap();
         let mut info = BootInfo::new();
-        let (ok, status, pushed, total) = fill_boot_info(system_table, &mut info);
+        let (ok, status, pushed, total, map_key) = fill_boot_info(system_table, &mut info);
         let (gop_ok, gop_status) = fill_framebuffer(system_table, &mut info);
         let mut emit = com1_emit;
         write_boot_summary::<Infallible>(&info, &mut emit).unwrap();
         write_memmap_line(ok, status, pushed, total);
         write_gop_line(gop_ok, gop_status);
-        // S02 kernel entry: transfer the handoff to crates/kernel and emit
-        // the KERNEL ok=<0|1> proof line (e2e hard-require in boot-uefi.ps1).
-        kernel_entry::<Infallible>(&info, &mut emit).unwrap();
+        // S02 slice 2: leave the firmware world. After a successful EBS no
+        // boot-service call is legal — kernel_entry + GDT/IDT/`#DE` run on
+        // bare CPU + our COM1 only (agent-b #38 caveat: KERNEL ok=1 must be
+        // post-EBS to honestly claim the S01 end goal).
+        let (ebs_ok, ebs_status) = exit_boot_services(image_handle, system_table, map_key);
+        write_ebs_line(ebs_ok, ebs_status);
+        if ebs_ok {
+            kernel_entry::<Infallible>(&info, &mut emit).unwrap();
+            baseos_kernel::bring_up_cpu_and_prove_exception();
+        }
+        // EBS failed: still own boot services — park fail-loud (e2e sees
+        // EBS ok=0 / missing KERNEL+EXC lines and exits non-zero).
         loop {
             asm!("hlt", options(nomem, nostack, preserves_flags));
         }
@@ -413,6 +539,10 @@ mod tests {
         _b: *const u8,
         _c: *mut *mut u8,
     ) -> usize {
+        0
+    }
+
+    unsafe extern "efiapi" fn dummy_ebs(_a: *const (), _b: usize) -> usize {
         0
     }
 
@@ -467,5 +597,32 @@ mod tests {
         let bs_empty = vec![0u8; BOOT_SERVICES_LOCATE_PROTOCOL_OFF + 8];
         let no_slot = fake_table(SYSTEM_TABLE_SIGNATURE, bs_empty.as_ptr());
         assert!(unsafe { load_locate_protocol(no_slot.as_ptr()) }.is_none());
+    }
+
+    #[test]
+    fn system_table_signature_gates_exit_boot_services() {
+        // S02 slice 2: EBS reuses the review #29 risk-3 fail-closed gate.
+        let bs = fake_bs_with_slot(BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF, dummy_ebs as *const ());
+        assert!(unsafe { load_exit_boot_services(core::ptr::null()) }.is_none());
+        let bad = fake_table(0xDEAD_BEEF_DEAD_BEEF, bs.as_ptr());
+        assert!(unsafe { load_exit_boot_services(bad.as_ptr()) }.is_none());
+        let null_bs = fake_table(SYSTEM_TABLE_SIGNATURE, core::ptr::null());
+        assert!(unsafe { load_exit_boot_services(null_bs.as_ptr()) }.is_none());
+        let good = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
+        assert!(unsafe { load_exit_boot_services(good.as_ptr()) }.is_some());
+        let bs_empty = vec![0u8; BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF + 8];
+        let no_slot = fake_table(SYSTEM_TABLE_SIGNATURE, bs_empty.as_ptr());
+        assert!(unsafe { load_exit_boot_services(no_slot.as_ptr()) }.is_none());
+        // Offset sanity: +232 must not collide with GetMemoryMap (+56) or
+        // LocateProtocol (+320) — a wrong constant would load the wrong slot.
+        assert_ne!(
+            BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF,
+            BOOT_SERVICES_GET_MEMORY_MAP_OFF
+        );
+        assert_ne!(
+            BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF,
+            BOOT_SERVICES_LOCATE_PROTOCOL_OFF
+        );
+        assert_eq!(BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF, 232);
     }
 }

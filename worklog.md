@@ -612,3 +612,50 @@ Format per entry (per `implementation-guide.md` §31):
   ExitBootServices + park-after-handoff (or GDT slice) as S02 slice 2;
   risk 2 (BUFFER_TOO_SMALL retry) stays S03; nit 3 (`\n` endings) stays
   S35.
+
+## S02 slice 2 — ExitBootServices + GDT/IDT + controlled #DE (2026-09-21)
+
+- **Decision:** Land the post-handoff half of S02 as one slice, fixing
+  agent-b #39 REJECT blockers first: (a) ExitBootServices at raw BS+232 with
+  GetMemoryMap buffer dance (16KiB, two-pass on BUFFER_TOO_SMALL only for the
+  print path — first EBS attempt must succeed this slice), emit
+  `EBS ok=<0|1>`; (b) after successful EBS + `cli`, install a 3-entry GDT
+  (null/code/data), populate IDT vector 0 with a present interrupt gate to
+  the #DE stub, `lidt`, then `div` by zero; (c) ISR stub rewritten for
+  `x86_64-unknown-uefi` Microsoft x64 ABI — zero vector in `RCX` (not
+  `RDI`), `and rsp,-16` + `sub rsp,32` shadow space before
+  `call exception_handler_rust`, which emits `EXC ok=1 vector=0` on COM1 and
+  parks; stub body lives in `de_isr_stub_asm!` shared with a host test that
+  locks the ABI instructions; (d) E0793 fix: copy packed `IdtEntry` fields
+  to locals before `assert_eq!`; (e) function-pointer cast via
+  `as *const () as u64`; guest-only types (`Gdt`/`Idt`/`DescriptorTablePointer`
+  statics) gated `cfg(not(test))` so host clippy `-D warnings` stays clean;
+  (f) `boot-uefi.ps1` hard-requires `EBS ok=1`, `KERNEL ok=1` (now post-EBS),
+  and `EXC ok=1 vector=0`.
+- **Why:** agent-b #39 blocked the first S02-slice-2 attempt: packed-field
+  refs are hard errors under `-D warnings`, the old stub put the vector in
+  `RDI` (garbage `vector=266751014` under Win64 ABI), and the fn-to-int
+  cast warned; keeping EBS+CPU-init+exception in one slice matches the
+  roadmap verify line (controlled `#DE`, stable kernel) without splitting
+  the boot script across commits.
+- **Alternatives:** Split EBS and GDT/IDT into two commits (rejected: e2e
+  gate needs both for `EXC` and agent-b asked for one REJECT fix cycle);
+  SysV-style stub leaving `RDI` (rejected: UEFI target is Win64, not SysV);
+  separate `.S` file for the stub (rejected: macro keeps one source of
+  truth for guest `global_asm!` and the host ABI test).
+- **Expected:** cargo test both targets green, fmt + clippy `-D warnings`
+  clean host and `x86_64-unknown-uefi`, `boot-uefi.ps1` PASS with
+  `EBS ok=1` + `KERNEL ok=1` + `EXC ok=1 vector=0`.
+- **Measured (2026-09-21, Win11):** `cargo test` 37/37 default OK (21
+  boot-info + 6 kernel incl. Win64 ABI stub test + 4 marker + 4 harness +
+  2 version) + 2 doc-tests; `cargo fmt --check` clean;
+  `clippy --all-targets -- -D warnings` clean; `clippy -p baseos-boot-uefi
+  --target x86_64-unknown-uefi -- -D warnings` clean; `boot-uefi.ps1` UEFI
+  BOOT PASS exit 0: marker FOUND, BOOTINFO/MEMMAP/truncated/FB/GOP ok,
+  `EBS ok=1` first attempt, `KERNEL ok=1` post-EBS, `EXC ok=1 vector=0`,
+  guest `bootx64.efi` 30720 bytes.
+- **Final:** All three #39 blockers fixed and gates green; slice 2 committed
+  pending agent-b review. Known-untested: stale-map-key EBS retry (EBS
+  succeeded first try this boot). Risk 2 (BUFFER_TOO_SMALL retry on EBS)
+  remains S03. Harness nit: prior sitrep stale dirty list still open for
+  human/orchestrator.
