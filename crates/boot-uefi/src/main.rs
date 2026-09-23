@@ -7,7 +7,8 @@
 //! Minimal `no_std` UEFI application (`efi_main`): it parses the raw
 //! `EFI_SYSTEM_TABLE`/`EFI_BOOT_SERVICES` tables with fixed byte offsets
 //! (no `uefi` crate — dependency-free slice), calls `GetMemoryMap` into a
-//! static 16 KiB buffer, locates the Graphics Output Protocol via
+//! static 16 KiB buffer (retrying through an `AllocatePool` overflow buffer
+//! on `EFI_BUFFER_TOO_SMALL`), locates the Graphics Output Protocol via
 //! `LocateProtocol`, fills `BootInfo` via
 //! [`baseos_boot_info::BootInfo::fill_from_raw_descriptors`] /
 //! [`baseos_boot_info::BootInfo::fill_from_gop_mode`], reports the result
@@ -55,6 +56,10 @@ const SYSTEM_TABLE_SIGNATURE: u64 = 0x5453_5953_2049_4249;
 /// Byte offset of `GetMemoryMap` in `EFI_BOOT_SERVICES`
 /// (header 24 + `RaiseTPL`/`RestoreTPL`/`AllocatePages`/`FreePages` 32 = 56).
 const BOOT_SERVICES_GET_MEMORY_MAP_OFF: usize = 56;
+/// Byte offset of `AllocatePool` in `EFI_BOOT_SERVICES` (header 24 +
+/// `RaiseTPL`/`RestoreTPL`/`AllocatePages`/`FreePages`/`GetMemoryMap`
+/// 40 = 64). Used only by the `EFI_BUFFER_TOO_SMALL` map-retry dance.
+const BOOT_SERVICES_ALLOCATE_POOL_OFF: usize = 64;
 /// Byte offset of `LocateProtocol` in `EFI_BOOT_SERVICES` (header 24 + the
 /// 37 preceding function pointers/reserved slots through
 /// `LocateHandleBuffer`, 8 bytes each = 320).
@@ -68,6 +73,26 @@ const BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF: usize = 232;
 /// `GetMemoryMap` is stale — the UEFI-mandated signal to refresh the key
 /// and retry `ExitBootServices` once before failing closed.
 const EFI_INVALID_PARAMETER: usize = 0x8000_0000_0000_0002;
+/// `EFI_BUFFER_TOO_SMALL` (bit 63 set + code 5): `GetMemoryMap`'s signal
+/// that the caller buffer is undersized — `MemoryMapSize` then holds the
+/// required size (the input to the pool-retry dance).
+const EFI_BUFFER_TOO_SMALL: usize = 0x8000_0000_0000_0005;
+/// `EfiLoaderData` (type 2): pool type for the map overflow buffer —
+/// reclaimable after `ExitBootServices`, never freed before it (FreePool
+/// would invalidate the map key).
+const EFI_LOADER_DATA: u32 = 2;
+/// Bounded `GetMemoryMap` attempts in the buffer-too-small dance (initial
+/// static call + pool retries). Each `AllocatePool` perturbs the map, so the
+/// next call may report `EFI_BUFFER_TOO_SMALL` again — give up with the
+/// raw status after this many calls instead of looping forever.
+const GET_MAP_MAX_ATTEMPTS: usize = 4;
+/// Slack appended to the `EFI_BUFFER_TOO_SMALL` required size when sizing
+/// the `AllocatePool` overflow buffer: the allocation itself perturbs the
+/// map (a free region may split and add a descriptor), so a buffer sized at
+/// exactly `MemoryMapSize` can undershoot on the very next call. 4 KiB
+/// covers ~85 extra 48-byte descriptors of headroom; the bounded
+/// [`GET_MAP_MAX_ATTEMPTS`] loop still fails closed if firmware outgrows it.
+const GET_MAP_POOL_SLACK: usize = 4096;
 /// Synthetic failure `status` for structural/internal errors that have no
 /// raw `EFI_STATUS` (slot load failed, GOP located but `Mode`/`Info` unusable,
 /// `fill_from_gop_mode` rejected, descriptor layout invalid). Printed as
@@ -100,10 +125,15 @@ const GOP_MODE_FB_SIZE_OFF: usize = 32;
 /// (through `PixelsPerScanLine` at +32, 4 bytes = 36).
 const GOP_INFO_MIN: usize = 36;
 
+/// Capacity of [`MEMMAP_BUF`].
+const MEMMAP_BUF_LEN: usize = 16384;
+
 /// Raw `GetMemoryMap` scratch: 16 KiB holds ~340 descriptors at the usual
 /// 48-byte stride; QEMU/OVMF reports far fewer. Static (not stack) so the
 /// boot stack stays small; local-only to the single-threaded boot path.
-static mut MEMMAP_BUF: [u8; 16384] = [0; 16384];
+/// On `EFI_BUFFER_TOO_SMALL` the dance retries into an `AllocatePool`
+/// overflow buffer instead of growing this static.
+static mut MEMMAP_BUF: [u8; MEMMAP_BUF_LEN] = [0; MEMMAP_BUF_LEN];
 
 /// Write one byte to an ISA I/O port.
 ///
@@ -242,6 +272,27 @@ unsafe fn load_get_memory_map(system_table: *const u8) -> Option<GetMemoryMapFn>
     Some(core::mem::transmute::<*const (), GetMemoryMapFn>(slot))
 }
 
+/// Raw `AllocatePool` signature (x86-64 UEFI = `efiapi` calling convention):
+/// `(PoolType, Size, Buffer) -> EFI_STATUS`.
+type AllocatePoolFn = unsafe extern "efiapi" fn(u32, usize, *mut *mut u8) -> usize;
+
+/// Load the `AllocatePool` entry point from the raw system table.
+///
+/// # Safety
+/// Same contract as [`load_get_memory_map`]: live `EFI_SYSTEM_TABLE`,
+/// signature-gated, null-slot fails closed. Only loaded once the
+/// `EFI_BUFFER_TOO_SMALL` dance needs it, so boot-services fakes sized for
+/// `GetMemoryMap` alone (all pre-dance host tests) never reach this slot.
+unsafe fn load_allocate_pool(system_table: *const u8) -> Option<AllocatePoolFn> {
+    let boot_services = load_boot_services(system_table)?;
+    let slot =
+        (boot_services.add(BOOT_SERVICES_ALLOCATE_POOL_OFF) as *const *const ()).read_unaligned();
+    if slot.is_null() {
+        return None;
+    }
+    Some(core::mem::transmute::<*const (), AllocatePoolFn>(slot))
+}
+
 /// Raw `LocateProtocol` signature (x86-64 UEFI = `efiapi` calling convention).
 type LocateProtocolFn = unsafe extern "efiapi" fn(
     *const u8,    // Protocol (EFI_GUID*)
@@ -264,7 +315,8 @@ unsafe fn load_locate_protocol(system_table: *const u8) -> Option<LocateProtocol
     Some(core::mem::transmute::<*const (), LocateProtocolFn>(slot))
 }
 
-/// Call `GetMemoryMap` into the static buffer and fill `info`.
+/// Call `GetMemoryMap` and fill `info`, escalating through an
+/// `AllocatePool` overflow buffer on `EFI_BUFFER_TOO_SMALL`.
 ///
 /// Returns `(ok, status, pushed, total, map_key)`: `ok` is true only when
 /// the firmware call succeeded; `status` is the raw `EFI_STATUS`; `pushed` is
@@ -279,15 +331,26 @@ unsafe fn load_locate_protocol(system_table: *const u8) -> Option<LocateProtocol
 /// `status = `[`STRUCTURAL_FAIL`] instead of a misleading `0x0` (agent-b #5
 /// nit: `ok=0 status=0x0` reads as "status succeeded, result failed").
 ///
-/// Deferred (review #29 risk 2, candidate S03): single-shot 16 KiB call
-/// with no `BUFFER_TOO_SMALL` retry. Fine for QEMU (~100 entries) but a
-/// larger bare-metal map fails loudly with `(false, status, 0, 0, 0)` and no
-/// recovery path — recorded here so it is not mistaken for a complete
-/// driver.
+/// Buffer-too-small dance (review #29 risk 2, closed this slice): the first
+/// call targets the static 16 KiB; on [`EFI_BUFFER_TOO_SMALL`] the firmware
+/// reports the required size and the loop escalates to an `AllocatePool`
+/// overflow buffer of `required + GET_MAP_POOL_SLACK`, bounded by
+/// [`GET_MAP_MAX_ATTEMPTS`] (each allocation perturbs the map, so the next
+/// call may overflow again — exhaustion returns the last raw status).
+/// Agent-b #51 invariants: (1) every `AllocatePool` happens BEFORE the final
+/// successful `GetMemoryMap`, and `efi_main` runs GOP `LocateProtocol`
+/// before this function, so nothing allocates between the call that produced
+/// `map_key` and `ExitBootServices`; (2) the retained overflow buffer is
+/// never `FreePool`'d pre-EBS (freeing would invalidate the key) and
+/// `fill_from_raw_descriptors` reads exactly the buffer that produced it —
+/// one pointer threads through the whole dance; (3) both halves are host
+/// tested through scripted boot-services stands (BTS->SUCCESS sequence;
+/// refresh-failure fail-closed asserts live on `exit_boot_services`).
 ///
 /// # Safety
 /// Must run pre-`ExitBootServices` on the boot thread with `system_table`
-/// live. Exclusively borrows the static buffer for the call duration.
+/// live. Exclusively owns the static buffer; any pool buffer obtained here
+/// is retained (not aliased, not freed) until EBS.
 unsafe fn fill_boot_info(
     system_table: *const u8,
     info: &mut BootInfo,
@@ -295,26 +358,55 @@ unsafe fn fill_boot_info(
     let Some(get_map) = load_get_memory_map(system_table) else {
         return (false, STRUCTURAL_FAIL, 0, 0, 0);
     };
-    let buf = &mut *core::ptr::addr_of_mut!(MEMMAP_BUF);
-    let mut map_size = buf.len();
+    // Single pointer threaded through the dance: the final successful call
+    // and the fill below always refer to the same buffer (invariant 2).
+    let mut buf = core::ptr::addr_of_mut!(MEMMAP_BUF).cast::<u8>();
+    let mut cap = MEMMAP_BUF_LEN;
+    let mut map_size;
     let mut map_key: usize = 0;
     let mut desc_size: usize = 0;
     let mut desc_version: u32 = 0;
-    let status = get_map(
-        &mut map_size,
-        buf.as_mut_ptr(),
-        &mut map_key,
-        &mut desc_size,
-        &mut desc_version,
-    );
+    let mut status;
+    let mut attempts_left = GET_MAP_MAX_ATTEMPTS;
+    loop {
+        attempts_left -= 1;
+        map_size = cap;
+        status = get_map(
+            &mut map_size,
+            buf,
+            &mut map_key,
+            &mut desc_size,
+            &mut desc_version,
+        );
+        if status != EFI_BUFFER_TOO_SMALL || attempts_left == 0 {
+            break;
+        }
+        let Some(allocate_pool) = load_allocate_pool(system_table) else {
+            return (false, STRUCTURAL_FAIL, 0, 0, 0);
+        };
+        let required = map_size.saturating_add(GET_MAP_POOL_SLACK);
+        let mut pool_buf = core::ptr::null_mut::<u8>();
+        let alloc_status = allocate_pool(EFI_LOADER_DATA, required, &mut pool_buf);
+        if alloc_status != 0 {
+            return (false, alloc_status, 0, 0, 0);
+        }
+        if pool_buf.is_null() {
+            return (false, STRUCTURAL_FAIL, 0, 0, 0);
+        }
+        // Pre-final-success allocation (invariant 1); retained through EBS.
+        buf = pool_buf;
+        cap = required;
+    }
     if status != 0 {
         return (false, status, 0, 0, 0);
     }
-    if desc_size < 40 || map_size > buf.len() {
+    if desc_size < 40 || map_size > cap {
         return (false, STRUCTURAL_FAIL, 0, 0, 0);
     }
     let total = map_size / desc_size;
-    let pushed = info.fill_from_raw_descriptors(&buf[..map_size], desc_size);
+    // Invariant 2: read the exact buffer whose call produced `map_key`.
+    let pushed =
+        info.fill_from_raw_descriptors(core::slice::from_raw_parts(buf, map_size), desc_size);
     (true, status, pushed, total, map_key)
 }
 
@@ -323,6 +415,9 @@ unsafe fn fill_boot_info(
 /// Returns `(ok, map_key)`: `ok` is true only when `GetMemoryMap` succeeded
 /// and returned a non-zero key; the caller must not use `info` from this
 /// call (this is key-refresh only after a stale-key `EFI_INVALID_PARAMETER`).
+/// Single-shot into the static buffer (no overflow dance): if the map has
+/// outgrown 16 KiB the refresh fails closed and `exit_boot_services` reports
+/// the original stale-key status — fail-loud over silent key fabrication.
 ///
 /// # Safety
 /// Pre-`ExitBootServices` only; same static-buffer exclusivity contract as
@@ -501,8 +596,14 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
         })
         .unwrap();
         let mut info = BootInfo::new();
-        let (ok, status, pushed, total, map_key) = fill_boot_info(system_table, &mut info);
+        // Agent-b #51 key-stability invariant: GOP LocateProtocol may
+        // allocate internally, so it runs BEFORE fill_boot_info — once the
+        // final GetMemoryMap succeeds, nothing allocates until EBS (the
+        // lines below are pure port I/O; the dance's AllocatePool calls
+        // precede its final successful get_map). Print order below stays
+        // summary/MEMMAP/GOP so the e2e asserts are untouched.
         let (gop_ok, gop_status) = fill_framebuffer(system_table, &mut info);
+        let (ok, status, pushed, total, map_key) = fill_boot_info(system_table, &mut info);
         let mut emit = com1_emit;
         write_boot_summary::<Infallible>(&info, &mut emit).unwrap();
         write_memmap_line(ok, status, pushed, total);
@@ -885,5 +986,165 @@ mod tests {
         assert_eq!(REFRESH_CALLS.load(Ordering::Relaxed), 2);
 
         EBS_ALWAYS_STALE.store(0, Ordering::Relaxed);
+    }
+
+    /// Agent-b #51 invariant 3 (dance half): inject the scripted status
+    /// sequence `[BUFFER_TOO_SMALL(required=N), SUCCESS]` through a fake BS
+    /// with GetMemoryMap (+56) AND AllocatePool (+64) slots. Asserts the
+    /// escalation asks AllocatePool for `required + GET_MAP_POOL_SLACK`,
+    /// the retry runs against the pool buffer (not the stale static), and
+    /// `fill_from_raw_descriptors` reads the buffer that produced the key
+    /// (invariant 2). Takes `MEMMAP_TEST_LOCK` (fill path owns MEMMAP_BUF).
+    #[test]
+    fn fill_boot_info_dances_through_pool_on_buffer_too_small() {
+        use baseos_boot_info::MemoryKind;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static GET_MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static ALLOC_SIZE: AtomicUsize = AtomicUsize::new(0);
+        static POOL_PTR: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "efiapi" fn allocate_pool_scripted(
+            pool_type: u32,
+            size: usize,
+            out: *mut *mut u8,
+        ) -> usize {
+            assert_eq!(pool_type, EFI_LOADER_DATA);
+            ALLOC_SIZE.store(size, Ordering::Relaxed);
+            *out = POOL_PTR.load(Ordering::Relaxed) as *mut u8;
+            0
+        }
+
+        unsafe extern "efiapi" fn get_map_buffer_too_small(
+            map_size: *mut usize,
+            buf: *mut u8,
+            key: *mut usize,
+            desc_size: *mut usize,
+            desc_version: *mut u32,
+        ) -> usize {
+            let call = GET_MAP_CALLS.fetch_add(1, Ordering::Relaxed);
+            if call == 0 {
+                // Attempt 1 targets the static buffer with its full capacity
+                // and overflows with a required size the static cannot hold.
+                assert_eq!(buf, core::ptr::addr_of_mut!(MEMMAP_BUF).cast::<u8>());
+                assert_eq!(*map_size, MEMMAP_BUF_LEN);
+                *map_size = MEMMAP_BUF_LEN + 4096;
+                return EFI_BUFFER_TOO_SMALL;
+            }
+            // Attempt 2 input capacity is the pool allocation (required+slack)
+            // and the buffer pointer is the overflow block, not the static.
+            assert_eq!(*map_size, MEMMAP_BUF_LEN + 4096 + GET_MAP_POOL_SLACK);
+            assert_eq!(buf as usize, POOL_PTR.load(Ordering::Relaxed));
+            let stride = 48usize;
+            *map_size = stride;
+            *key = 0x7777;
+            *desc_size = stride;
+            *desc_version = 1;
+            // One EfiConventionalMemory descriptor at 1 MiB, 4 pages.
+            let d = core::slice::from_raw_parts_mut(buf, stride);
+            d[0..4].copy_from_slice(&7u32.to_le_bytes());
+            d[8..16].copy_from_slice(&0x0010_0000u64.to_le_bytes());
+            d[24..32].copy_from_slice(&4u64.to_le_bytes());
+            0
+        }
+
+        let _guard = MEMMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pool_scratch = [0u8; 32768];
+        POOL_PTR.store(pool_scratch.as_mut_ptr() as usize, Ordering::Relaxed);
+        let mut bs = fake_bs_with_slot(
+            BOOT_SERVICES_ALLOCATE_POOL_OFF,
+            allocate_pool_scripted as *const (),
+        );
+        bs[BOOT_SERVICES_GET_MEMORY_MAP_OFF..BOOT_SERVICES_GET_MEMORY_MAP_OFF + 8]
+            .copy_from_slice(&(get_map_buffer_too_small as *const () as usize).to_le_bytes());
+        let st = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
+        GET_MAP_CALLS.store(0, Ordering::Relaxed);
+        ALLOC_SIZE.store(0, Ordering::Relaxed);
+
+        let mut info = BootInfo::new();
+        let (ok, status, pushed, total, key) = unsafe { fill_boot_info(st.as_ptr(), &mut info) };
+        assert!(ok, "dance must succeed through the pool buffer");
+        assert_eq!(status, 0);
+        assert_eq!(GET_MAP_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            ALLOC_SIZE.load(Ordering::Relaxed),
+            MEMMAP_BUF_LEN + 4096 + GET_MAP_POOL_SLACK
+        );
+        // Invariant 2: fill parsed the pool buffer that produced the key.
+        assert_eq!((pushed, total, key), (1, 1, 0x7777));
+        assert_eq!(info.region_count, 1);
+        assert_eq!(info.regions[0].start, 0x0010_0000);
+        assert_eq!(info.regions[0].page_count, 4);
+        assert_eq!(info.regions[0].kind, MemoryKind::Usable);
+
+        POOL_PTR.store(0, Ordering::Relaxed);
+    }
+
+    /// Agent-b #51 invariant 3 (refresh half): a stale-key EBS whose
+    /// `refresh_map_key` fails — raw `GetMemoryMap` error OR success with a
+    /// zero key — must fail closed with the original `EFI_INVALID_PARAMETER`,
+    /// with exactly one EBS attempt (no second call on a bad key) and one
+    /// refresh attempt, each mode asserted separately.
+    #[test]
+    fn exit_boot_services_refresh_failure_fails_closed() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static EBS_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static REFRESH_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static REFRESH_MODE: AtomicUsize = AtomicUsize::new(0); // 0 raw error, 1 zero key
+
+        unsafe extern "efiapi" fn get_map_refresh_fail(
+            _map_size: *mut usize,
+            _buf: *mut u8,
+            key: *mut usize,
+            desc_size: *mut usize,
+            _desc_version: *mut u32,
+        ) -> usize {
+            REFRESH_CALLS.fetch_add(1, Ordering::Relaxed);
+            *desc_size = 48;
+            if REFRESH_MODE.load(Ordering::Relaxed) == 0 {
+                return 0x8000_0000_0000_000E; // raw firmware error
+            }
+            *key = 0; // status 0 but unusable key
+            0
+        }
+
+        unsafe extern "efiapi" fn ebs_always_stale(_ih: *const (), _key: usize) -> usize {
+            EBS_CALLS.fetch_add(1, Ordering::Relaxed);
+            EFI_INVALID_PARAMETER
+        }
+
+        let _guard = MEMMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut bs = fake_bs_with_slot(
+            BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF,
+            ebs_always_stale as *const (),
+        );
+        bs[BOOT_SERVICES_GET_MEMORY_MAP_OFF..BOOT_SERVICES_GET_MEMORY_MAP_OFF + 8]
+            .copy_from_slice(&(get_map_refresh_fail as *const () as usize).to_le_bytes());
+        let st = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
+        EBS_CALLS.store(0, Ordering::Relaxed);
+        REFRESH_CALLS.store(0, Ordering::Relaxed);
+        REFRESH_MODE.store(0, Ordering::Relaxed);
+
+        // Mode 0: refresh GetMemoryMap returns a raw error.
+        let (ok, status) = unsafe { exit_boot_services(core::ptr::null(), st.as_ptr(), 0x1234) };
+        assert!(!ok);
+        assert_eq!(status, EFI_INVALID_PARAMETER);
+        assert_eq!(EBS_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(REFRESH_CALLS.load(Ordering::Relaxed), 1);
+
+        // Mode 1: refresh succeeds but yields a zero key.
+        EBS_CALLS.store(0, Ordering::Relaxed);
+        REFRESH_CALLS.store(0, Ordering::Relaxed);
+        REFRESH_MODE.store(1, Ordering::Relaxed);
+        let (ok, status) = unsafe { exit_boot_services(core::ptr::null(), st.as_ptr(), 0x1234) };
+        assert!(!ok);
+        assert_eq!(status, EFI_INVALID_PARAMETER);
+        assert_eq!(EBS_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(REFRESH_CALLS.load(Ordering::Relaxed), 1);
+
+        REFRESH_MODE.store(0, Ordering::Relaxed);
     }
 }

@@ -751,3 +751,63 @@ Format per entry (per `implementation-guide.md` §31):
   BUFFER_TOO_SMALL handling + frame allocator over BootInfo regions with
   double-free/invalid-range detection. Sitrep harness stale dirty(3)+SKIPPED
   still escalated for human/orchestrator (tree was clean this cycle).
+
+## S03 slice 3 - BUFFER_TOO_SMALL pool dance + GOP reorder + refresh-failure asserts (2026-09-22)
+
+- **Decision:** Third committable slice of task #5, closing review #29 risk
+  2 and agent-b mail #51's three invariants. (1) `fill_boot_info` now runs
+  a bounded dance: static 16 KiB first, then on `EFI_BUFFER_TOO_SMALL` an
+  `AllocatePool(EfiLoaderData, required + GET_MAP_POOL_SLACK=4096)` overflow
+  buffer, re-GetMemoryMap, bounded by `GET_MAP_MAX_ATTEMPTS=4` (each
+  allocation perturbs the map, so a second overflow is possible); exhaustion
+  or a non-BTS error returns the raw status, null/failed allocation fails
+  closed (`STRUCTURAL_FAIL` / raw). One `buf` pointer threads through the
+  loop, and `fill_from_raw_descriptors` reads exactly the buffer whose call
+  produced the final key (invariant 2); the overflow buffer is retained
+  (never FreePool'd pre-EBS). (2) `efi_main` reordered: GOP
+  `LocateProtocol` (may allocate) now runs BEFORE `fill_boot_info`, so
+  between the final successful GetMemoryMap and ExitBootServices nothing
+  allocates — only pure port-I/O serial lines (invariant 1); print order
+  (summary/MEMMAP/GOP) unchanged so e2e asserts untouched. (3) New host
+  tests for invariant 3: `fill_boot_info_dances_through_pool_on_buffer_too_small`
+  injects `[BUFFER_TOO_SMALL(required=16K+4K), SUCCESS]` via fake BS
+  (+56 GetMemoryMap, +64 AllocatePool) and asserts AllocatePool got
+  required+slack, attempt 2 ran against the pool pointer with the pool
+  capacity as input, fill parsed the pool-written descriptor (pushed/total/
+  key 1/1/0x7777, region fields verified); and
+  `exit_boot_services_refresh_failure_fails_closed` asserts, per mode (raw
+  GetMemoryMap error AND zero-key), that refresh failure fails closed with
+  the original `EFI_INVALID_PARAMETER`, exactly 1 EBS call (no retry on a
+  bad key) and 1 refresh call. `refresh_map_key` doc records its single-shot
+  static-buffer limit (no dance there; fail-loud over key fabrication).
+- **Why:** Review #51 named three invariants as the cheapest
+  disconfirmation before commit: key stability (GOP order was the actual
+  bug risk — map key was taken before LocateProtocol), buffer consistency
+  (pool-vs-static read), and host coverage of the dance + the residual
+  refresh-failure path acked in #50 (previously untested — only a print).
+- **Alternatives:** Keep fill-then-GOP order and rely on the EBS stale-key
+  retry (rejected: retry is a defensive fallback, not the primary path —
+  taking the key after all allocating calls is strictly better and free);
+  exact-size pool allocation (rejected: the AllocatePool itself can split
+  a free region and grow the map, so 4 KiB slack avoids a second dance
+  iteration for ~85 descriptors' worth); dance inside refresh_map_key too
+  (rejected as scope growth this slice — flagged to agent-b, QEMU maps fit
+  16 KiB so refresh-dance is only needed on >16 KiB bare-metal maps).
+- **Expected:** default `cargo test` 37 (new tests live in boot-uefi,
+  outside default-members) + `cargo test -p baseos-boot-uefi` 8 (2 new);
+  fmt clean; the three clippy gates exit 0 with -D warnings;
+  `boot-uefi.ps1` PASS; `smoke -RequireOvmf` PASS.
+- **Measured (2026-09-22, Win11):** `cargo fmt --check` clean; default
+  `cargo test` 37/37 OK (21+6+4+4+2); `cargo test -p baseos-boot-uefi`
+  8/8 OK (3 slot-gate + 2 diagnosability + 1 stale-key retry + 2 new:
+  dance + refresh-failure); `cargo clippy` default exit 0; `-p
+  baseos-boot-uefi --tests -- -D warnings` exit 0; `-p baseos-boot-uefi
+  --target x86_64-unknown-uefi -- -D warnings` exit 0;
+  `boot-uefi.ps1` UEFI BOOT PASS (marker + BOOTINFO/MEMMAP/truncated=0/
+  FB/GOP/EBS/KERNEL/EXC ok, guest 31232 bytes); `smoke.ps1 -RequireOvmf`
+  SMOKE PASS (0-byte SeaBIOS serial unchanged).
+- **Final:** Risk 2 closed and all three #51 invariants host-tested. #5
+  stays active: last remaining slice is the frame allocator over BootInfo
+  regions with double-free/invalid-range detection (next cycle). Sitrep
+  harness stale dirty+SKIPPED and board showing only #1/#2 still escalated
+  for orchestrator (done-moves flowing).
