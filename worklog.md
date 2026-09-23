@@ -951,3 +951,72 @@ Format per entry (per `implementation-guide.md` Â§31):
   desc_size=48, static-fit with 15680 B headroom to 16 KiB. Next: #6
   refresh_map_key >16KiB fail-closed host test (owner agent-a,
   proposed). Open: #59(b) host-only until real-UEFI BUFFER_TOO_SMALL.
+
+## S03 slice 7 — #6 refresh_map_key >16KiB fail-closed host test + e2e budget value check (2026-09-22)
+
+- **Decision:** Seventh committable slice (#6), folding agent-b REVIEW #75
+  findings. New host test
+  `exit_boot_services_refresh_fails_closed_when_map_outgrows_static`:
+  fake BS with EBS-always-stale + GetMemoryMap refresh stand that asserts
+  the single-shot refresh targets `MEMMAP_BUF` at full capacity, writes
+  required `map_size = 16384+4096` (>16 KiB), and returns
+  `EFI_BUFFER_TOO_SMALL`; asserts fail-closed `(false,
+  EFI_INVALID_PARAMETER)` with exactly one EBS attempt and one refresh
+  attempt, plus a guard that required > `MEMMAP_BUF_LEN` (proves the
+  outgrown-map branch, distinct from mode 0's raw error in
+  `exit_boot_services_refresh_failure_fails_closed`, per agent-b's ask).
+  No guest/control-flow change (`refresh_map_key` already failed closed on
+  `status != 0`; the test locks the contract). `boot-uefi.ps1` finding-1
+  hardening: regex-capture `map_size`/`desc_size` off the `MEMMAP ok=1`
+  line and enforce `map_size <= 20480` (16 KiB + 4 KiB slack) and
+  `desc_size in [40,256]`; missing/non-numeric/out-of-range fails the
+  PASS chain (presence-only checks would have let
+  `map_size=999999999`/`map_size=abc` PASS). Banner ? slice 7.
+- **Why:** #6 acceptance (worklog slice-4 final: host test for >16KiB
+  refresh fail-closed contract) + agent-b #75 findings 1 (budget values
+  not actually checked e2e) and endorsement to proceed; finding 2
+  (FRAMEALLOC 1-frame delta) required attribution before leaving it.
+- **Alternatives:** Drive the >16KiB refresh failure through a pool-dance
+  in refresh (rejected: refresh is single-shot by design since slice 3 —
+  dance would add a second allocation path post-stale-key with no
+  observed need; fail-loud over silent growth); extend mode 0 with a
+  BUFFER_TOO_SMALL case (rejected: agent-b explicitly asked the >16KiB
+  scenario be unmistakable — separate test with map_size guard reads
+  unambiguously); budget check as a soft log line (rejected: fail-loud —
+  that was finding 1); restructure ps1 into a parser module (rejected:
+  scope growth for a one-regex gate).
+- **Expected:** default `cargo test` 43 unchanged (boot-uefi not in
+  default-members); `-p baseos-boot-uefi` 10 (9 + 1); `-p baseos-kernel`
+  12 unchanged; fmt clean; clippy 4x -D warnings exit 0; boot-uefi.ps1
+  PASS with `Budget check: … ok=True`; FRAMEALLOC free=52876 stable
+  across reruns (attribution: deterministic layout, not variance); smoke
+  PASS.
+- **Measured (2026-09-22, Win11):** `cargo fmt --check` clean; default
+  `cargo test` 43/43 (21+12+4+4+2); `-p baseos-boot-uefi` 10/10 (new:
+  `exit_boot_services_refresh_fails_closed_when_map_outgrows_static`);
+  `-p baseos-kernel` 12/12; clippy default --all-targets + boot-uefi
+  --tests + boot-uefi --target x86_64-unknown-uefi + kernel --tests all
+  exit 0 -D warnings; `boot-uefi.ps1` UEFI BOOT PASS ×2 consecutive runs
+  (guest 53760 bytes both; `Budget check: map_size=4704 (<=20480),
+  desc_size=48 ([40,256]), ok=True`; serial `MEMMAP ok=1 status=0x0
+  entries=98/98 truncated=0 map_size=4704 desc_size=48`; FRAMEALLOC
+  `free=52876 spans=8 faults=3` byte-identical across both runs);
+  negative budget probes fail as intended (999999999?False, abc?False,
+  desc_size=8?False, 4704/48?True); `smoke.ps1 -RequireOvmf` SMOKE PASS.
+  Finding-2 attribution: @7a1ce76 guest was 53248 B = exactly 13 pages
+  with free=52877; @da11000 guest 53760 B = 14 pages (+512 B of slice-6
+  formatting code crossed the 13?14 page boundary) with free=52876 —
+  the image occupies one more 4 KiB frame so Usable free drops by exactly
+  1; spans=8 and faults=3 unchanged; two fresh reruns both 52876.
+  Deterministic layout consequence of code growth, not OVMF variance and
+  not an allocator regression.
+- **Final:** #6 landed with the >16KiB BUFFER_TOO_SMALL fail-closed host
+  test agent-b asked for; #59(a) e2e gate now checks budget values, not
+  substrings (finding 1 closed); FRAMEALLOC delta attributed and recorded
+  (finding 2 closed). Risk retained and documented: #59(b) real-UEFI
+  BUFFER_TOO_SMALL still never observed — OVMF 4704 B is one config
+  only, budget headroom is not a universal guarantee. No
+  PROJECT_GOAL.md added (mission lists agents.md/worklog.md only) —
+  human decision if a durable goal copy is wanted. Pending peer REVIEW
+  of this slice by agent-b; board moves withheld pending agent-b's board
+  fix (#62/#65/#69).

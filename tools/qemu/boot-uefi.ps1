@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S03 slice 6: MEMMAP map_size/desc_size budget) ==="
+Write-Output "=== BaseOS UEFI guest boot (S03 slice 7: #6 refresh >16KiB fail-closed + budget value e2e) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -148,6 +148,28 @@ if ($serialText -and $serialText.Contains($marker)) {
   $kernel = "KERNEL ok=1"
   $framealloc = "FRAMEALLOC ok=1"
   $exc = "EXC ok=1 vector=0"
+  # #59a value check (agent-b REVIEW #75 finding 1): presence of the
+  # substrings alone would let map_size=999999999 or map_size=abc PASS.
+  # Regex-capture the actual values off the MEMMAP ok=1 line and enforce
+  # the 16 KiB static + 4 KiB pool-slack budget (20480) plus a plausible
+  # descriptor stride [40,256]; missing/non-numeric/out-of-range fails.
+  $budgetOk = $false
+  $budgetDetail = ""
+  $mmVals = [regex]::Match($serialText, "MEMMAP ok=1 [^\r\n]*map_size=(\d+) desc_size=(\d+)")
+  if ($mmVals.Success) {
+    $mv = 0L
+    $dv = 0L
+    if ([long]::TryParse($mmVals.Groups[1].Value, [ref]$mv) -and
+        [long]::TryParse($mmVals.Groups[2].Value, [ref]$dv)) {
+      $budgetOk = ($mv -le 20480) -and ($dv -ge 40) -and ($dv -le 256)
+      $budgetDetail = "map_size=$mv (<=20480), desc_size=$dv ([40,256]), ok=$budgetOk"
+    } else {
+      $budgetDetail = "non-numeric map_size/desc_size ($($mmVals.Groups[1].Value)/$($mmVals.Groups[2].Value))"
+    }
+  } else {
+    $budgetDetail = "MEMMAP ok=1 line with map_size=<dec> desc_size=<dec> not found"
+  }
+  Write-Output "Budget check: $budgetDetail"
   $hasBootinfo = $serialText.Contains($bootinfo)
   $hasMemmap = $serialText.Contains($memmap)
   $hasNotrunc = $serialText.Contains($notrunc)
@@ -159,15 +181,16 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasKernel = $serialText.Contains($kernel)
   $hasFramealloc = $serialText.Contains($framealloc)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasExc) {
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasExc) {
     Write-Output ("Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $mapsize + $descsize + " +
-      "$fb + $gop + $ebs + $kernel + $framealloc + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
     Write-Output ("Boot summary: MISSING (BOOTINFO valid=1 present=$hasBootinfo, " +
       "MEMMAP ok=1 present=$hasMemmap, truncated=0 present=$hasNotrunc, " +
       "map_size= present=$hasMapsize, desc_size= present=$hasDescsize, " +
+      "budget ok=$budgetOk ($budgetDetail), " +
       "FB present=1 present=$hasFb, GOP ok=1 present=$hasGop, " +
       "EBS ok=1 present=$hasEbs, KERNEL ok=1 present=$hasKernel, " +
       "FRAMEALLOC ok=1 present=$hasFramealloc, " +

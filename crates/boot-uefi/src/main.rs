@@ -1238,4 +1238,73 @@ mod tests {
 
         REFRESH_MODE.store(0, Ordering::Relaxed);
     }
+
+    /// S03 #6 (agent-b REVIEW #75: must not be confused with mode 0's raw
+    /// error): a stale-key EBS whose `refresh_map_key` hits the static
+    /// 16 KiB ceiling — `GetMemoryMap` answers `EFI_BUFFER_TOO_SMALL` with
+    /// required `map_size > MEMMAP_BUF_LEN` (map outgrown; the refresh path
+    /// is single-shot by design, no pool dance) — fails closed with the
+    /// original `EFI_INVALID_PARAMETER`, never fabricates a key, and never
+    /// retries EBS: exactly one EBS attempt and one refresh attempt against
+    /// the shared static buffer at full capacity. Takes `MEMMAP_TEST_LOCK`
+    /// (`refresh_map_key` writes the shared static `MEMMAP_BUF`).
+    #[test]
+    fn exit_boot_services_refresh_fails_closed_when_map_outgrows_static() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static EBS_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static REFRESH_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static REQUIRED_MAP_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "efiapi" fn get_map_refresh_outgrown(
+            map_size: *mut usize,
+            buf: *mut u8,
+            _key: *mut usize,
+            desc_size: *mut usize,
+            _desc_version: *mut u32,
+        ) -> usize {
+            REFRESH_CALLS.fetch_add(1, Ordering::Relaxed);
+            // Single-shot refresh targets the static buffer at full capacity.
+            assert_eq!(buf, core::ptr::addr_of_mut!(MEMMAP_BUF).cast::<u8>());
+            assert_eq!(*map_size, MEMMAP_BUF_LEN);
+            // The map has outgrown the static: required size crosses the
+            // 16 KiB budget — the #6 scenario, distinct from mode 0's raw
+            // EFI_NOT_FOUND-style error in the refresh-failure test.
+            let required = MEMMAP_BUF_LEN + 4096;
+            *map_size = required;
+            REQUIRED_MAP_SIZE.store(required, Ordering::Relaxed);
+            *desc_size = 48;
+            EFI_BUFFER_TOO_SMALL
+        }
+
+        unsafe extern "efiapi" fn ebs_stale_after_outgrown_refresh(
+            _ih: *const (),
+            _key: usize,
+        ) -> usize {
+            EBS_CALLS.fetch_add(1, Ordering::Relaxed);
+            EFI_INVALID_PARAMETER
+        }
+
+        let _guard = MEMMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut bs = fake_bs_with_slot(
+            BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF,
+            ebs_stale_after_outgrown_refresh as *const (),
+        );
+        bs[BOOT_SERVICES_GET_MEMORY_MAP_OFF..BOOT_SERVICES_GET_MEMORY_MAP_OFF + 8]
+            .copy_from_slice(&(get_map_refresh_outgrown as *const () as usize).to_le_bytes());
+        let st = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
+        EBS_CALLS.store(0, Ordering::Relaxed);
+        REFRESH_CALLS.store(0, Ordering::Relaxed);
+        REQUIRED_MAP_SIZE.store(0, Ordering::Relaxed);
+
+        let (ok, status) = unsafe { exit_boot_services(core::ptr::null(), st.as_ptr(), 0x1234) };
+        assert!(!ok);
+        assert_eq!(status, EFI_INVALID_PARAMETER);
+        assert_eq!(EBS_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(REFRESH_CALLS.load(Ordering::Relaxed), 1);
+        // Proof the stand really drove the outgrown-map branch (required
+        // map_size > 16 KiB), not a generic raw error.
+        assert!(REQUIRED_MAP_SIZE.load(Ordering::Relaxed) > MEMMAP_BUF_LEN);
+    }
 }
