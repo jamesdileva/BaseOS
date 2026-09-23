@@ -883,7 +883,7 @@ Format per entry (per `implementation-guide.md` §31):
   pre-EBS with boot services still live (rejected: the allocator is
   post-handoff kernel logic and must be proven on the BootInfo handoff
   itself); drop the hard-require to a soft log check (rejected: fail-loud
-  agreement � a missing/failed FRAMEALLOC line must fail the e2e).
+  agreement � a missing/failed FRAMEALLOC line must fail the e2e).
 - **Expected:** default `cargo test` 43 (41 + 2 new stress tests);
   `-p baseos-kernel` 12 (10 + 2); `-p baseos-boot-uefi` 8 unchanged;
   fmt clean; clippy 4x -D warnings exit 0; boot-uefi.ps1 PASS with
@@ -901,8 +901,53 @@ Format per entry (per `implementation-guide.md` §31):
   98 regions, 8 coalesced Usable spans, 52877 free pages, 3/3 faults
   rejected); `smoke.ps1 -RequireOvmf` SMOKE PASS.
 - **Final:** #5 guest residual closed end-to-end (host exact-line tests +
-  QEMU hard-require both green); #5 stays active until agent-b peer-acks
-  the REVIEW. Open unchanged: #59(a) serial-log map_size budget endorsed
-  not coded; #59(b) host-only; #6 refresh_map_key >16KiB fail-closed
-  host test (owner agent-a, proposed). Multi-span stitch deferred by
-  design.
+  QEMU hard-require both green); #5 peer-ACKed by agent-b REVIEW #71 at
+  7a1ce76 (independent re-run, byte-identical FRAMEALLOC line) — closed.
+  Next: #7/#59(a) map_size/desc_size budget serial baseline, then #6
+  refresh_map_key >16KiB fail-closed host test (owner agent-a, proposed).
+  Open: #59(b) host-only. Multi-span stitch deferred by design.
+
+## S03 slice 6 — MEMMAP map_size/desc_size budget serial baseline (2026-09-22)
+
+- **Decision:** Sixth committable slice (#7/#59(a)): `fill_boot_info` now
+  returns `(…, map_size, desc_size)` from the last `GetMemoryMap` call
+  (0/0 when no call ran; failure paths keep last-call sizes for
+  diagnosability) and `write_memmap_line` appends
+  ` map_size=<dec> desc_size=<dec>` after `truncated`. Sink is now
+  generic (`emit` callback) so the exact line is host-tested. New test
+  `write_memmap_line_embeds_budget_fields` locks the full line for ok=1,
+  structural-fail, and truncated=1 shapes; failure-path tests assert the
+  returned sizes (structural: cap 16384 + desc_size 8; raw error:
+  16384/0; null table: 0/0; pool dance success: 48/48). `boot-uefi.ps1`
+  hard-requires `map_size=` and `desc_size=` substrings in the PASS chain
+  (fields regress → e2e fails). Existing `MEMMAP ok=1`/`truncated=0`
+  substrings stay byte-identical.
+- **Why:** #59(a) endorsed baseline: every boot records raw map bytes and
+  descriptor stride against the 16 KiB static + 4 KiB pool-slack budget
+  so #6 (refresh >16KiB fail-closed) and future buffer sizing have a
+  measured OVMF reference instead of a guess. Zero-risk: append-only
+  serial fields, no control-flow change.
+- **Alternatives:** Separate `MAPBUDGET` line (rejected: another hard-require
+  to wire for data that belongs on MEMMAP); log-only without e2e
+  hard-require (rejected: fail-loud — a silent field drop would hide the
+  baseline); return sizes only on success (rejected: failure-path sizes
+  are free diagnosability and already flow out of the dance).
+- **Expected:** default `cargo test` 43 unchanged; `-p baseos-boot-uefi`
+  9 (8 + 1 new); `-p baseos-kernel` 12 unchanged; fmt clean; clippy 4x
+  -D warnings; boot-uefi.ps1 PASS with map_size=/desc_size= in chain;
+  smoke PASS.
+- **Measured (2026-09-22, Win11):** `cargo fmt --check` clean; default
+  `cargo test` 43/43 (21+12+4+4+2); `-p baseos-boot-uefi` 9/9 (new:
+  `write_memmap_line_embeds_budget_fields`); `-p baseos-kernel` 12/12;
+  clippy default --all-targets + boot-uefi --tests + boot-uefi --target
+  x86_64-unknown-uefi + kernel --tests all exit 0 -D warnings;
+  `boot-uefi.ps1` UEFI BOOT PASS (guest 53760 bytes, serial
+  `MEMMAP ok=1 status=0x0 entries=98/98 truncated=0 map_size=4704
+  desc_size=48` — 4704 B ≪ 16384+4096=20480 budget, 98 descriptors ×
+  48 B; FRAMEALLOC ok=1 free=52876 spans=8 faults=3, EXC ok=1 vector=0);
+  `smoke.ps1 -RequireOvmf` SMOKE PASS.
+- **Final:** #7/#59(a) landed end-to-end (host exact-line + QEMU
+  hard-require green); OVMF baseline recorded: map_size=4704,
+  desc_size=48, static-fit with 15680 B headroom to 16 KiB. Next: #6
+  refresh_map_key >16KiB fail-closed host test (owner agent-a,
+  proposed). Open: #59(b) host-only until real-UEFI BUFFER_TOO_SMALL.

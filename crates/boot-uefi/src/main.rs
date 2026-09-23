@@ -17,7 +17,8 @@
 //! `x86_64-unknown-uefi`, boots OVMF, and asserts the marker plus the
 //! `BOOTINFO valid=1`, `MEMMAP ok=1`, `FB present=1`, `GOP ok=1`,
 //! `EBS ok=1`, `KERNEL ok=1`, `FRAMEALLOC ok=1`, and `EXC ok=1 vector=0`
-//! summary lines in the serial capture.
+//! summary lines in the serial capture. The `MEMMAP` line also carries
+//! `map_size`/`desc_size` for the 16 KiB + 4 KiB budget baseline (#59a).
 
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
@@ -318,18 +319,22 @@ unsafe fn load_locate_protocol(system_table: *const u8) -> Option<LocateProtocol
 /// Call `GetMemoryMap` and fill `info`, escalating through an
 /// `AllocatePool` overflow buffer on `EFI_BUFFER_TOO_SMALL`.
 ///
-/// Returns `(ok, status, pushed, total, map_key)`: `ok` is true only when
-/// the firmware call succeeded; `status` is the raw `EFI_STATUS`; `pushed` is
-/// the number of regions stored (0 on failure); `total` is the firmware
-/// descriptor count (`map_size / desc_size`, 0 on failure); `map_key` is the
-/// opaque key [`ExitBootServices`] will validate (0 on failure — never pass
-/// a zero key to EBS). `pushed < total` means the 128-entry inline map
-/// truncated the firmware map — reported on serial as `truncated=1` so e2e
-/// fails loudly (review #29 risk 1). Never panics; a failure still leaves
-/// `info` valid-but-empty so the serial summary stays diagnosable.
-/// Structural failures (slot load, `desc_size < 40`, oversized map) report
-/// `status = `[`STRUCTURAL_FAIL`] instead of a misleading `0x0` (agent-b #5
-/// nit: `ok=0 status=0x0` reads as "status succeeded, result failed").
+/// Returns `(ok, status, pushed, total, map_key, map_size, desc_size)`:
+/// `ok` is true only when the firmware call succeeded; `status` is the raw
+/// `EFI_STATUS`; `pushed` is the number of regions stored (0 on failure);
+/// `total` is the firmware descriptor count (`map_size / desc_size`, 0 on
+/// failure); `map_key` is the opaque key [`ExitBootServices`] will validate
+/// (0 on failure — never pass a zero key to EBS); `map_size`/`desc_size` are
+/// the raw byte size and descriptor stride from the last `GetMemoryMap`
+/// call (0/0 when no call ran) so serial can baseline them against the
+/// 16 KiB + 4 KiB budget (#59a/#7). `pushed < total` means the 128-entry
+/// inline map truncated the firmware map — reported on serial as
+/// `truncated=1` so e2e fails loudly (review #29 risk 1). Never panics; a
+/// failure still leaves `info` valid-but-empty so the serial summary stays
+/// diagnosable. Structural failures (slot load, `desc_size < 40`, oversized
+/// map) report `status = `[`STRUCTURAL_FAIL`] instead of a misleading `0x0`
+/// (agent-b #5 nit: `ok=0 status=0x0` reads as "status succeeded, result
+/// failed").
 ///
 /// Buffer-too-small dance (review #29 risk 2, closed this slice): the first
 /// call targets the static 16 KiB; on [`EFI_BUFFER_TOO_SMALL`] the firmware
@@ -354,18 +359,18 @@ unsafe fn load_locate_protocol(system_table: *const u8) -> Option<LocateProtocol
 unsafe fn fill_boot_info(
     system_table: *const u8,
     info: &mut BootInfo,
-) -> (bool, usize, usize, usize, usize) {
+) -> (bool, usize, usize, usize, usize, usize, usize) {
+    let mut map_size = 0usize;
+    let mut map_key: usize = 0;
+    let mut desc_size: usize = 0;
+    let mut desc_version: u32 = 0;
     let Some(get_map) = load_get_memory_map(system_table) else {
-        return (false, STRUCTURAL_FAIL, 0, 0, 0);
+        return (false, STRUCTURAL_FAIL, 0, 0, 0, map_size, desc_size);
     };
     // Single pointer threaded through the dance: the final successful call
     // and the fill below always refer to the same buffer (invariant 2).
     let mut buf = core::ptr::addr_of_mut!(MEMMAP_BUF).cast::<u8>();
     let mut cap = MEMMAP_BUF_LEN;
-    let mut map_size;
-    let mut map_key: usize = 0;
-    let mut desc_size: usize = 0;
-    let mut desc_version: u32 = 0;
     let mut status;
     let mut attempts_left = GET_MAP_MAX_ATTEMPTS;
     loop {
@@ -382,32 +387,32 @@ unsafe fn fill_boot_info(
             break;
         }
         let Some(allocate_pool) = load_allocate_pool(system_table) else {
-            return (false, STRUCTURAL_FAIL, 0, 0, 0);
+            return (false, STRUCTURAL_FAIL, 0, 0, 0, map_size, desc_size);
         };
         let required = map_size.saturating_add(GET_MAP_POOL_SLACK);
         let mut pool_buf = core::ptr::null_mut::<u8>();
         let alloc_status = allocate_pool(EFI_LOADER_DATA, required, &mut pool_buf);
         if alloc_status != 0 {
-            return (false, alloc_status, 0, 0, 0);
+            return (false, alloc_status, 0, 0, 0, map_size, desc_size);
         }
         if pool_buf.is_null() {
-            return (false, STRUCTURAL_FAIL, 0, 0, 0);
+            return (false, STRUCTURAL_FAIL, 0, 0, 0, map_size, desc_size);
         }
         // Pre-final-success allocation (invariant 1); retained through EBS.
         buf = pool_buf;
         cap = required;
     }
     if status != 0 {
-        return (false, status, 0, 0, 0);
+        return (false, status, 0, 0, 0, map_size, desc_size);
     }
     if desc_size < 40 || map_size > cap {
-        return (false, STRUCTURAL_FAIL, 0, 0, 0);
+        return (false, STRUCTURAL_FAIL, 0, 0, 0, map_size, desc_size);
     }
     let total = map_size / desc_size;
     // Invariant 2: read the exact buffer whose call produced `map_key`.
     let pushed =
         info.fill_from_raw_descriptors(core::slice::from_raw_parts(buf, map_size), desc_size);
-    (true, status, pushed, total, map_key)
+    (true, status, pushed, total, map_key, map_size, desc_size)
 }
 
 /// Refresh only the map key (ignore descriptor contents) for an EBS retry.
@@ -486,22 +491,37 @@ unsafe fn exit_boot_services(
 }
 
 /// Emit the one-line `MEMMAP` diagnostic after the two-line boot summary:
-/// `MEMMAP ok=<0|1> status=<0x...> entries=<pushed>/<total> truncated=<0|1>`.
+/// `MEMMAP ok=<0|1> status=<0x...> entries=<pushed>/<total> truncated=<0|1>
+/// map_size=<dec> desc_size=<dec>`.
 /// `status` is the raw `GetMemoryMap` `EFI_STATUS`, or `0xffffffffffffffff`
 /// ([`STRUCTURAL_FAIL`]) for structural failures (never `ok=0 status=0x0`).
-fn write_memmap_line(ok: bool, status: usize, pushed: usize, total: usize) {
-    let mut emit = com1_emit;
-    let _ = write_str(&mut emit, "MEMMAP ok=");
-    let _ = write_u64_dec(&mut emit, u64::from(ok));
-    let _ = write_str(&mut emit, " status=");
-    let _ = write_u64_hex(&mut emit, status as u64);
-    let _ = write_str(&mut emit, " entries=");
-    let _ = write_u64_dec(&mut emit, pushed as u64);
-    let _ = write_str(&mut emit, "/");
-    let _ = write_u64_dec(&mut emit, total as u64);
-    let _ = write_str(&mut emit, " truncated=");
-    let _ = write_u64_dec(&mut emit, u64::from(pushed < total));
-    let _ = write_str(&mut emit, "\n");
+/// `map_size`/`desc_size` baseline the firmware map against the 16 KiB
+/// static + 4 KiB pool-slack budget (#59a/#7; zero-risk serial fields —
+/// `MEMMAP ok=1` / `truncated=0` e2e substrings stay byte-identical).
+fn write_memmap_line<E>(
+    ok: bool,
+    status: usize,
+    pushed: usize,
+    total: usize,
+    map_size: usize,
+    desc_size: usize,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "MEMMAP ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " status=")?;
+    write_u64_hex(emit, status as u64)?;
+    write_str(emit, " entries=")?;
+    write_u64_dec(emit, pushed as u64)?;
+    write_str(emit, "/")?;
+    write_u64_dec(emit, total as u64)?;
+    write_str(emit, " truncated=")?;
+    write_u64_dec(emit, u64::from(pushed < total))?;
+    write_str(emit, " map_size=")?;
+    write_u64_dec(emit, map_size as u64)?;
+    write_str(emit, " desc_size=")?;
+    write_u64_dec(emit, desc_size as u64)?;
+    write_str(emit, "\n")
 }
 
 /// Locate the GOP instance and fill `info.framebuffer` from its active mode.
@@ -603,10 +623,12 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
         // precede its final successful get_map). Print order below stays
         // summary/MEMMAP/GOP so the e2e asserts are untouched.
         let (gop_ok, gop_status) = fill_framebuffer(system_table, &mut info);
-        let (ok, status, pushed, total, map_key) = fill_boot_info(system_table, &mut info);
+        let (ok, status, pushed, total, map_key, map_size, desc_size) =
+            fill_boot_info(system_table, &mut info);
         let mut emit = com1_emit;
         write_boot_summary::<Infallible>(&info, &mut emit).unwrap();
-        write_memmap_line(ok, status, pushed, total);
+        write_memmap_line::<Infallible>(ok, status, pushed, total, map_size, desc_size, &mut emit)
+            .unwrap();
         write_gop_line(gop_ok, gop_status);
         // S02 slice 2: leave the firmware world. After a successful EBS no
         // boot-service call is legal — kernel_entry + GDT/IDT/`#DE` run on
@@ -799,26 +821,88 @@ mod tests {
         );
         let st = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
         let mut info = BootInfo::new();
-        let (ok, status, pushed, total, key) = unsafe { fill_boot_info(st.as_ptr(), &mut info) };
+        let (ok, status, pushed, total, key, map_size, desc_size) =
+            unsafe { fill_boot_info(st.as_ptr(), &mut info) };
         assert!(!ok);
         assert_eq!(status, STRUCTURAL_FAIL);
         assert_eq!((pushed, total, key), (0, 0, 0));
+        // #59a baseline: last-call sizes still surface on structural fail
+        // (map_size left at input cap; desc_size=8 from the stand).
+        assert_eq!(map_size, MEMMAP_BUF_LEN);
+        assert_eq!(desc_size, 8);
         // Raw firmware error passes through unchanged.
         let bs = fake_bs_with_slot(
             BOOT_SERVICES_GET_MEMORY_MAP_OFF,
             get_map_raw_error as *const (),
         );
         let st = fake_table(SYSTEM_TABLE_SIGNATURE, bs.as_ptr());
-        let (ok, status, pushed, total, key) = unsafe { fill_boot_info(st.as_ptr(), &mut info) };
+        let (ok, status, pushed, total, key, map_size, desc_size) =
+            unsafe { fill_boot_info(st.as_ptr(), &mut info) };
         assert!(!ok);
         assert_eq!(status, 0x8000_0000_0000_000E);
         assert_eq!((pushed, total, key), (0, 0, 0));
-        // Missing/stale system table (slot load fails) is structural too.
-        let (ok, status, pushed, total, key) =
+        assert_eq!((map_size, desc_size), (MEMMAP_BUF_LEN, 0));
+        // Missing/stale system table (slot load fails) is structural too —
+        // no GetMemoryMap call ran, so both sizes stay 0.
+        let (ok, status, pushed, total, key, map_size, desc_size) =
             unsafe { fill_boot_info(core::ptr::null(), &mut info) };
         assert!(!ok);
         assert_eq!(status, STRUCTURAL_FAIL);
         assert_eq!((pushed, total, key), (0, 0, 0));
+        assert_eq!((map_size, desc_size), (0, 0));
+    }
+
+    /// #59a/#7: `MEMMAP` line embeds `map_size`/`desc_size` after
+    /// `truncated` while the e2e hard-require substrings
+    /// (`MEMMAP ok=1`, `truncated=0`) stay byte-identical.
+    #[test]
+    fn write_memmap_line_embeds_budget_fields() {
+        let mut text = Vec::new();
+        write_memmap_line::<core::convert::Infallible>(true, 0, 98, 98, 4704, 48, &mut |b| {
+            text.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(
+            line,
+            "MEMMAP ok=1 status=0x0 entries=98/98 truncated=0 map_size=4704 desc_size=48\n"
+        );
+        assert!(line.contains("MEMMAP ok=1"));
+        assert!(line.contains("truncated=0"));
+
+        let mut text = Vec::new();
+        write_memmap_line::<core::convert::Infallible>(
+            false,
+            STRUCTURAL_FAIL,
+            0,
+            0,
+            MEMMAP_BUF_LEN,
+            8,
+            &mut |b| {
+                text.push(b);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(
+            line,
+            "MEMMAP ok=0 status=0xffffffffffffffff entries=0/0 truncated=0 map_size=16384 desc_size=8\n"
+        );
+        assert!(line.contains("MEMMAP ok=0 status=0xffffffffffffffff"));
+        // Failure with pushed < total still reports truncated=1.
+        let mut text = Vec::new();
+        write_memmap_line::<core::convert::Infallible>(true, 0, 2, 3, 144, 48, &mut |b| {
+            text.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(
+            line,
+            "MEMMAP ok=1 status=0x0 entries=2/3 truncated=1 map_size=144 desc_size=48\n"
+        );
     }
 
     /// agent-b #5 nit, GOP half: structural GOP failures (null protocol,
@@ -1067,7 +1151,8 @@ mod tests {
         ALLOC_SIZE.store(0, Ordering::Relaxed);
 
         let mut info = BootInfo::new();
-        let (ok, status, pushed, total, key) = unsafe { fill_boot_info(st.as_ptr(), &mut info) };
+        let (ok, status, pushed, total, key, map_size, desc_size) =
+            unsafe { fill_boot_info(st.as_ptr(), &mut info) };
         assert!(ok, "dance must succeed through the pool buffer");
         assert_eq!(status, 0);
         assert_eq!(GET_MAP_CALLS.load(Ordering::Relaxed), 2);
@@ -1077,6 +1162,8 @@ mod tests {
         );
         // Invariant 2: fill parsed the pool buffer that produced the key.
         assert_eq!((pushed, total, key), (1, 1, 0x7777));
+        // #59a: sizes come from the final successful call (stride 48 bytes).
+        assert_eq!((map_size, desc_size), (48, 48));
         assert_eq!(info.region_count, 1);
         assert_eq!(info.regions[0].start, 0x0010_0000);
         assert_eq!(info.regions[0].page_count, 4);

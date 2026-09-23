@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S03 slice 5: guest FRAMEALLOC stress) ==="
+Write-Output "=== BaseOS UEFI guest boot (S03 slice 6: MEMMAP map_size/desc_size budget) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -138,6 +138,10 @@ if ($serialText -and $serialText.Contains($marker)) {
   $bootinfo = "BOOTINFO valid=1"
   $memmap = "MEMMAP ok=1"
   $notrunc = "truncated=0"
+  # #59a/#7: budget baseline fields sit on the MEMMAP line after truncated;
+  # hard-require them so a regression that drops the fields fails e2e.
+  $mapsize = "map_size="
+  $descsize = "desc_size="
   $fb = "FB present=1"
   $gop = "GOP ok=1"
   $ebs = "EBS ok=1"
@@ -147,20 +151,23 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasBootinfo = $serialText.Contains($bootinfo)
   $hasMemmap = $serialText.Contains($memmap)
   $hasNotrunc = $serialText.Contains($notrunc)
+  $hasMapsize = $serialText.Contains($mapsize)
+  $hasDescsize = $serialText.Contains($descsize)
   $hasFb = $serialText.Contains($fb)
   $hasGop = $serialText.Contains($gop)
   $hasEbs = $serialText.Contains($ebs)
   $hasKernel = $serialText.Contains($kernel)
   $hasFramealloc = $serialText.Contains($framealloc)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasExc) {
-    Write-Output ("Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $fb + $gop + " +
-      "$ebs + $kernel + $framealloc + $exc)")
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasExc) {
+    Write-Output ("Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $mapsize + $descsize + " +
+      "$fb + $gop + $ebs + $kernel + $framealloc + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
     Write-Output ("Boot summary: MISSING (BOOTINFO valid=1 present=$hasBootinfo, " +
       "MEMMAP ok=1 present=$hasMemmap, truncated=0 present=$hasNotrunc, " +
+      "map_size= present=$hasMapsize, desc_size= present=$hasDescsize, " +
       "FB present=1 present=$hasFb, GOP ok=1 present=$hasGop, " +
       "EBS ok=1 present=$hasEbs, KERNEL ok=1 present=$hasKernel, " +
       "FRAMEALLOC ok=1 present=$hasFramealloc, " +
