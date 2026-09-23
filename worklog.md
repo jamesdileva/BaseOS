@@ -858,3 +858,51 @@ Format per entry (per `implementation-guide.md` Â§31):
   endorsed, not yet implemented. #6 refresh_map_key remains proposed
   (owner agent-a; acceptance: host test for >16KiB refresh dance or
   documented fail-closed contract with test).
+
+## S03 slice 5 - guest FRAMEALLOC stress line + QEMU e2e hard-require (2026-09-22)
+
+- **Decision:** Fifth committable slice of task #5, closing the residual
+  agent-b #66 guest-e2e ask. New `frame_alloc_stress(boot, emit)` in
+  `crates/kernel/src/frame_alloc.rs`: 1024x single-page alloc/free sweep,
+  multi-page pair (two 2-page blocks) with free count/spans fully
+  restored, then three fail-closed faults (double-free of a still-free
+  in-map range, wild outside-map address, wrap) each required to return
+  the exact expected `FrameError` with the
+  `(free_pages, free_span_count, cursor)` snapshot untouched. Emits
+  `FRAMEALLOC ok=<0|1> free=<dec> spans=<n> faults=<n>`; empty Usable map
+  skips the battery fail-closed (`ok=0 free=0 spans=0 faults=0`). Called
+  from `efi_main` after `kernel_entry`, before bring_up (post-EBS, COM1
+  only). `boot-uefi.ps1` hard-requires `FRAMEALLOC ok=1` in the Contains
+  chain.
+- **Why:** S03 verification residual per #59/#66: the frame-allocator
+  matrix (slice 4) was host-only; the guest proof must show the same
+  fail-closed behavior on the real OVMF memory map under QEMU. Cheapest
+  disconfirm agent-b named: one boot-uefi.ps1 run asserting the line.
+- **Alternatives:** QEMU-side stress harness poking guest memory (rejected:
+  needs a debug protocol, heavy for one serial line); run the stress
+  pre-EBS with boot services still live (rejected: the allocator is
+  post-handoff kernel logic and must be proven on the BootInfo handoff
+  itself); drop the hard-require to a soft log check (rejected: fail-loud
+  agreement — a missing/failed FRAMEALLOC line must fail the e2e).
+- **Expected:** default `cargo test` 43 (41 + 2 new stress tests);
+  `-p baseos-kernel` 12 (10 + 2); `-p baseos-boot-uefi` 8 unchanged;
+  fmt clean; clippy 4x -D warnings exit 0; boot-uefi.ps1 PASS with
+  FRAMEALLOC in the chain; smoke PASS.
+- **Measured (2026-09-22, Win11):** `cargo fmt --check` clean; default
+  `cargo test` 43/43 (21+12+4+4+2); `-p baseos-kernel` 12/12 (new:
+  `frame_alloc_stress_healthy_map_emits_exact_ok_line` exact
+  `FRAMEALLOC ok=1 free=16 spans=1 faults=3`, and
+  `frame_alloc_stress_empty_map_reports_ok_zero` exact
+  `FRAMEALLOC ok=0 free=0 spans=0 faults=0`); `-p baseos-boot-uefi` 8/8;
+  clippy default --all-targets + boot-uefi --tests + boot-uefi --target
+  x86_64-unknown-uefi + kernel --tests all exit 0 -D warnings;
+  `boot-uefi.ps1` UEFI BOOT PASS (guest 53248 bytes, serial
+  `FRAMEALLOC ok=1 free=52877 spans=8 faults=3` on the real OVMF map:
+  98 regions, 8 coalesced Usable spans, 52877 free pages, 3/3 faults
+  rejected); `smoke.ps1 -RequireOvmf` SMOKE PASS.
+- **Final:** #5 guest residual closed end-to-end (host exact-line tests +
+  QEMU hard-require both green); #5 stays active until agent-b peer-acks
+  the REVIEW. Open unchanged: #59(a) serial-log map_size budget endorsed
+  not coded; #59(b) host-only; #6 refresh_map_key >16KiB fail-closed
+  host test (owner agent-a, proposed). Multi-span stitch deferred by
+  design.

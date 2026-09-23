@@ -10,7 +10,7 @@
 //! count, span count, and next-fit cursor untouched so a rejected free or
 //! allocation cannot corrupt allocator state.
 
-use baseos_boot_info::{BootInfo, MemoryKind, PAGE_SIZE};
+use baseos_boot_info::{write_str, write_u64_dec, BootInfo, MemoryKind, PAGE_SIZE};
 
 /// Maximum ingested Usable spans after coalescing (never exceeds the
 /// handoff's region cap).
@@ -285,6 +285,95 @@ impl FrameAllocator {
     }
 }
 
+/// Guest-side stress proof for S03 task #5: drive the allocator over
+/// `boot`'s Usable map, inject the three fail-closed faults, and emit
+/// `FRAMEALLOC ok=<0|1> free=<dec> spans=<n> faults=<n>\n` on `emit`
+/// (the `tools/qemu/boot-uefi.ps1` hard-require is `FRAMEALLOC ok=1`).
+///
+/// Battery, in order (any failure clears `ok` but the line still prints):
+/// 1. 1024× single-page `alloc`+`free` sweep — every step must succeed.
+/// 2. Multi-page pair (two 2-page blocks) allocated and both freed, with
+///    `free_pages`/`free_span_count` fully restored to the pre-pair values.
+/// 3. Three faults — double-free of a still-free in-map range
+///    ([`FrameError::DoubleFree`]), a wild address
+///    ([`FrameError::OutsideMap`]), and a wrap ([`FrameError::Wrap`]) —
+///    each must return exactly that error and leave the
+///    `(free_pages, free_span_count, cursor)` snapshot untouched.
+///
+/// `faults` counts faults that failed with the expected kind (3 on a full
+/// battery). An empty Usable map (`free_pages() == 0` after ingest) skips
+/// the battery entirely and reports `ok=0 free=0 spans=0 faults=0`.
+/// Never panics; returns only the sink's error (COM1 is infallible in the
+/// guest; host tests collect bytes).
+pub fn frame_alloc_stress<E>(
+    boot: &BootInfo,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut fa = FrameAllocator::from_boot_info(boot);
+    let mut ok = fa.free_pages() > 0;
+    let mut faults = 0usize;
+    if ok {
+        // (1) 1024x single-page sweep — every alloc/free must succeed.
+        for _ in 0..1024 {
+            let Some(base) = fa.alloc(1) else {
+                ok = false;
+                break;
+            };
+            if fa.free(base, 1).is_err() {
+                ok = false;
+                break;
+            }
+        }
+        // (2) Multi-page pair; free count/spans must fully restore.
+        let free0 = fa.free_pages();
+        let spans0 = fa.free_span_count();
+        let a = fa.alloc(2);
+        let b = fa.alloc(2);
+        let mut pair_ok = a.is_some() && b.is_some();
+        for block in [a, b].into_iter().flatten() {
+            if fa.free(block, 2).is_err() {
+                pair_ok = false;
+            }
+        }
+        if fa.free_pages() != free0 || fa.free_span_count() != spans0 {
+            pair_ok = false;
+        }
+        if !pair_ok {
+            ok = false;
+        }
+        // (3) Fault storm against a stable snapshot: each must Err with
+        // the expected kind, and no state may move.
+        let snap = (fa.free_pages(), fa.free_span_count(), fa.cursor());
+        // Map union was fully restored above, so map span 0 is free —
+        // its first page is the canonical still-free double-free target.
+        let dbl_base = fa.map[0].start;
+        let results = [
+            (fa.free(dbl_base, 1), FrameError::DoubleFree),
+            (fa.free(0xFFFF_DEAD_BEEF, 1), FrameError::OutsideMap),
+            (fa.free(u64::MAX - 0x800, 4), FrameError::Wrap),
+        ];
+        for (result, expected) in results {
+            if result == Err(expected) {
+                faults += 1;
+            } else {
+                ok = false;
+            }
+        }
+        if (fa.free_pages(), fa.free_span_count(), fa.cursor()) != snap {
+            ok = false;
+        }
+    }
+    write_str(emit, "FRAMEALLOC ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " free=")?;
+    write_u64_dec(emit, fa.free_pages())?;
+    write_str(emit, " spans=")?;
+    write_u64_dec(emit, fa.free_span_count() as u64)?;
+    write_str(emit, " faults=")?;
+    write_u64_dec(emit, faults as u64)?;
+    write_str(emit, "\n")
+}
+
 /// Sort the first `count` spans of `spans` by `start` (insertion sort:
 /// stable, no allocator, tiny `count`).
 fn sort_spans(spans: &mut [Span], count: usize) {
@@ -463,5 +552,37 @@ mod tests {
         assert_eq!(fa.free(second.unwrap(), 8), Ok(()));
         assert_eq!(fa.free(first.unwrap(), 16), Ok(()));
         assert_eq!(fa.free_pages(), 24);
+    }
+
+    /// S03 #5 host half of the guest stress: a healthy 16-page Usable map
+    /// completes sweep + multi-page pair + three faults and emits the
+    /// exact `FRAMEALLOC ok=1 free=16 spans=1 faults=3` line.
+    #[test]
+    fn frame_alloc_stress_healthy_map_emits_exact_ok_line() {
+        let boot = boot_with(&[(0x1000, 16)]);
+        let mut out = Vec::new();
+        frame_alloc_stress::<core::convert::Infallible>(&boot, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let text = std::string::String::from_utf8(out).unwrap();
+        assert_eq!(text, "FRAMEALLOC ok=1 free=16 spans=1 faults=3\n");
+    }
+
+    /// Empty Usable map: no frames to sweep — battery skipped fail-closed,
+    /// line reports `ok=0 free=0 spans=0 faults=0` (e2e hard-require of
+    /// `ok=1` would fail loudly).
+    #[test]
+    fn frame_alloc_stress_empty_map_reports_ok_zero() {
+        let boot = boot_with(&[]);
+        let mut out = Vec::new();
+        frame_alloc_stress::<core::convert::Infallible>(&boot, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let text = std::string::String::from_utf8(out).unwrap();
+        assert_eq!(text, "FRAMEALLOC ok=0 free=0 spans=0 faults=0\n");
     }
 }

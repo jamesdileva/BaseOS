@@ -16,8 +16,8 @@
 //! and enters the kernel. `tools/qemu/boot-uefi.ps1` builds this for
 //! `x86_64-unknown-uefi`, boots OVMF, and asserts the marker plus the
 //! `BOOTINFO valid=1`, `MEMMAP ok=1`, `FB present=1`, `GOP ok=1`,
-//! `EBS ok=1`, `KERNEL ok=1`, and `EXC ok=1 vector=0` summary lines in the
-//! serial capture.
+//! `EBS ok=1`, `KERNEL ok=1`, `FRAMEALLOC ok=1`, and `EXC ok=1 vector=0`
+//! summary lines in the serial capture.
 
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
@@ -616,6 +616,10 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
         write_ebs_line(ebs_ok, ebs_status);
         if ebs_ok {
             kernel_entry::<Infallible>(&info, &mut emit).unwrap();
+            // S03 #5: post-EBS, COM1-only frame-allocator stress proof
+            // (`FRAMEALLOC ok=1` hard-required by boot-uefi.ps1) before
+            // the GDT/IDT/#DE bring-up parks the guest.
+            baseos_kernel::frame_alloc::frame_alloc_stress::<Infallible>(&info, &mut emit).unwrap();
             baseos_kernel::bring_up_cpu_and_prove_exception();
         }
         // EBS failed: still own boot services — park fail-loud (e2e sees

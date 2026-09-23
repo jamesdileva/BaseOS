@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S02 slice 2: EBS + GDT/IDT + #DE) ==="
+Write-Output "=== BaseOS UEFI guest boot (S03 slice 5: guest FRAMEALLOC stress) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -142,6 +142,7 @@ if ($serialText -and $serialText.Contains($marker)) {
   $gop = "GOP ok=1"
   $ebs = "EBS ok=1"
   $kernel = "KERNEL ok=1"
+  $framealloc = "FRAMEALLOC ok=1"
   $exc = "EXC ok=1 vector=0"
   $hasBootinfo = $serialText.Contains($bootinfo)
   $hasMemmap = $serialText.Contains($memmap)
@@ -150,10 +151,11 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasGop = $serialText.Contains($gop)
   $hasEbs = $serialText.Contains($ebs)
   $hasKernel = $serialText.Contains($kernel)
+  $hasFramealloc = $serialText.Contains($framealloc)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasExc) {
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasExc) {
     Write-Output ("Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $fb + $gop + " +
-      "$ebs + $kernel + $exc)")
+      "$ebs + $kernel + $framealloc + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -161,8 +163,9 @@ if ($serialText -and $serialText.Contains($marker)) {
       "MEMMAP ok=1 present=$hasMemmap, truncated=0 present=$hasNotrunc, " +
       "FB present=1 present=$hasFb, GOP ok=1 present=$hasGop, " +
       "EBS ok=1 present=$hasEbs, KERNEL ok=1 present=$hasKernel, " +
+      "FRAMEALLOC ok=1 present=$hasFramealloc, " +
       "EXC ok=1 vector=0 present=$hasExc; " +
-      "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/#DE path failed " +
+      "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/frame-alloc/#DE path failed " +
       "-- see serial log)")
     Write-Output "UEFI BOOT FAIL"
     exit 1
