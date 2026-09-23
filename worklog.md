@@ -811,3 +811,50 @@ Format per entry (per `implementation-guide.md` §31):
   regions with double-free/invalid-range detection (next cycle). Sitrep
   harness stale dirty+SKIPPED and board showing only #1/#2 still escalated
   for orchestrator (done-moves flowing).
+
+## S03 slice 4 - frame allocator over BootInfo Usable + invalid-range/double-free matrix (2026-09-22)
+
+- **Decision:** Fourth committable slice of task #5, closing agent-b #58/#60
+  test matrix. New `crates/kernel/src/frame_alloc.rs`: `FrameAllocator`
+  ingests every `MemoryKind::Usable` region from `BootInfo` (sort +
+  coalesce touching spans; wrap/zero page_count skipped fail-closed),
+  next-fit `alloc(pages)` (no multi-span stitching this slice), and
+  `free(base, pages)` with three ordered fail-closed checks: Wrap
+  (`base > u64::MAX - len` or page_count byte-overflow), OutsideMap
+  (range not fully inside one coalesced Usable span - catches holes,
+  past-map, Reserved decoy), DoubleFree (any overlap with still-free
+  memory - adjacent touch coalesces, never false-positives). Every error
+  path leaves free_pages/free_span_count/cursor untouched. Public
+  accessors free_pages/free_span_count/cursor/map_span_count for
+  snapshot asserts. `pub mod frame_alloc` wired into baseos-kernel.
+- **Why:** S03 verification requires detect double free + detect invalid
+  ranges + stress; #58 matrix named the three concrete falsifiable cases
+  (adjacent in-order OK / same-range double-free error; wrap and
+  outside-map as separate tests; stress snapshot after fault storm).
+  Standing agreement 3: previous cycles held uncommitted plan-only work -
+  this lands the matrix end-to-end host-tested in one segment.
+- **Alternatives:** Bitmap over physical frames (rejected: needs a bound
+  on max physical address and wastes memory on sparse maps); free only
+  page-granular individual bits (rejected: double-free of multi-page
+  ranges and adjacent coalesce are harder to express cleanly); put the
+  allocator in boot-uefi (rejected: post-EBS kernel concern, e2e guest
+  stress deferred).
+- **Expected:** default `cargo test` 41 (37 + 4 new frame_alloc);
+  `-p baseos-kernel` 10 (6 prior + 4); `-p baseos-boot-uefi` 8
+  unchanged; fmt clean; clippy 3x -D warnings exit 0; boot-uefi.ps1
+  PASS; smoke PASS.
+- **Measured (2026-09-22, Win11):** `cargo fmt --check` clean; default
+  `cargo test` 41/41 OK (21+10+4+4+2); `-p baseos-kernel` 10/10
+  (4 new: `adjacent_usable_regions_free_in_order_same_range_double_free_errors`,
+  `free_rejects_wrapping_range`, `free_rejects_outside_bootinfo_map`,
+  `stress_fault_injection_preserves_free_count_and_cursor_snapshot`);
+  `-p baseos-boot-uefi` 8/8 OK; clippy default + boot-uefi --tests +
+  boot-uefi --target x86_64-unknown-uefi + kernel --tests all exit 0
+  -D warnings; `boot-uefi.ps1` UEFI BOOT PASS (guest 31232 bytes);
+  `smoke.ps1 -RequireOvmf` SMOKE PASS.
+- **Final:** #5 frame-allocator matrix landed (4/4 tests green). Residual
+  for #5 close: guest-side alloc/free proof serial line + QEMU stress
+  under S03 verification - next slice. #59(a) serial-log map_size budget
+  endorsed, not yet implemented. #6 refresh_map_key remains proposed
+  (owner agent-a; acceptance: host test for >16KiB refresh dance or
+  documented fail-closed contract with test).
