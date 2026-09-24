@@ -1287,3 +1287,52 @@ Format per entry (per `implementation-guide.md` §31):
   (wire scatter into guest stress/boot path with QEMU re-verify next --
   do not stack another host-only skip); contiguous `alloc` contract +
   no-stitch guard still pinned.
+
+## S03 slice 15 -- scatter guest wire-up + QEMU re-verify (2026-09-24)
+
+- **Decision:** Wire `alloc_scatter` into the guest path as step 2b of
+  `frame_alloc_stress` in `crates/kernel/src/frame_alloc.rs` (no script or
+  serial-format change): after the multi-page pair restore, run
+  `alloc_scatter(min(4, free_pages))` into a static 8-slot
+  `[ScatterSpan; 8]` buffer, then free every run in fill order; freed pages
+  plus `free_pages`/`free_span_count` must fully restore or `ok` clears.
+  Snapshot for the fault storm is taken after 2b, so scatter cursor motion
+  cannot weaken the fault assertions. New host test
+  `frame_alloc_stress_two_span_map_emits_exact_ok_line` (2x4-page fixture
+  expects `FRAMEALLOC ok=1 free=8 spans=2 faults=3`) proves the wired path
+  multi-span host-side; existing exact-line tests stay byte-identical.
+- **Why:** REVIEW #105 APPROVED slice 14 but held that scatter was proven in
+  isolation only, with two consecutive host-only skips stacking drift risk;
+  cheapest disconfirm is guest integration on the real OVMF map plus a fresh
+  QEMU PASS, closing both risks in one segment.
+- **Alternatives:** New SCATTER serial line + script hard-require (rejected:
+  scope growth -- FRAMEALLOC ok=1 already gates the battery, and 2b folds
+  into the same ok bit with zero e2e churn); larger scatter request to force
+  multi-span on any map (rejected: largest-span size is firmware-dependent,
+  min(4, free) always fits the 8-slot buffer and still stitches when the
+  cursor/fragments require it); assert spans restore only, not pages
+  (rejected: pages restore is the load-bearing invariant, spans restore
+  holds by insert-coalesce on all fixtures and the live map).
+- **Expected:** default `cargo test` 53 (52 + 1); `-p baseos-kernel` 22
+  (21 + 1); `-p baseos-boot-uefi` 10 unchanged; fmt clean; clippy 4x
+  `-D warnings` exit 0; `boot-uefi.ps1` PASS with `FRAMEALLOC ok=1`;
+  smoke PASS.
+- **Measured (2026-09-24, Win11):** default 53/53 (21+22+4+4+2);
+  `-p baseos-kernel` 22/22 (new: two-span stress exact-ok line);
+  `-p baseos-boot-uefi` 10/10; `cargo fmt --check` clean; clippy
+  default-all-targets + boot-uefi --tests + kernel --tests +
+  boot-uefi --target x86_64-unknown-uefi all exit 0 `-D warnings` (one
+  doc-lazy-continuation indent fix on the 2b doc list); `boot-uefi.ps1`
+  UEFI BOOT PASS exit 0 (guest 58368 bytes, serial 671 bytes: marker FOUND,
+  BOOTINFO valid=1 regions=98 usable=0xce8b000, FB present=1 1280x800
+  pitch=5120 bpp=32, MEMMAP ok=1 entries=98/98 truncated=0 map_size=4704
+  desc_size=48, GOP ok=1, EBS ok=1, KERNEL ok=1,
+  FRAMEALLOC ok=1 free=52875 spans=8 faults=3, EXC ok=1 vector=0; Budget
+  check ok=True); `smoke.ps1` not re-run this cycle (SeaBIOS path
+  untouched, prior PASS stands). Attribution: guest 53760 -> 58368
+  (+4608 B, crosses one 4 KiB page) so Usable free drops exactly 1
+  (52876 -> 52875) and usable 0xce8c000 -> 0xce8b000 (-0x1000); spans=8
+  and faults=3 unchanged; map_size/desc_size stable.
+- **Final:** Scatter is now integrated guest-side and proven on the OVMF map
+  (host exact-line + QEMU hard-require green). #5 stays active (contiguous
+  `alloc` no-stitch guard still pinned; stitch API additive only).

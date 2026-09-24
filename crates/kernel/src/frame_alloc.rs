@@ -380,9 +380,13 @@ impl FrameAllocator {
 /// (the `tools/qemu/boot-uefi.ps1` hard-require is `FRAMEALLOC ok=1`).
 ///
 /// Battery, in order (any failure clears `ok` but the line still prints):
-/// 1. 1024× single-page `alloc`+`free` sweep — every step must succeed.
+/// 1. 1024x single-page `alloc`+`free` sweep — every step must succeed.
 /// 2. Multi-page pair (two 2-page blocks) allocated and both freed, with
 ///    `free_pages`/`free_span_count` fully restored to the pre-pair values.
+///    2b. Scatter/gather wire-up: `alloc_scatter(min(4, free_pages))` into a
+///    static 8-slot buffer, then free every run in fill order; freed pages
+///    plus `free_pages`/`free_span_count` must fully restore (proves the
+///    stitch path on the live map, including the guest OVMF map).
 /// 3. Three faults — double-free of a still-free in-map range
 ///    ([`FrameError::DoubleFree`]), a wild address
 ///    ([`FrameError::OutsideMap`]), and a wrap ([`FrameError::Wrap`]) —
@@ -429,6 +433,36 @@ pub fn frame_alloc_stress<E>(
         }
         if !pair_ok {
             ok = false;
+        }
+        // (2b) Scatter wire-up on the live map (guest + host same path).
+        let scatter_need = core::cmp::min(4, fa.free_pages());
+        if scatter_need > 0 {
+            let mut runs = [ScatterSpan { base: 0, pages: 0 }; 8];
+            let free_before = fa.free_pages();
+            let spans_before = fa.free_span_count();
+            match fa.alloc_scatter(scatter_need, &mut runs) {
+                Some(filled) if filled > 0 && filled <= runs.len() => {
+                    let mut scatter_ok = true;
+                    let mut freed_pages = 0u64;
+                    for run in &runs[..filled] {
+                        freed_pages = freed_pages.saturating_add(run.pages);
+                        if fa.free(run.base, run.pages).is_err() {
+                            scatter_ok = false;
+                            break;
+                        }
+                    }
+                    if !scatter_ok
+                        || freed_pages != scatter_need
+                        || fa.free_pages() != free_before
+                        || fa.free_span_count() != spans_before
+                    {
+                        ok = false;
+                    }
+                }
+                _ => {
+                    ok = false;
+                }
+            }
         }
         // (3) Fault storm against a stable snapshot: each must Err with
         // the expected kind, and no state may move.
@@ -673,6 +707,22 @@ mod tests {
         .unwrap();
         let text = std::string::String::from_utf8(out).unwrap();
         assert_eq!(text, "FRAMEALLOC ok=0 free=0 spans=0 faults=0\n");
+    }
+
+    /// Scatter wire-up host proof: the 2x4-page two-span fixture runs the
+    /// full stress battery including step 2b (`alloc_scatter(4)` + free of
+    /// every run) and still emits the exact ok line with spans restored.
+    #[test]
+    fn frame_alloc_stress_two_span_map_emits_exact_ok_line() {
+        let boot = boot_with(&[(0x1000, 4), (0x100_0000, 4)]);
+        let mut out = Vec::new();
+        frame_alloc_stress::<core::convert::Infallible>(&boot, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let text = std::string::String::from_utf8(out).unwrap();
+        assert_eq!(text, "FRAMEALLOC ok=1 free=8 spans=2 faults=3\n");
     }
 
     /// S03 verification (host-only #59b): allocate/free large numbers of
