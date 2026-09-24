@@ -385,8 +385,9 @@ impl FrameAllocator {
 ///    `free_pages`/`free_span_count` fully restored to the pre-pair values.
 ///    2b. Scatter/gather wire-up: `alloc_scatter(min(4, free_pages))` into a
 ///    static 8-slot buffer, then free every run in fill order; freed pages
-///    plus `free_pages`/`free_span_count` must fully restore (proves the
-///    stitch path on the live map, including the guest OVMF map).
+///    plus `free_pages`/`free_span_count` must fully restore (exercises the
+///    scatter path on the live map; single-span on the OVMF map, true
+///    multi-span stitch stays host-only).
 /// 3. Three faults — double-free of a still-free in-map range
 ///    ([`FrameError::DoubleFree`]), a wild address
 ///    ([`FrameError::OutsideMap`]), and a wrap ([`FrameError::Wrap`]) —

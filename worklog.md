@@ -1300,7 +1300,9 @@ Format per entry (per `implementation-guide.md` §31):
   cannot weaken the fault assertions. New host test
   `frame_alloc_stress_two_span_map_emits_exact_ok_line` (2x4-page fixture
   expects `FRAMEALLOC ok=1 free=8 spans=2 faults=3`) proves the wired path
-  multi-span host-side; existing exact-line tests stay byte-identical.
+  host-side (need=4 fits one span, so single-span; true multi-span stitch
+  stays covered by `alloc_scatter_succeeds_across_spans` etc); existing
+  exact-line tests stay byte-identical.
 - **Why:** REVIEW #105 APPROVED slice 14 but held that scatter was proven in
   isolation only, with two consecutive host-only skips stacking drift risk;
   cheapest disconfirm is guest integration on the real OVMF map plus a fresh
@@ -1333,6 +1335,8 @@ Format per entry (per `implementation-guide.md` §31):
   (+4608 B, crosses one 4 KiB page) so Usable free drops exactly 1
   (52876 -> 52875) and usable 0xce8c000 -> 0xce8b000 (-0x1000); spans=8
   and faults=3 unchanged; map_size/desc_size stable.
-- **Final:** Scatter is now integrated guest-side and proven on the OVMF map
-  (host exact-line + QEMU hard-require green). #5 stays active (contiguous
-  `alloc` no-stitch guard still pinned; stitch API additive only).
+- **Final:** Scatter wire-up is now integrated guest-side and proven on the
+  OVMF map as single-span `alloc_scatter` (host exact-line + QEMU
+  hard-require green); true multi-span stitch stays host-only. #5 stays
+  active (contiguous `alloc` no-stitch guard still pinned; stitch API
+  additive only). Per REVIEW #107, 2b proves wire-up, not guest stitch.
