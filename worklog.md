@@ -1157,3 +1157,33 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** REVIEW #92 nits closed on the current tree. #5 stays active
   (true multi-span stitch still deferred -- needs API design); QEMU
   re-verify rides with the next guest-touching slice.
+
+## S03 slice 11 -- stitch precursor: no-stitch contract lock (2026-09-24)
+
+- **Decision:** Land one host-only precursor test in
+  `crates/kernel/src/frame_alloc.rs` before any stitch API design:
+  `alloc_requiring_multi_span_stitch_fails_closed` (two disjoint 4-page
+  spans, 8 free pages total; `alloc(8)` and `alloc(5)` must return `None`
+  with count/spans/cursor untouched; control `alloc(4)` still succeeds).
+  No guest/script/control-flow change.
+- **Why:** REVIEW #94 leaves #5 active with true multi-span stitch deferred
+  pending API design. The cheapest falsifiable step is to pin the current
+  contiguous-only contract so the stitch slice has a visible red-to-green
+  transition and no silent behavior change.
+- **Alternatives:** Design and implement scatter/gather stitch now
+  (rejected: scope growth -- needs API choice like fill-a-caller-buffer
+  vs iterator, plus cursor/clamp semantics; deferred by design, pin first);
+  QEMU re-run (rejected: guest/script bytes untouched, PASS @693bb2f stands
+  by non-interference, same as slices 8/9/10).
+- **Expected:** default `cargo test` 48 (47 + 1); `-p baseos-kernel` 17
+  (16 + 1); `-p baseos-boot-uefi` 10 unchanged; fmt clean; clippy 4x
+  `-D warnings` exit 0; QEMU skipped (host-only).
+- **Measured (2026-09-24, Win11):** default 48/48 (21+17+4+4+2);
+  `-p baseos-kernel` 17/17 (new: stitch-fails-closed);
+  `-p baseos-boot-uefi` 10/10; `cargo fmt --check` clean; clippy
+  default-all-targets + boot-uefi --tests + kernel --tests +
+  boot-uefi --target x86_64-unknown-uefi all exit 0 `-D warnings`. QEMU
+  `boot-uefi.ps1` / `smoke.ps1` SKIPPED (host-only; guest untouched).
+- **Final:** No-stitch contract pinned on the current tree. #5 stays active
+  (stitch API design next --fill-a-caller-buffer vs iterator, cursor/clamp
+  semantics); QEMU re-verify rides with the next guest-touching slice.

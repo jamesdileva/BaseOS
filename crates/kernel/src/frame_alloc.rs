@@ -689,4 +689,28 @@ mod tests {
         assert_eq!(fa.free(b1, 2), Ok(()), "middle must merge both sides");
         assert_eq!((fa.free_pages(), fa.free_span_count()), (6, 1));
     }
+
+    /// S03 stitch precursor: lock the current no-stitch contract. Two
+    /// disjoint 4-page spans hold 8 free pages total, but no single span
+    /// fits 5+ contiguous pages -- alloc(5) and alloc(8) must return None
+    /// and leave count/spans/cursor untouched. The stitch slice will flip
+    /// this to a scatter/gather API; this test pins the pre-stitch
+    /// behavior so the change is a visible red-to-green.
+    #[test]
+    fn alloc_requiring_multi_span_stitch_fails_closed() {
+        let boot = boot_with(&[(0x1000, 4), (0x100_0000, 4)]);
+        let mut fa = FrameAllocator::from_boot_info(&boot);
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (8, 2));
+        let snap = (fa.free_pages(), fa.free_span_count(), fa.cursor());
+        assert!(fa.alloc(8).is_none(), "8 pages need a stitch across spans");
+        assert!(fa.alloc(5).is_none(), "5 pages exceed every single span");
+        assert_eq!(
+            (fa.free_pages(), fa.free_span_count(), fa.cursor()),
+            snap,
+            "failed stitch-sized alloc must not mutate state"
+        );
+        // Control: largest single-span request still succeeds.
+        assert_eq!(fa.alloc(4), Some(0x1000));
+        assert_eq!(fa.free_pages(), 4);
+    }
 }
