@@ -952,7 +952,7 @@ Format per entry (per `implementation-guide.md` Â§31):
   refresh_map_key >16KiB fail-closed host test (owner agent-a,
   proposed). Open: #59(b) host-only until real-UEFI BUFFER_TOO_SMALL.
 
-## S03 slice 7 — #6 refresh_map_key >16KiB fail-closed host test + e2e budget value check (2026-09-22)
+## S03 slice 7 ï¿½ #6 refresh_map_key >16KiB fail-closed host test + e2e budget value check (2026-09-22)
 
 - **Decision:** Seventh committable slice (#6), folding agent-b REVIEW #75
   findings. New host test
@@ -977,18 +977,18 @@ Format per entry (per `implementation-guide.md` Â§31):
   not actually checked e2e) and endorsement to proceed; finding 2
   (FRAMEALLOC 1-frame delta) required attribution before leaving it.
 - **Alternatives:** Drive the >16KiB refresh failure through a pool-dance
-  in refresh (rejected: refresh is single-shot by design since slice 3 —
+  in refresh (rejected: refresh is single-shot by design since slice 3 ï¿½
   dance would add a second allocation path post-stale-key with no
   observed need; fail-loud over silent growth); extend mode 0 with a
   BUFFER_TOO_SMALL case (rejected: agent-b explicitly asked the >16KiB
-  scenario be unmistakable — separate test with map_size guard reads
-  unambiguously); budget check as a soft log line (rejected: fail-loud —
+  scenario be unmistakable ï¿½ separate test with map_size guard reads
+  unambiguously); budget check as a soft log line (rejected: fail-loud ï¿½
   that was finding 1); restructure ps1 into a parser module (rejected:
   scope growth for a one-regex gate).
 - **Expected:** default `cargo test` 43 unchanged (boot-uefi not in
   default-members); `-p baseos-boot-uefi` 10 (9 + 1); `-p baseos-kernel`
   12 unchanged; fmt clean; clippy 4x -D warnings exit 0; boot-uefi.ps1
-  PASS with `Budget check: … ok=True`; FRAMEALLOC free=52876 stable
+  PASS with `Budget check: ï¿½ ok=True`; FRAMEALLOC free=52876 stable
   across reruns (attribution: deterministic layout, not variance); smoke
   PASS.
 - **Measured (2026-09-22, Win11):** `cargo fmt --check` clean; default
@@ -996,7 +996,7 @@ Format per entry (per `implementation-guide.md` Â§31):
   `exit_boot_services_refresh_fails_closed_when_map_outgrows_static`);
   `-p baseos-kernel` 12/12; clippy default --all-targets + boot-uefi
   --tests + boot-uefi --target x86_64-unknown-uefi + kernel --tests all
-  exit 0 -D warnings; `boot-uefi.ps1` UEFI BOOT PASS ×2 consecutive runs
+  exit 0 -D warnings; `boot-uefi.ps1` UEFI BOOT PASS ï¿½2 consecutive runs
   (guest 53760 bytes both; `Budget check: map_size=4704 (<=20480),
   desc_size=48 ([40,256]), ok=True`; serial `MEMMAP ok=1 status=0x0
   entries=98/98 truncated=0 map_size=4704 desc_size=48`; FRAMEALLOC
@@ -1005,7 +1005,7 @@ Format per entry (per `implementation-guide.md` Â§31):
   desc_size=8?False, 4704/48?True); `smoke.ps1 -RequireOvmf` SMOKE PASS.
   Finding-2 attribution: @7a1ce76 guest was 53248 B = exactly 13 pages
   with free=52877; @da11000 guest 53760 B = 14 pages (+512 B of slice-6
-  formatting code crossed the 13?14 page boundary) with free=52876 —
+  formatting code crossed the 13?14 page boundary) with free=52876 ï¿½
   the image occupies one more 4 KiB frame so Usable free drops by exactly
   1; spans=8 and faults=3 unchanged; two fresh reruns both 52876.
   Deterministic layout consequence of code growth, not OVMF variance and
@@ -1014,9 +1014,44 @@ Format per entry (per `implementation-guide.md` Â§31):
   test agent-b asked for; #59(a) e2e gate now checks budget values, not
   substrings (finding 1 closed); FRAMEALLOC delta attributed and recorded
   (finding 2 closed). Risk retained and documented: #59(b) real-UEFI
-  BUFFER_TOO_SMALL still never observed — OVMF 4704 B is one config
+  BUFFER_TOO_SMALL still never observed ï¿½ OVMF 4704 B is one config
   only, budget headroom is not a universal guarantee. No
-  PROJECT_GOAL.md added (mission lists agents.md/worklog.md only) —
-  human decision if a durable goal copy is wanted. Pending peer REVIEW
-  of this slice by agent-b; board moves withheld pending agent-b's board
-  fix (#62/#65/#69).
+  PROJECT_GOAL.md added (mission lists agents.md/worklog.md only) ï¿½
+   human decision if a durable goal copy is wanted. Pending peer REVIEW
+   of this slice by agent-b; board moves withheld pending agent-b's board
+   fix (#62/#65/#69).
+
+## S03 slice 8 â€” host-only large-number drain test + skipped-verification re-green (2026-09-24)
+
+- **Decision:** Smallest host-only S03-remaining slice (#5, #59b spirit):
+  one test `alloc_drains_entire_map_and_restores` in
+  `crates/kernel/src/frame_alloc.rs` â€” 2000-page two-span map drained one
+  page at a time, exhaustion `alloc` proven `None` with snapshot untouched,
+  reverse-order free restores `(2000, 2)`. No guest/script/control-flow
+  change. Also re-ran the full host gates to close agent-b #86's
+  two-cycles-skipped-verification risk (baseline was green before the edit
+  too, so no hidden regression).
+- **Why:** S03 verification needs "allocate/free large numbers of frames";
+  host max was 24 pages (guest sweep reuses one frame 1024x). A full-drain
+  test is the cheapest falsifiable host proof, QEMU-free per #59b host-only
+  + #86 cheapest-disconfirm guidance. Guest untouched, so prior
+  `boot-uefi.ps1` PASS @693bb2f stands by non-interference.
+- **Alternatives:** QEMU e2e re-run this cycle (rejected: guest bytes
+  unchanged, host-only slice needs no firmware proof; rerun rides with the
+  next guest-touching slice); multi-span stitching alloc (rejected: scope
+  growth â€” deferred by design, drain test first); separate stress crate
+  (rejected: one test in the existing matrix file is the smallest segment).
+- **Expected:** default `cargo test` 44 (43 + 1); `-p baseos-kernel` 13
+  (12 + 1); `-p baseos-boot-uefi` 10 unchanged; fmt clean; clippy 4x
+  `-D warnings` exit 0; QEMU skipped (host-only).
+- **Measured (2026-09-24, Win11):** baseline pre-edit green (default 43,
+  boot-uefi 10, fmt clean, clippy host/tests/kernel 0); post-edit default
+  44/44 (21+13+4+4+2); `-p baseos-kernel` 13/13; `-p baseos-boot-uefi`
+  10/10; `cargo fmt --check` clean; clippy default-all-targets +
+  boot-uefi --tests + kernel --tests + boot-uefi --target
+  x86_64-unknown-uefi all exit 0 `-D warnings`. QEMU `boot-uefi.ps1` /
+  `smoke.ps1` SKIPPED (host-only slice; guest/script bytes untouched).
+- **Final:** Large-number host proof landed; verification gap closed on the
+  current tree. #5 stays active: remaining S03 work is multi-span stitch
+  (deferred by design) + any peer review findings; QEMU re-verify rides
+  with the next guest-touching slice.

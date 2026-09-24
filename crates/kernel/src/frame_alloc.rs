@@ -585,4 +585,31 @@ mod tests {
         let text = std::string::String::from_utf8(out).unwrap();
         assert_eq!(text, "FRAMEALLOC ok=0 free=0 spans=0 faults=0\n");
     }
+
+    /// S03 verification (host-only #59b): allocate/free large numbers of
+    /// frames — drain a 2000-page two-span map one page at a time, prove
+    /// exhaustion fails closed without state motion, then free all in
+    /// reverse and prove full restore (count + spans).
+    #[test]
+    fn alloc_drains_entire_map_and_restores() {
+        let boot = boot_with(&[(0x1000, 1500), (0x100_0000, 500)]);
+        let mut fa = FrameAllocator::from_boot_info(&boot);
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (2000, 2));
+        let mut bases = std::vec::Vec::with_capacity(2000);
+        for _ in 0..2000 {
+            bases.push(fa.alloc(1).expect("drain must succeed"));
+        }
+        assert_eq!(fa.free_pages(), 0);
+        let snap = (fa.free_pages(), fa.free_span_count(), fa.cursor());
+        assert!(fa.alloc(1).is_none(), "exhausted alloc must fail");
+        assert_eq!(
+            (fa.free_pages(), fa.free_span_count(), fa.cursor()),
+            snap,
+            "failed alloc must not mutate state"
+        );
+        for base in bases.into_iter().rev() {
+            assert_eq!(fa.free(base, 1), Ok(()));
+        }
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (2000, 2));
+    }
 }
