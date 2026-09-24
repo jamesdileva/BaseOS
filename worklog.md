@@ -265,7 +265,7 @@ Format per entry (per `implementation-guide.md` §31):
   time, `boot-uefi.ps1` stays the proof vehicle; suggested first slice is
   UEFI memory-map retrieval printed to serial.
 
-## S01 slice 3 � boot-info handoff struct contract (2026-09-20)
+## S01 slice 3 -- boot-info handoff struct contract (2026-09-20)
 
 - **Decision:** Land the S01-remainder handoff half as one committable slice:
   new no_std crates/boot-info (BootInfo magic/version header, inline
@@ -883,7 +883,7 @@ Format per entry (per `implementation-guide.md` §31):
   pre-EBS with boot services still live (rejected: the allocator is
   post-handoff kernel logic and must be proven on the BootInfo handoff
   itself); drop the hard-require to a soft log check (rejected: fail-loud
-  agreement � a missing/failed FRAMEALLOC line must fail the e2e).
+  agreement -- a missing/failed FRAMEALLOC line must fail the e2e).
 - **Expected:** default `cargo test` 43 (41 + 2 new stress tests);
   `-p baseos-kernel` 12 (10 + 2); `-p baseos-boot-uefi` 8 unchanged;
   fmt clean; clippy 4x -D warnings exit 0; boot-uefi.ps1 PASS with
@@ -952,7 +952,7 @@ Format per entry (per `implementation-guide.md` §31):
   refresh_map_key >16KiB fail-closed host test (owner agent-a,
   proposed). Open: #59(b) host-only until real-UEFI BUFFER_TOO_SMALL.
 
-## S03 slice 7 � #6 refresh_map_key >16KiB fail-closed host test + e2e budget value check (2026-09-22)
+## S03 slice 7 -- #6 refresh_map_key >16KiB fail-closed host test + e2e budget value check (2026-09-22)
 
 - **Decision:** Seventh committable slice (#6), folding agent-b REVIEW #75
   findings. New host test
@@ -971,24 +971,24 @@ Format per entry (per `implementation-guide.md` §31):
   line and enforce `map_size <= 20480` (16 KiB + 4 KiB slack) and
   `desc_size in [40,256]`; missing/non-numeric/out-of-range fails the
   PASS chain (presence-only checks would have let
-  `map_size=999999999`/`map_size=abc` PASS). Banner ? slice 7.
+  `map_size=999999999`/`map_size=abc` PASS). Banner -- slice 7.
 - **Why:** #6 acceptance (worklog slice-4 final: host test for >16KiB
   refresh fail-closed contract) + agent-b #75 findings 1 (budget values
   not actually checked e2e) and endorsement to proceed; finding 2
   (FRAMEALLOC 1-frame delta) required attribution before leaving it.
 - **Alternatives:** Drive the >16KiB refresh failure through a pool-dance
-  in refresh (rejected: refresh is single-shot by design since slice 3 �
+  in refresh (rejected: refresh is single-shot by design since slice 3 --
   dance would add a second allocation path post-stale-key with no
   observed need; fail-loud over silent growth); extend mode 0 with a
   BUFFER_TOO_SMALL case (rejected: agent-b explicitly asked the >16KiB
-  scenario be unmistakable � separate test with map_size guard reads
-  unambiguously); budget check as a soft log line (rejected: fail-loud �
+  scenario be unmistakable -- separate test with map_size guard reads
+  unambiguously); budget check as a soft log line (rejected: fail-loud --
   that was finding 1); restructure ps1 into a parser module (rejected:
   scope growth for a one-regex gate).
 - **Expected:** default `cargo test` 43 unchanged (boot-uefi not in
   default-members); `-p baseos-boot-uefi` 10 (9 + 1); `-p baseos-kernel`
   12 unchanged; fmt clean; clippy 4x -D warnings exit 0; boot-uefi.ps1
-  PASS with `Budget check: � ok=True`; FRAMEALLOC free=52876 stable
+  PASS with `Budget check: -- ok=True`; FRAMEALLOC free=52876 stable
   across reruns (attribution: deterministic layout, not variance); smoke
   PASS.
 - **Measured (2026-09-22, Win11):** `cargo fmt --check` clean; default
@@ -996,16 +996,16 @@ Format per entry (per `implementation-guide.md` §31):
   `exit_boot_services_refresh_fails_closed_when_map_outgrows_static`);
   `-p baseos-kernel` 12/12; clippy default --all-targets + boot-uefi
   --tests + boot-uefi --target x86_64-unknown-uefi + kernel --tests all
-  exit 0 -D warnings; `boot-uefi.ps1` UEFI BOOT PASS �2 consecutive runs
+  exit 0 -D warnings; `boot-uefi.ps1` UEFI BOOT PASS x2 consecutive runs
   (guest 53760 bytes both; `Budget check: map_size=4704 (<=20480),
   desc_size=48 ([40,256]), ok=True`; serial `MEMMAP ok=1 status=0x0
   entries=98/98 truncated=0 map_size=4704 desc_size=48`; FRAMEALLOC
   `free=52876 spans=8 faults=3` byte-identical across both runs);
-  negative budget probes fail as intended (999999999?False, abc?False,
-  desc_size=8?False, 4704/48?True); `smoke.ps1 -RequireOvmf` SMOKE PASS.
+  negative budget probes fail as intended (999999999->False, abc->False,
+  desc_size=8->False, 4704/48->True); `smoke.ps1 -RequireOvmf` SMOKE PASS.
   Finding-2 attribution: @7a1ce76 guest was 53248 B = exactly 13 pages
   with free=52877; @da11000 guest 53760 B = 14 pages (+512 B of slice-6
-  formatting code crossed the 13?14 page boundary) with free=52876 �
+  formatting code crossed the 13->14 page boundary) with free=52876 --
   the image occupies one more 4 KiB frame so Usable free drops by exactly
   1; spans=8 and faults=3 unchanged; two fresh reruns both 52876.
   Deterministic layout consequence of code growth, not OVMF variance and
@@ -1014,9 +1014,9 @@ Format per entry (per `implementation-guide.md` §31):
   test agent-b asked for; #59(a) e2e gate now checks budget values, not
   substrings (finding 1 closed); FRAMEALLOC delta attributed and recorded
   (finding 2 closed). Risk retained and documented: #59(b) real-UEFI
-  BUFFER_TOO_SMALL still never observed � OVMF 4704 B is one config
+  BUFFER_TOO_SMALL still never observed -- OVMF 4704 B is one config
   only, budget headroom is not a universal guarantee. No
-  PROJECT_GOAL.md added (mission lists agents.md/worklog.md only) �
+  PROJECT_GOAL.md added (mission lists agents.md/worklog.md only) --
    human decision if a durable goal copy is wanted. Pending peer REVIEW
    of this slice by agent-b; board moves withheld pending agent-b's board
    fix (#62/#65/#69).
@@ -1055,3 +1055,37 @@ Format per entry (per `implementation-guide.md` §31):
   current tree. #5 stays active: remaining S03 work is multi-span stitch
   (deferred by design) + any peer review findings; QEMU re-verify rides
   with the next guest-touching slice.
+
+## S03 slice 8 follow-up -- REVIEW #88 encoding + re-verify (2026-09-24)
+
+- **Decision:** Close both agent-b REVIEW #88 findings with no code change:
+  (a) replaced all 11 U+FFFD replacement chars in `worklog.md` (slice-7
+  lines rewritten by the slice-8 edit: headers, trailing em-dashes,
+  `PASS x2`, `13->14`, `->False/->True` probes) with ASCII equivalents,
+  plus three ASCII-`?` cleanups on the same lines (`Banner -- slice 7`,
+  `13->14`, `->False/->True`); file now has zero U+FFFD and stays valid
+  UTF-8; (b) re-ran the full host gates reviewer asked for (default +
+  `-p baseos-kernel` + `-p baseos-boot-uefi` + fmt + 4x clippy).
+- **Why:** Finding 1 was a real mojibake regression from editing a file
+  that mixes UTF-8 multi-byte and legacy cp1252 singletons (0x97 em-dash,
+  0xD7 times) with a UTF-8 read/replace/write round-trip; finding 2 was a
+  trust gap (prior gates reported, not independently re-run by reviewer).
+- **Alternatives:** Convert the whole worklog to pure ASCII now (rejected:
+  scope growth -- 300+ legacy non-ASCII bytes predate this fix; ASCII-only
+  for touched lines closes the nit without a noisy full-file rewrite);
+  QEMU re-run this cycle (rejected: guest/script bytes untouched, prior
+  PASS @693bb2f stands by non-interference, same as slice 8).
+- **Expected:** zero U+FFFD; default 44, kernel 13, boot-uefi 10; fmt
+  clean; clippy 4x exit 0; QEMU skipped (worklog-only).
+- **Measured (2026-09-24, Win11):** `worklog.md` U+FFFD count 11 -> 0;
+  default `cargo test` 44/44 (21+13+4+4+2); `-p baseos-kernel` 13/13;
+  `-p baseos-boot-uefi` 10/10; `cargo fmt --check` clean; clippy
+  default-all-targets + boot-uefi --tests + kernel --tests +
+  boot-uefi --target x86_64-unknown-uefi all exit 0 `-D warnings`.
+- **Final:** REVIEW #88 findings 1+2 closed on the current tree. #5 stays
+  active (multi-span stitch deferred + forward/interleaved-free variant
+  noted for the stitch slice); QEMU re-verify rides with the next
+  guest-touching slice. Coalescing note for #88 Q: reverse-only free
+  exercises the coalesce-with-next branch on every page plus the final
+  2-span restore; forward would cover coalesce-with-prev and interleaved
+  the double-sided merge -- worth adding alongside stitch, not blocking.
