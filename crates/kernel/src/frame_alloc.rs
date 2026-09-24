@@ -60,6 +60,14 @@ impl Span {
     }
 }
 
+/// One contiguous run of a scatter/gather allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScatterSpan {
+    /// Physical base address (page-aligned).
+    pub base: u64,
+    /// Length in pages.
+    pub pages: u64,
+}
 /// Physical frame allocator: sorted free list over BootInfo Usable spans.
 ///
 /// `map` is the immutable ingested Usable union (outside-map oracle);
@@ -192,6 +200,87 @@ impl FrameAllocator {
             return Some(base);
         }
         None
+    }
+
+    /// Allocate `pages` frames across disjoint free spans into `out`.
+    ///
+    /// Fill-caller-buffer scatter/gather for no_std post-EBS (no
+    /// lifetimes/alloc in the EBS-exited context): writes one
+    /// [`ScatterSpan`] per consumed free span and returns `Some(filled)`.
+    /// Next-fit from `cursor`, carving each span from the front.
+    ///
+    /// Fail-closed (no mutation of free count, spans, cursor, or `out`)
+    /// when `pages == 0`, `pages > free_pages()`, or `out.len()` is
+    /// smaller than the spans needed to cover `pages`.
+    ///
+    /// Cursor edge cases: empty list -> 0; exact-consume (last span fully
+    /// taken) -> `idx % free_count` (0 when the list drains); partial
+    /// final span -> same span index (remainder sits at that index).
+    pub fn alloc_scatter(&mut self, pages: u64, out: &mut [ScatterSpan]) -> Option<usize> {
+        if pages == 0 {
+            return None;
+        }
+        if pages > self.free_pages {
+            return None;
+        }
+        if self.free_count == 0 {
+            return None;
+        }
+        let n = self.free_count;
+        let start = self.cursor % n;
+        // Phase 1 (read-only): count spans needed to cover `pages`.
+        let mut need_pages = pages;
+        let mut spans_needed = 0usize;
+        for i in 0..n {
+            let span_pages = self.free[(start + i) % n].len() / PAGE_SIZE;
+            if span_pages == 0 {
+                continue;
+            }
+            spans_needed += 1;
+            if span_pages >= need_pages {
+                need_pages = 0;
+                break;
+            }
+            need_pages -= span_pages;
+        }
+        if need_pages != 0 {
+            return None;
+        }
+        if out.len() < spans_needed {
+            return None;
+        }
+        // Phase 2 (commit): carve spans in next-fit order.
+        let mut remaining = pages;
+        let mut filled = 0usize;
+        let mut idx = start;
+        while remaining > 0 {
+            let span_pages = self.free[idx].len() / PAGE_SIZE;
+            let take = remaining.min(span_pages);
+            out[filled] = ScatterSpan {
+                base: self.free[idx].start,
+                pages: take,
+            };
+            filled += 1;
+            remaining -= take;
+            if take == span_pages {
+                for k in idx..self.free_count - 1 {
+                    self.free[k] = self.free[k + 1];
+                }
+                self.free_count -= 1;
+                if self.free_count == 0 {
+                    self.cursor = 0;
+                    break;
+                }
+                idx %= self.free_count;
+                self.cursor = idx;
+            } else {
+                self.free[idx].start += take * PAGE_SIZE;
+                self.cursor = idx;
+                break;
+            }
+        }
+        self.free_pages -= pages;
+        Some(filled)
     }
 
     /// Free `pages` frames at `base` back into the list.
@@ -712,5 +801,88 @@ mod tests {
         // Control: largest single-span request still succeeds.
         assert_eq!(fa.alloc(4), Some(0x1000));
         assert_eq!(fa.free_pages(), 4);
+    }
+
+    /// REVIEW #100 stitch: scatter across the 2x4-page fixture. `alloc(5)`
+    /// stays `None` (contiguous-only) while `alloc_scatter(5)` fills two
+    /// runs `[(0x1000, 4), (0x1000000, 1)]`, leaving the partial second
+    /// span at the same cursor index; exact-consume drain clamps to 0.
+    #[test]
+    fn alloc_scatter_succeeds_across_spans() {
+        let boot = boot_with(&[(0x1000, 4), (0x100_0000, 4)]);
+        let mut fa = FrameAllocator::from_boot_info(&boot);
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (8, 2));
+        let mut out = [ScatterSpan { base: 0, pages: 0 }; 4];
+        let filled = fa
+            .alloc_scatter(5, &mut out)
+            .expect("5 pages stitch across 2 spans");
+        assert_eq!(filled, 2);
+        assert_eq!(
+            (out[0], out[1]),
+            (
+                ScatterSpan {
+                    base: 0x1000,
+                    pages: 4
+                },
+                ScatterSpan {
+                    base: 0x100_0000,
+                    pages: 1
+                },
+            )
+        );
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (3, 1));
+        assert_eq!(fa.cursor(), 0, "partial final span keeps its index");
+        // Exact-consume of the 3-page remainder drains the list.
+        let mut tail = [ScatterSpan { base: 0, pages: 0 }; 2];
+        assert_eq!(fa.alloc_scatter(3, &mut tail), Some(1));
+        assert_eq!(
+            tail[0],
+            ScatterSpan {
+                base: 0x100_0000 + PAGE_SIZE,
+                pages: 3
+            }
+        );
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (0, 0));
+        assert_eq!(fa.cursor(), 0, "empty list clamps cursor to 0");
+    }
+
+    /// REVIEW #100 stitch fail-closed: undersized `out` and over-request
+    /// both return `None` with bitmap, cursor, and `out` untouched.
+    #[test]
+    fn alloc_scatter_out_too_small_fails_closed() {
+        let boot = boot_with(&[(0x1000, 4), (0x100_0000, 4)]);
+        let mut fa = FrameAllocator::from_boot_info(&boot);
+        let snap = (fa.free_pages(), fa.free_span_count(), fa.cursor());
+        // 5 pages need 2 spans; a 1-slot buffer must fail closed.
+        let mut small = [ScatterSpan {
+            base: 0xCAFE,
+            pages: 0xCAFE,
+        }];
+        assert!(fa.alloc_scatter(5, &mut small).is_none());
+        assert_eq!(
+            (fa.free_pages(), fa.free_span_count(), fa.cursor()),
+            snap,
+            "short buffer must not mutate allocator state"
+        );
+        assert_eq!(
+            small[0],
+            ScatterSpan {
+                base: 0xCAFE,
+                pages: 0xCAFE
+            },
+            "short buffer slot must stay untouched"
+        );
+        // Over-request beyond total free pages fails closed too.
+        let mut wide = [ScatterSpan { base: 0, pages: 0 }; 4];
+        assert!(fa.alloc_scatter(9, &mut wide).is_none());
+        assert_eq!(
+            (fa.free_pages(), fa.free_span_count(), fa.cursor()),
+            snap,
+            "over-request must not mutate allocator state"
+        );
+        assert!(
+            wide.iter().all(|s| *s == ScatterSpan { base: 0, pages: 0 }),
+            "over-request must not touch the buffer"
+        );
     }
 }

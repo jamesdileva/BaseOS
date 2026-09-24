@@ -1217,3 +1217,37 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** QEMU drift closed on the current tree (@dc2a1c1 + worklog).
   #5 stays active (stitch API design next -- fill-a-caller-buffer vs
   iterator, cursor/clamp semantics).
+
+## S03 slice 13 -- stitch scatter prototype per REVIEW #100 (2026-09-24)
+
+- **Decision:** Implement `FrameAllocator::alloc_scatter(pages, out:
+  &mut [ScatterSpan]) -> Option<usize>` (single `ScatterSpan{base,
+  pages}` slice, fill-caller-buffer, no_std-safe) plus two host tests on
+  the 2x4-page fixture; keep `alloc` contiguous-only and keep
+  `alloc_requiring_multi_span_stitch_fails_closed` as the fail-closed
+  guard (not flipped green).
+- **Why:** REVIEW #100 concurred fill-buffer over lazy iterator (no
+  lifetimes/alloc post-EBS), rejected parallel bases+lens arrays (desync
+  risk), and named cursor-clamp on the 2x4 fixture as the cheapest
+  disconfirm before wiring the boot path.
+- **Alternatives:** Lazy iterator scatter (rejected: lifetimes/alloc in
+  EBS-exited context); dual `&mut [u64]` bases+lens arrays (rejected:
+  desync risk); flipping the no-stitch guard green now (rejected: keep
+  the contiguous-only contract pinned for `alloc`, scatter is additive).
+- **Expected:** default 50 (48 + 2), kernel 19 (17 + 2), boot-uefi 10;
+  fmt clean; clippy 4x `-D warnings` exit 0; QEMU skipped (host-only,
+  guest/script untouched, PASS @22752c3 stands by non-interference).
+- **Measured (2026-09-24, Win11):** default 50/50 (21+19+4+4+2);
+  `-p baseos-kernel` 19/19 (new: `alloc_scatter_succeeds_across_spans`
+  + `alloc_scatter_out_too_small_fails_closed`);
+  `-p baseos-boot-uefi` 10/10; `cargo fmt --check` clean (after one
+  auto-format); clippy default-all-targets + boot-uefi --tests +
+  kernel --tests + boot-uefi --target x86_64-unknown-uefi all exit 0
+  `-D warnings`. Scatter semantics locked: 5 pages on 2x4 fills
+  `[(0x1000,4),(0x1000000,1)]` with partial-span cursor staying at the
+  same index; exact-consume drain clamps cursor to 0; short buffer and
+  over-request both return `None` with bitmap/cursor/`out` untouched.
+  QEMU `boot-uefi.ps1` / `smoke.ps1` SKIPPED (host-only).
+- **Final:** Stitch cursor-clamp prototype landed on the current tree.
+  #5 stays active (wire scatter into guest stress/boot path or peer
+  review first); contiguous `alloc` behavior unchanged.
