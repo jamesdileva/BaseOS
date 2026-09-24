@@ -612,4 +612,42 @@ mod tests {
         }
         assert_eq!((fa.free_pages(), fa.free_span_count()), (2000, 2));
     }
+
+    /// REVIEW #90 coverage: forward-order free exercises the
+    /// coalesce-with-prev branch on every page (reverse-only covers
+    /// coalesce-with-next). Drain then free in allocation order.
+    #[test]
+    fn alloc_drain_free_forward_restores() {
+        let boot = boot_with(&[(0x1000, 1500), (0x100_0000, 500)]);
+        let mut fa = FrameAllocator::from_boot_info(&boot);
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (2000, 2));
+        let mut bases = std::vec::Vec::with_capacity(2000);
+        for _ in 0..2000 {
+            bases.push(fa.alloc(1).expect("drain must succeed"));
+        }
+        assert_eq!(fa.free_pages(), 0);
+        for base in bases.into_iter() {
+            assert_eq!(fa.free(base, 1), Ok(()));
+        }
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (2000, 2));
+    }
+
+    /// REVIEW #90 coverage: interleaved free exercises the double-sided
+    /// merge (coalesce prev + next in one insert). Three contiguous pages
+    /// drained, sides freed first, middle last must collapse to one span.
+    #[test]
+    fn interleaved_free_merges_both_neighbors() {
+        let boot = boot_with(&[(0x1000, 3)]);
+        let mut fa = FrameAllocator::from_boot_info(&boot);
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (3, 1));
+        let b0 = fa.alloc(1).expect("b0");
+        let b1 = fa.alloc(1).expect("b1");
+        let b2 = fa.alloc(1).expect("b2");
+        assert_eq!((b0, b1, b2), (0x1000, 0x2000, 0x3000));
+        assert_eq!(fa.free(b0, 1), Ok(()));
+        assert_eq!(fa.free(b2, 1), Ok(()));
+        assert_eq!(fa.free_span_count(), 2);
+        assert_eq!(fa.free(b1, 1), Ok(()), "middle must merge both sides");
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (3, 1));
+    }
 }

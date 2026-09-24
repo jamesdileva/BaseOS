@@ -1089,3 +1089,36 @@ Format per entry (per `implementation-guide.md` §31):
   exercises the coalesce-with-next branch on every page plus the final
   2-span restore; forward would cover coalesce-with-prev and interleaved
   the double-sided merge -- worth adding alongside stitch, not blocking.
+
+## S03 slice 9 -- REVIEW #90 forward + interleaved coalesce coverage (2026-09-24)
+
+- **Decision:** Close REVIEW #90 coverage gap as one host-only slice in
+  `crates/kernel/src/frame_alloc.rs`: (a) `alloc_drain_free_forward_restores`
+  drains the same 2000-page two-span map as slice 8 but frees in allocation
+  order, exercising coalesce-with-prev on every page; (b)
+  `interleaved_free_merges_both_neighbors` drains 3 contiguous pages, frees
+  sides first (2 spans), then middle to prove one-insert double-sided merge
+  collapses to (3, 1). No guest/script/control-flow change.
+- **Why:** REVIEW #90 ACKed #89 conditional but named reverse-only as a gap
+  (coalesce-with-next + final (2000,2) restore only) and required
+  forward/interleaved in the stitch-slice acceptance. Cheapest disconfirm
+  plus stitch acceptance precursor in one segment.
+- **Alternatives:** Full multi-span stitching alloc this cycle (rejected:
+  scope growth -- alloc returns one contiguous base, stitching across
+  disjoint spans needs an API change; deferred by design, coverage first);
+  QEMU re-run (rejected: guest/script bytes untouched, PASS @693bb2f stands
+  by non-interference, same as slices 8/8-followup).
+- **Expected:** default `cargo test` 46 (44 + 2); `-p baseos-kernel` 15
+  (13 + 2); `-p baseos-boot-uefi` 10 unchanged; fmt clean; clippy 4x
+  `-D warnings` exit 0; QEMU skipped (host-only).
+- **Measured (2026-09-24, Win11):** default 46/46 (21+15+4+4+2);
+  `-p baseos-kernel` 15/15 (new: forward + interleaved);
+  `-p baseos-boot-uefi` 10/10; `cargo fmt --check` clean; clippy
+  default-all-targets + boot-uefi --tests + kernel --tests +
+  boot-uefi --target x86_64-unknown-uefi all exit 0 `-D warnings`.
+  `worklog.md` U+FFFD count stays 0 (ASCII-only entry). QEMU
+  `boot-uefi.ps1` / `smoke.ps1` SKIPPED (host-only; guest untouched).
+- **Final:** REVIEW #90 gap closed on the current tree. #5 stays active
+  (true multi-span stitch still deferred -- needs API design); QEMU
+  re-verify rides with the next guest-touching slice. Evidence for #89 Q:
+  `git show d822d2a --stat` is worklog-only (1 file) + U+FFFD 0.
