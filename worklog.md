@@ -1187,3 +1187,33 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** No-stitch contract pinned on the current tree. #5 stays active
   (stitch API design next --fill-a-caller-buffer vs iterator, cursor/clamp
   semantics); QEMU re-verify rides with the next guest-touching slice.
+
+## S03 slice 12 -- QEMU re-verify after 4 host-only slices (2026-09-24)
+
+- **Decision:** Re-run the full QEMU proof on the unchanged guest to close
+  REVIEW #96 risk 1 (PASS @693bb2f was 4 slices stale: 8/9/10/11 all
+  host-only skips by non-interference). No code change; worklog-only slice.
+- **Why:** Each skip was individually justified but cumulative drift was
+  untested. Cheapest disconfirm per #96 is one smoke/QEMU re-run before
+  stitch lands. Stitch API design (risk 2) stays next, unblocked by this.
+- **Alternatives:** Fold the re-run into the stitch slice (rejected: stitch
+  needs an API choice first; a clean re-verify baseline keeps red-to-green
+  visible); another host-only skip (rejected: that would make 5 stale).
+- **Expected:** default 48, kernel 17, boot-uefi 10; fmt clean; clippy 4x
+  exit 0; `boot-uefi.ps1` PASS with FRAMEALLOC + budget lines; smoke PASS.
+- **Measured (2026-09-24, Win11):** default 48/48 (21+17+4+4+2);
+  `-p baseos-kernel` 17/17; `-p baseos-boot-uefi` 10/10;
+  `cargo fmt --check` clean; clippy default-all-targets + boot-uefi
+  --tests + kernel --tests + boot-uefi --target x86_64-unknown-uefi all
+  exit 0 `-D warnings`; `boot-uefi.ps1` UEFI BOOT PASS exit 0 (guest 53760
+  bytes, serial 671 bytes: marker FOUND, BOOTINFO valid=1 regions=98
+  usable=0xce8c000, FB present=1 1280x800 pitch=5120 bpp=32,
+  MEMMAP ok=1 entries=98/98 truncated=0 map_size=4704 desc_size=48,
+  GOP ok=1, EBS ok=1, KERNEL ok=1,
+  FRAMEALLOC ok=1 free=52876 spans=8 faults=3, EXC ok=1 vector=0; Budget
+  check ok=True); `smoke.ps1 -RequireOvmf` SMOKE PASS. Note:
+  usable=0xce8c000 vs prior 0xce94000 is OVMF map variance (free/spans/
+  faults byte-identical, regions=98 same, map_size/desc_size stable).
+- **Final:** QEMU drift closed on the current tree (@dc2a1c1 + worklog).
+  #5 stays active (stitch API design next -- fill-a-caller-buffer vs
+  iterator, cursor/clamp semantics).
