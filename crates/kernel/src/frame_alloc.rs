@@ -885,4 +885,117 @@ mod tests {
             "over-request must not touch the buffer"
         );
     }
+
+    /// REVIEW #103 gap 1: scatter from a nonzero cursor must wrap
+    /// next-fit order. Advance cursor to 1 (span0 pared to 1 page, then a
+    /// 2-page alloc skips it for span1), then `alloc_scatter(3)` must fill
+    /// `[(0x1002000, 2), (0x4000, 1)]` -- span1 remainder first, wrapping
+    /// to span0 -- and drain the list with cursor clamped to 0.
+    #[test]
+    fn alloc_scatter_wraps_from_nonzero_cursor() {
+        let boot = boot_with(&[(0x1000, 4), (0x100_0000, 4)]);
+        let mut fa = FrameAllocator::from_boot_info(&boot);
+        // Pare span0 to 1 page; cursor stays 0.
+        assert_eq!(fa.alloc(3), Some(0x1000));
+        // 2 pages does not fit the 1-page span0 remainder, so next-fit
+        // skips to span1; cursor moves to 1.
+        assert_eq!(fa.alloc(2), Some(0x100_0000));
+        assert_eq!(fa.cursor(), 1);
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (3, 2));
+        let mut out = [ScatterSpan { base: 0, pages: 0 }; 2];
+        let filled = fa
+            .alloc_scatter(3, &mut out)
+            .expect("wrap scatter of 3 pages");
+        assert_eq!(filled, 2);
+        assert_eq!(
+            (out[0], out[1]),
+            (
+                ScatterSpan {
+                    base: 0x100_0000 + 2 * PAGE_SIZE,
+                    pages: 2
+                },
+                ScatterSpan {
+                    base: 0x4000,
+                    pages: 1
+                },
+            )
+        );
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (0, 0));
+        assert_eq!(fa.cursor(), 0, "drained list clamps cursor to 0");
+    }
+
+    /// REVIEW #103 gaps 2+3: zero-pages, empty-out, and tail-slot
+    /// preservation all fail closed. `alloc_scatter(0)` and an empty `out`
+    /// both return `None` with state and buffer untouched; an oversized
+    /// `out` keeps `out[filled..]` untouched on success.
+    #[test]
+    fn alloc_scatter_zero_empty_and_tail_preserved() {
+        let boot = boot_with(&[(0x1000, 4), (0x100_0000, 4)]);
+        let mut fa = FrameAllocator::from_boot_info(&boot);
+        let snap = (fa.free_pages(), fa.free_span_count(), fa.cursor());
+        // Zero pages: fail closed, buffer untouched.
+        let mut sentinel = [ScatterSpan {
+            base: 0xBEEF,
+            pages: 0xBEEF,
+        }];
+        assert!(fa.alloc_scatter(0, &mut sentinel).is_none());
+        assert_eq!(
+            (fa.free_pages(), fa.free_span_count(), fa.cursor()),
+            snap,
+            "zero-page scatter must not mutate state"
+        );
+        assert_eq!(
+            sentinel[0],
+            ScatterSpan {
+                base: 0xBEEF,
+                pages: 0xBEEF
+            },
+            "zero-page scatter must not touch out"
+        );
+        // Empty out with nonzero pages: fail closed, state untouched.
+        let mut empty: [ScatterSpan; 0] = [];
+        assert!(fa.alloc_scatter(1, &mut empty).is_none());
+        assert_eq!(
+            (fa.free_pages(), fa.free_span_count(), fa.cursor()),
+            snap,
+            "empty-out scatter must not mutate state"
+        );
+        // Oversized out: 5 pages need 2 spans; slots 2.. must stay sentinel.
+        let mut wide = [ScatterSpan {
+            base: 0xCAFE,
+            pages: 0xCAFE,
+        }; 4];
+        let filled = fa
+            .alloc_scatter(5, &mut wide)
+            .expect("5 pages across 2 spans");
+        assert_eq!(filled, 2);
+        assert_eq!(
+            (wide[0], wide[1]),
+            (
+                ScatterSpan {
+                    base: 0x1000,
+                    pages: 4
+                },
+                ScatterSpan {
+                    base: 0x100_0000,
+                    pages: 1
+                },
+            )
+        );
+        assert_eq!(
+            (wide[2], wide[3]),
+            (
+                ScatterSpan {
+                    base: 0xCAFE,
+                    pages: 0xCAFE
+                },
+                ScatterSpan {
+                    base: 0xCAFE,
+                    pages: 0xCAFE
+                },
+            ),
+            "tail slots beyond filled must stay untouched"
+        );
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (3, 1));
+    }
 }

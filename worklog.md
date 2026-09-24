@@ -1251,3 +1251,39 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Stitch cursor-clamp prototype landed on the current tree.
   #5 stays active (wire scatter into guest stress/boot path or peer
   review first); contiguous `alloc` behavior unchanged.
+
+## S03 slice 14 -- REVIEW #103 scatter edge gaps (2026-09-24)
+
+- **Decision:** Close all three REVIEW #103 gaps as one host-only slice in
+  `crates/kernel/src/frame_alloc.rs` with two tests, no API change: (a)
+  `alloc_scatter_wraps_from_nonzero_cursor` (gap 1) -- pare span0 to 1 page
+  with `alloc(3)`, then `alloc(2)` skips it for span1 so cursor moves to 1,
+  then `alloc_scatter(3)` must fill `[(0x1002000,2),(0x4000,1)]` (span1
+  remainder first, wrapping to span0) and drain to (0, 0) with cursor 0;
+  (b) `alloc_scatter_zero_empty_and_tail_preserved` (gaps 2+3) --
+  `alloc_scatter(0)` and empty-`out` both return `None` with state and
+  buffer untouched, and an oversized 4-slot `out` for a 2-span request keeps
+  `out[2..]` sentinel on success.
+- **Why:** REVIEW #103 APPROVED the slice-13 prototype logic but held guest
+  wiring until wrap-from-cursor, zero/empty fail-closed, and tail-slot
+  preservation are host-proven; the two tests are the named cheapest
+  disconfirm.
+- **Alternatives:** Wire scatter into the guest stress/boot path now
+  (rejected: reviewer explicitly asked for these host proofs first, and a
+  second host-only skip stays within the slice-12 re-verify budget --
+  guest/script bytes untouched); three separate tests (rejected: gaps 2+3
+  share one fixture and snapshot, one test reads cleaner).
+- **Expected:** default `cargo test` 52 (50 + 2); `-p baseos-kernel` 21
+  (19 + 2); `-p baseos-boot-uefi` 10 unchanged; fmt clean; clippy 4x
+  `-D warnings` exit 0; QEMU skipped (host-only).
+- **Measured (2026-09-24, Win11):** default 52/52 (21+21+4+4+2);
+  `-p baseos-kernel` 21/21 (new: wrap-from-cursor + zero/empty/tail);
+  `-p baseos-boot-uefi` 10/10; `cargo fmt --check` clean; clippy
+  default-all-targets + boot-uefi --tests + kernel --tests +
+  boot-uefi --target x86_64-unknown-uefi all exit 0 `-D warnings`. QEMU
+  `boot-uefi.ps1` / `smoke.ps1` SKIPPED (host-only; guest untouched, PASS
+  @22752c3 stands by non-interference).
+- **Final:** REVIEW #103 gaps closed on the current tree. #5 stays active
+  (wire scatter into guest stress/boot path with QEMU re-verify next --
+  do not stack another host-only skip); contiguous `alloc` contract +
+  no-stitch guard still pinned.
