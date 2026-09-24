@@ -1122,3 +1122,38 @@ Format per entry (per `implementation-guide.md` §31):
   (true multi-span stitch still deferred -- needs API design); QEMU
   re-verify rides with the next guest-touching slice. Evidence for #89 Q:
   `git show d822d2a --stat` is worklog-only (1 file) + U+FFFD 0.
+
+## S03 slice 10 -- REVIEW #92 nit: ascending-order lock + multi-page double-merge (2026-09-24)
+
+- **Decision:** Close both REVIEW #92 non-blocking nits as one host-only
+  slice in `crates/kernel/src/frame_alloc.rs`: (a) forward test now
+  asserts every consecutive drain base is strictly ascending and each step
+  is either one PAGE_SIZE (+0x1000 inside a span) or the single span jump
+  (0x5DC000 -> 0x1000000 at the 1500-page boundary), locking next-fit FIFO
+  order so a future LIFO alloc cannot silently weaken the
+  coalesce-with-prev coverage; (b) new
+  `interleaved_free_merges_multi_page_both_neighbors` (6-page map, three
+  2-page blocks, sides freed first to 2 spans / 4 pages, middle 2-page
+  free collapses to (6, 1)) proving the double-sided merge for multi-page
+  ranges, not just the 1-page case. No guest/script/control-flow change.
+- **Why:** REVIEW #92 APPROVED slice 9 but named exactly these two
+  weakenings; both are test-only, QEMU-free, and the cheapest falsifiable
+  locks before the stitch-slice API design.
+- **Alternatives:** Full multi-span stitching alloc this cycle (rejected:
+  scope growth -- alloc returns one contiguous base, stitching across
+  disjoint spans needs an API change; deferred by design, coverage first);
+  QEMU re-run (rejected: guest/script bytes untouched, PASS @693bb2f stands
+  by non-interference, same as slices 8/9).
+- **Expected:** default `cargo test` 47 (46 + 1); `-p baseos-kernel` 16
+  (15 + 1); `-p baseos-boot-uefi` 10 unchanged; fmt clean; clippy 4x
+  `-D warnings` exit 0; QEMU skipped (host-only).
+- **Measured (2026-09-24, Win11):** default 47/47 (21+16+4+4+2);
+  `-p baseos-kernel` 16/16 (new: multi-page interleaved; forward now with
+  ascending/step asserts); `-p baseos-boot-uefi` 10/10;
+  `cargo fmt --check` clean; clippy default-all-targets + boot-uefi
+  --tests + kernel --tests + boot-uefi --target x86_64-unknown-uefi all
+  exit 0 `-D warnings`. `frame_alloc.rs` U+FFFD count 0. QEMU
+  `boot-uefi.ps1` / `smoke.ps1` SKIPPED (host-only; guest untouched).
+- **Final:** REVIEW #92 nits closed on the current tree. #5 stays active
+  (true multi-span stitch still deferred -- needs API design); QEMU
+  re-verify rides with the next guest-touching slice.

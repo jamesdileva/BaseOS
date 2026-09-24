@@ -616,6 +616,10 @@ mod tests {
     /// REVIEW #90 coverage: forward-order free exercises the
     /// coalesce-with-prev branch on every page (reverse-only covers
     /// coalesce-with-next). Drain then free in allocation order.
+    /// REVIEW #92 hardening: bases must be strictly ascending (one
+    /// PAGE_SIZE step inside a span, span jump at the 1500-page
+    /// boundary) -- locks next-fit FIFO order so a future LIFO alloc
+    /// cannot silently weaken the prev-merge coverage.
     #[test]
     fn alloc_drain_free_forward_restores() {
         let boot = boot_with(&[(0x1000, 1500), (0x100_0000, 500)]);
@@ -626,6 +630,21 @@ mod tests {
             bases.push(fa.alloc(1).expect("drain must succeed"));
         }
         assert_eq!(fa.free_pages(), 0);
+        for w in bases.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "alloc order must be ascending, got {:#x} then {:#x}",
+                w[0],
+                w[1]
+            );
+            let step = w[1] - w[0];
+            let span_jump = step == 0x100_0000 - (0x1000 + 1500 * PAGE_SIZE - PAGE_SIZE);
+            assert!(
+                step == PAGE_SIZE || span_jump,
+                "bases must be contiguous (+0x1000) or the one span jump, got step {:#x}",
+                step
+            );
+        }
         for base in bases.into_iter() {
             assert_eq!(fa.free(base, 1), Ok(()));
         }
@@ -649,5 +668,25 @@ mod tests {
         assert_eq!(fa.free_span_count(), 2);
         assert_eq!(fa.free(b1, 1), Ok(()), "middle must merge both sides");
         assert_eq!((fa.free_pages(), fa.free_span_count()), (3, 1));
+    }
+
+    /// REVIEW #92 hardening: multi-page double-sided merge. Three
+    /// contiguous 2-page blocks drained, sides freed first (2 spans),
+    /// middle 2-page free must collapse both neighbors in one insert.
+    #[test]
+    fn interleaved_free_merges_multi_page_both_neighbors() {
+        let boot = boot_with(&[(0x1000, 6)]);
+        let mut fa = FrameAllocator::from_boot_info(&boot);
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (6, 1));
+        let b0 = fa.alloc(2).expect("b0");
+        let b1 = fa.alloc(2).expect("b1");
+        let b2 = fa.alloc(2).expect("b2");
+        assert_eq!((b0, b1, b2), (0x1000, 0x3000, 0x5000));
+        assert_eq!(fa.free(b0, 2), Ok(()));
+        assert_eq!(fa.free(b2, 2), Ok(()));
+        assert_eq!(fa.free_span_count(), 2);
+        assert_eq!(fa.free_pages(), 4);
+        assert_eq!(fa.free(b1, 2), Ok(()), "middle must merge both sides");
+        assert_eq!((fa.free_pages(), fa.free_span_count()), (6, 1));
     }
 }
