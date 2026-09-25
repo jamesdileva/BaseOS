@@ -1490,3 +1490,46 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** S04 permission contract landed host-green; #6 active. Next:
   hardware PTE walk / guest wiring + e2e fault-line asserts, then kernel
   vs user mapping foundations.
+
+## S04 slice 2 -- HW PTE encode/index/CR3 helpers + REVIEW #120 risk close-out (2026-09-25)
+
+- **Decision:** Host-only, `no_std`-clean encode slice in
+  `crates/kernel/src/page_table.rs` (no guest wiring, no QEMU this cycle):
+  `pte_encode` (PRESENT->0/WRITABLE->1/USER->2/NO_EXEC->63, `GUARD`/bit 9
+  always masked to 0, Accessed/Dirty load 0, low-12 phys masked),
+  `pte_decoded_phys`/`pte_decoded_flags` (GUARD never reconstructed),
+  `page_table_index(virt, level)` (3=PML4/39, 2=30, 1=21, 0=PT/12,
+  `None` for level>3), `cr3_encode` (`None` if misaligned, low-12 controls
+  0)/`cr3_decode`, plus `PageFlags::from_bits` for the decode path. Docs
+  pin: phys aliasing intended (shared/COW, only virt-dup rejected),
+  `translate` raw/`check` gate with no non-test kernel `translate(`
+  callers (searched `crates/`), O(n) model must not carry to the HW walker,
+  guest must `invlpg`/reload `CR3`, never branch on Accessed/Dirty. Five
+  host tests: guard-mask, PTE roundtrip, 4-level index, CR3 roundtrip,
+  phys-alias sharing.
+- **Why:** REVIEW #120 accepted slice 1 and named 4 slice-2 risks with
+  cheapest disconfirming experiments; this slice runs all four without
+  touching the guest: (1) translate-bypass search = tests-only, doc-gated;
+  (2) bit-9 masking pinned by failing-first test; (3) aliasing documented +
+  tested as sharing; (4) scale/TLB/A-D scope note for the guest slice.
+- **Alternatives:** Full guest walker + `CR3` load + QEMU e2e now (rejected:
+  doubles single-cycle risk; encode contract must exist first so the guest
+  slice is wiring-only); rename `translate` to `translate_raw` now
+  (rejected: churn with zero non-test callers; doc gate suffices until the
+  guest walker lands).
+- **Expected:** default `cargo test` 67 (62 + 5); `-p baseos-kernel` 36
+  (31 + 5); `-p baseos-boot-uefi` 10; fmt clean; clippy host + UEFI
+  `-D warnings` exit 0; no QEMU (guest untouched).
+- **Measured (2026-09-25, Win11):** default 67/67
+  (21+36+4+4+2); `-p baseos-kernel` 36/36 (5 new HW PTE);
+  `-p baseos-boot-uefi` 10/10; `cargo fmt --check` clean;
+  `cargo clippy --all-targets -- -D warnings` exit 0;
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -- -D warnings` exit 0. One test bug caught red-to-green before commit:
+  index spot-check hard-coded PML4=0xFF, true value for
+  `0x00FF_8765_4321_ABCD` is 0x10E (verified via python3 shift; fixed to
+  0x10E/0x195/0x19/0x1A). QEMU not re-run (guest sources untouched; S03
+  slice-17 PASS stands).
+- **Final:** HW PTE encode contract landed host-green; #6 active. Next:
+  guest walker + `CR3` load + QEMU boot with e2e fault-line asserts, then
+  kernel vs user mapping foundations.

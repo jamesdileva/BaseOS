@@ -8,8 +8,20 @@
 //! Stage 1 is a fixed-capacity software model (`64` mappings, sorted
 //! linear scan) so map/unmap/permission/guard behavior is fully
 //! unit-testable on the host with no allocator and no `unsafe`. Hardware
-//! PTE walk + `CR3` load is a later slice; the permission-check contract
+//! PTE encode + index/`CR3` helpers below are the second half of the slice:
+//! pure `core`-only functions the guest loader will call, with the `GUARD`
+//! (bit 9) masking obligation pinned by tests. The permission-check contract
 //! (`check`) already mirrors the fault kinds the guest stub will assert.
+//!
+//! Hardware scope (this slice is encode-only, no guest wiring yet):
+//! sorted insert + linear scan is `O(n)`, fine for 64 software entries but
+//! must not carry to a hardware walker; the guest walker indexes each level
+//! directly via [`page_table_index`]. After loading a real PTE the guest must
+//! `invlpg` the page (or reload `CR3`) — stale TLB entries are not modeled
+//! here. `Accessed` (bit 5) / `Dirty` (bit 6) are set by hardware and load as
+//! 0 from [`pte_encode`]; software must never branch on them. Guest `CR3`
+//! load + QEMU boot with e2e fault-line asserts ride with the next
+//! guest-touching slice (guest untouched here).
 //!
 //! `no_std`-clean (`core` only).
 
@@ -48,6 +60,13 @@ impl PageFlags {
     #[must_use]
     pub const fn bits(self) -> u64 {
         self.0
+    }
+
+    /// Rebuild from raw bits (decode path; `GUARD` naturally absent when the
+    /// bits came from [`pte_decoded_flags`]).
+    #[must_use]
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
     }
 
     /// True when all bits in `other` are set in `self`.
@@ -160,6 +179,10 @@ impl PageTable {
     /// Requires 4 KiB alignment on both addresses and at least one of
     /// `PRESENT` / `GUARD` in `flags`. Duplicate `virt` pages and a full
     /// table fail closed with no mutation.
+    ///
+    /// Physical aliasing is intended: mapping the same `phys` at two
+    /// different `virt` pages succeeds (shared / copy-on-write foundations).
+    /// Only `virt` duplicates are rejected.
     pub fn map(&mut self, virt: u64, phys: u64, flags: PageFlags) -> Result<(), MapError> {
         if virt & PAGE_OFFSET_MASK != 0 || phys & PAGE_OFFSET_MASK != 0 {
             return Err(MapError::Misaligned);
@@ -221,7 +244,11 @@ impl PageTable {
     /// Raw unchecked translation — does NOT enforce permissions, including
     /// `GUARD` (a guard page still returns `Some`; bit 9 is OS-available and
     /// ignored by hardware). Use [`PageTable::check`] as the access gate;
-    /// the hardware-PTE slice must mask bit 9 before loading a real PTE.
+    /// the hardware-PTE slice must mask bit 9 before loading a real PTE
+    /// (see [`pte_encode`]). Kernel code outside tests must go through
+    /// `check`; today `translate` has no non-test kernel callers (verified
+    /// by searching for `translate(` under `crates/`), so the bypass is
+    /// documentation-only until the guest walker lands.
     /// The low 12 bits pass through (`phys_base + offset`).
     #[must_use]
     pub fn translate(&self, virt: u64) -> Option<(u64, PageFlags)> {
@@ -292,6 +319,96 @@ impl Default for PageTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Physical-address field of a 4 KiB PTE / `CR3`: bits 12..=51.
+pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+/// Hardware PTE flag bits this slice loads: PRESENT(0) / WRITABLE(1) /
+/// USER(2) / NO_EXEC(63). `GUARD` (bit 9, OS-available) is never loaded.
+pub const PTE_HW_FLAGS_MASK: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 63);
+
+/// Encode a hardware PTE from a 4 KiB-aligned `phys` base and `flags`.
+///
+/// Maps `PRESENT -> bit0`, `WRITABLE -> bit1`, `USER -> bit2`,
+/// `NO_EXEC -> bit63`. `GUARD` (bit 9) is always masked to 0: hardware
+/// ignores bit 9, and a leaked 1 would survive into the real entry where a
+/// future reader could mistake OS state for a hardware bit. `Accessed` /
+/// `Dirty` (bits 5/6) load as 0; hardware sets them. Low 12 `phys` bits are
+/// masked off (caller must pass an aligned base; `map` already enforces it).
+#[must_use]
+pub const fn pte_encode(phys_base: u64, flags: PageFlags) -> u64 {
+    let mut pte = phys_base & PTE_ADDR_MASK;
+    let bits = flags.bits();
+    if bits & (1 << 0) != 0 {
+        pte |= 1 << 0;
+    }
+    if bits & (1 << 1) != 0 {
+        pte |= 1 << 1;
+    }
+    if bits & (1 << 2) != 0 {
+        pte |= 1 << 2;
+    }
+    if bits & (1 << 63) != 0 {
+        pte |= 1 << 63;
+    }
+    pte
+}
+
+/// Physical base decoded from a hardware PTE (low 12 bits cleared).
+#[must_use]
+pub const fn pte_decoded_phys(pte: u64) -> u64 {
+    pte & PTE_ADDR_MASK
+}
+
+/// Permission flags decoded from a hardware PTE. `GUARD` is never
+/// reconstructed: it is OS state, masked out at encode time.
+#[must_use]
+pub const fn pte_decoded_flags(pte: u64) -> PageFlags {
+    let mut bits: u64 = 0;
+    if pte & (1 << 0) != 0 {
+        bits |= 1 << 0;
+    }
+    if pte & (1 << 1) != 0 {
+        bits |= 1 << 1;
+    }
+    if pte & (1 << 2) != 0 {
+        bits |= 1 << 2;
+    }
+    if pte & (1 << 63) != 0 {
+        bits |= 1 << 63;
+    }
+    PageFlags::from_bits(bits)
+}
+
+/// 9-bit page-table index for `virt` at `level`: 3 = PML4 (shift 39),
+/// 2 = PDPT (30), 1 = PD (21), 0 = PT (12). `None` for `level > 3`.
+#[must_use]
+pub const fn page_table_index(virt: u64, level: u8) -> Option<u16> {
+    let shift = match level {
+        3 => 39,
+        2 => 30,
+        1 => 21,
+        0 => 12,
+        _ => return None,
+    };
+    Some(((virt >> shift) & 0x1FF) as u16)
+}
+
+/// Encode a `CR3` value from a 4 KiB-aligned PML4 base. `None` when
+/// misaligned. PCID / PWT / PCD low-12 controls are out of scope this slice
+/// (load as 0).
+#[must_use]
+pub const fn cr3_encode(pml4_base: u64) -> Option<u64> {
+    if pml4_base & PAGE_OFFSET_MASK != 0 {
+        return None;
+    }
+    Some(pml4_base & PTE_ADDR_MASK)
+}
+
+/// Decode the PML4 base from a `CR3` value (low 12 bits cleared).
+#[must_use]
+pub const fn cr3_decode(cr3: u64) -> u64 {
+    cr3 & PTE_ADDR_MASK
 }
 
 #[cfg(test)]
@@ -438,6 +555,64 @@ mod tests {
         assert_eq!(pt.unmap(0x8ABC), Err(MapError::Misaligned));
         pt.unmap(0x8000).unwrap();
         assert_eq!(pt.translate(0x8000), None);
+    }
+
+    #[test]
+    fn pte_encode_masks_guard_bit() {
+        // REVIEW #120 risk 2: HW ignores bit 9, so the loader must clear it.
+        let guard_rw = PageFlags::PRESENT
+            .union(PageFlags::WRITABLE)
+            .union(PageFlags::GUARD);
+        let pte = pte_encode(0xA000, guard_rw);
+        assert_eq!(pte & (1 << 9), 0, "GUARD must never reach hardware");
+        assert_eq!(pte, pte_encode(0xA000, K_RW));
+        // Only HW flag bits survive alongside the address.
+        assert_eq!(pte & !PTE_ADDR_MASK & !PTE_HW_FLAGS_MASK, 0);
+        assert_eq!(pte_decoded_flags(pte), K_RW);
+    }
+
+    #[test]
+    fn pte_roundtrip_preserves_addr_and_perms() {
+        let flags = PageFlags::PRESENT
+            .union(PageFlags::WRITABLE)
+            .union(PageFlags::USER)
+            .union(PageFlags::NO_EXEC);
+        let pte = pte_encode(0x1234_5000, flags);
+        assert_eq!(pte_decoded_phys(pte), 0x1234_5000);
+        assert_eq!(pte_decoded_flags(pte), flags);
+        // Misaligned low-12 phys bits are masked off, Accessed/Dirty load 0.
+        let sloppy = pte_encode(0x1234_5ABC, flags);
+        assert_eq!(pte_decoded_phys(sloppy), 0x1234_5000);
+        assert_eq!(sloppy & ((1 << 5) | (1 << 6)), 0);
+    }
+
+    #[test]
+    fn page_index_extracts_four_levels() {
+        // Spot-check with hand-verified 9-bit fields.
+        let virt: u64 = 0x00FF_8765_4321_ABCD;
+        assert_eq!(page_table_index(virt, 3), Some(0x10E));
+        assert_eq!(page_table_index(virt, 2), Some(0x195));
+        assert_eq!(page_table_index(virt, 1), Some(0x19));
+        assert_eq!(page_table_index(virt, 0), Some(0x1A));
+        assert_eq!(page_table_index(virt, 4), None);
+    }
+
+    #[test]
+    fn cr3_encode_roundtrips_aligned_base() {
+        assert_eq!(cr3_encode(0x1000), Some(0x1000));
+        assert_eq!(cr3_decode(cr3_encode(0x7F00_1000).unwrap()), 0x7F00_1000);
+        assert_eq!(cr3_encode(0x1001), None);
+        assert_eq!(cr3_decode(0xFFFF_FFFF_FFFF_FFFF), PTE_ADDR_MASK);
+    }
+
+    #[test]
+    fn phys_aliasing_is_shared_mapping() {
+        // REVIEW #120 risk 3: same phys at two virts is intended sharing.
+        let mut pt = PageTable::new();
+        pt.map(0x1000, 0xA000, K_RW).unwrap();
+        pt.map(0x2000, 0xA000, K_RW).unwrap();
+        assert_eq!(pt.translate(0x1000), Some((0xA000, K_RW)));
+        assert_eq!(pt.translate(0x2000), Some((0xA000, K_RW)));
     }
 
     #[test]
