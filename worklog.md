@@ -1340,3 +1340,64 @@ Format per entry (per `implementation-guide.md` §31):
   hard-require green); true multi-span stitch stays host-only. #5 stays
   active (contiguous `alloc` no-stitch guard still pinned; stitch API
   additive only). Per REVIEW #107, 2b proves wire-up, not guest stitch.
+
+## S03 slice 16 -- forced guest multi-span stitch (step 2c) + QEMU re-verify (2026-09-25)
+
+- **Decision:** Close the REVIEW #107/#109 open risk (guest stitch unproven:
+  2b `need=min(4,free)` fits one OVMF span) with a forced-stitch step 2c in
+  `frame_alloc_stress` (`crates/kernel/src/frame_alloc.rs`, guest + host
+  same path, no serial/script format change): new
+  `FrameAllocator::largest_free_run()` oracle (max single free span in
+  pages, 0 when empty), then 2c requests `largest + 1` into a static
+  8-slot buffer and requires `filled >= 2` with page-sum == need plus full
+  `free_pages`/`free_span_count` restore, else `ok` clears. Skip (stitch
+  stays host-only) when < 2 free spans, total <= largest (single-span
+  map), free spans > 8 (worst case exceeds the static buffer), or
+  `checked_add` overflow. Two host tests: `largest_free_run_tracks_max_span`
+  (2-4-2 fixture max 4, pared to 2 after `alloc(3)`, 0 when drained) and
+  `frame_alloc_stress_fragmented_map_stitches_multi_span` (2-4-2 expects
+  `FRAMEALLOC ok=1 free=8 spans=3 faults=3`); existing exact-line tests
+  stay byte-identical (16-page single-span map skips 2c by the < 2-span
+  guard; 2x4 map now exercises 2b single-span AND 2c `need=5` stitch).
+- **Why:** REVIEW #109 named the cheapest next step under #5 as forcing
+  multi-span on the live map (larger need sized past the biggest run) with
+  restore, if the firmware map allows, else keeping the stitch claim
+  host-only. `largest + 1` is the smallest need that cannot fit any one
+  span on any map, so success with `filled >= 2` is a true stitch by
+  construction; the skip guards keep single-span maps and oversized
+  span counts fail-loud-free (ok untouched) instead of buffer-truncating.
+- **Alternatives:** Log `filled`/`stitch=` in the serial line + script
+  hard-require (rejected: scope growth — 4 exact-line asserts + ps1 +
+  second QEMU cycle; skip-vs-ran is already decidable on this map by
+  counting, see Measured); drain-to-stitch with full-map free/restore
+  (rejected: heavier guest churn for the same signal; largest+1 stitches
+  with a 2-span, 8-slot-bounded request); exact-size heap buffer for
+  > 8 spans (rejected: no allocator post-EBS; static 8 covers the
+  observed OVMF spans=8, larger maps keep the host-only claim).
+- **Expected:** default `cargo test` 55 (53 + 2); `-p baseos-kernel` 24
+  (22 + 2); `-p baseos-boot-uefi` 10 unchanged; fmt clean; clippy 4x
+  `-D warnings` exit 0; `boot-uefi.ps1` PASS with `FRAMEALLOC ok=1`.
+- **Measured (2026-09-25, Win11):** default 55/55 (21+24+4+4+2);
+  `-p baseos-kernel` 24/24 (new: largest oracle + fragmented stitch);
+  `-p baseos-boot-uefi` 10/10; `cargo fmt --check` clean (one auto-format);
+  clippy default-all-targets + boot-uefi --tests + kernel --tests +
+  boot-uefi --target x86_64-unknown-uefi all exit 0 `-D warnings`;
+  `boot-uefi.ps1` UEFI BOOT PASS exit 0 (guest 60928 bytes, serial 671
+  bytes: marker FOUND, `BOOTINFO valid=1 regions=98 usable=0xce8b000`,
+  `FB present=1 1280x800 pitch=5120 bpp=32`,
+  `MEMMAP ok=1 entries=98/98 truncated=0 map_size=4704 desc_size=48`,
+  `GOP ok=1`, `EBS ok=1`, `KERNEL ok=1`,
+  `FRAMEALLOC ok=1 free=52875 spans=8 faults=3`, `EXC ok=1 vector=0`;
+  Budget ok=True). Attribution: guest 58368 -> 60928 (+2560 B, no page
+  cross) so usable/free/spans/faults/map_size/desc_size all identical to
+  slice-15 baseline. Stitch-ran argument: 8 non-empty spans with total
+  52875 implies total > largest (at least 7 other pages), spans 8 <= 8,
+  so no 2c skip guard can fire on this map — `ok=1` means the
+  `filled >= 2` stitch succeeded and restored. `smoke.ps1` not re-run
+  (SeaBIOS path untouched, prior PASS stands).
+- **Final:** Guest multi-span stitch now proven on the OVMF map (host
+  fragmented exact-line + QEMU hard-require green with skip impossible
+  by counting). #5 stays active (contiguous `alloc` no-stitch guard still
+  pinned; stitch API additive only). Open: serial-line stitch observability
+  (log `filled`) remains a possible follow-up so future maps distinguish
+  ran-vs-skipped on serial alone.

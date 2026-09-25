@@ -155,6 +155,17 @@ impl FrameAllocator {
         self.map_count
     }
 
+    /// Largest single free span in pages (0 when the list is empty).
+    /// Used by the guest stress battery to size a scatter request that
+    /// cannot fit any one span, forcing a true multi-span stitch.
+    pub fn largest_free_run(&self) -> u64 {
+        self.free[..self.free_count]
+            .iter()
+            .map(|span| span.len() / PAGE_SIZE)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Allocate `pages` contiguous free frames; returns the physical base.
     ///
     /// Next-fit from `cursor`: returns `None` on `pages == 0`, a size that
@@ -388,6 +399,12 @@ impl FrameAllocator {
 ///    plus `free_pages`/`free_span_count` must fully restore (exercises the
 ///    scatter path on the live map; single-span on the OVMF map, true
 ///    multi-span stitch stays host-only).
+///    2c. Forced multi-span stitch: `alloc_scatter(largest_free_run + 1)`
+///    into a static 8-slot buffer, then free every run in fill order;
+///    `filled` must be >= 2 with page sum == need and full restore.
+///    Skipped when fewer than 2 free spans, total <= largest (single-span
+///    map), or free spans > 8 (buffer cannot cover worst case) — stitch
+///    stays host-only there.
 /// 3. Three faults — double-free of a still-free in-map range
 ///    ([`FrameError::DoubleFree`]), a wild address
 ///    ([`FrameError::OutsideMap`]), and a wrap ([`FrameError::Wrap`]) —
@@ -462,6 +479,47 @@ pub fn frame_alloc_stress<E>(
                 }
                 _ => {
                     ok = false;
+                }
+            }
+        }
+        // (2c) Forced multi-span stitch on the live map (guest + host).
+        // `largest + 1` cannot fit any single span, so a successful
+        // scatter must stitch >= 2 spans. Skip (host-only stitch) when
+        // the live map cannot force it: < 2 free spans, single-span map,
+        // or more spans than the static 8-slot buffer can cover.
+        if ok && fa.free_span_count() >= 2 && fa.free_span_count() <= 8 {
+            let largest = fa.largest_free_run();
+            let total = fa.free_pages();
+            if largest > 0 && total > largest {
+                if let Some(need) = largest.checked_add(1) {
+                    if need <= total {
+                        let mut runs = [ScatterSpan { base: 0, pages: 0 }; 8];
+                        let free_before = fa.free_pages();
+                        let spans_before = fa.free_span_count();
+                        match fa.alloc_scatter(need, &mut runs) {
+                            Some(filled) if filled >= 2 && filled <= runs.len() => {
+                                let mut stitch_ok = true;
+                                let mut freed_pages = 0u64;
+                                for run in &runs[..filled] {
+                                    freed_pages = freed_pages.saturating_add(run.pages);
+                                    if fa.free(run.base, run.pages).is_err() {
+                                        stitch_ok = false;
+                                        break;
+                                    }
+                                }
+                                if !stitch_ok
+                                    || freed_pages != need
+                                    || fa.free_pages() != free_before
+                                    || fa.free_span_count() != spans_before
+                                {
+                                    ok = false;
+                                }
+                            }
+                            _ => {
+                                ok = false;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -724,6 +782,38 @@ mod tests {
         .unwrap();
         let text = std::string::String::from_utf8(out).unwrap();
         assert_eq!(text, "FRAMEALLOC ok=1 free=8 spans=2 faults=3\n");
+    }
+
+    /// `largest_free_run` tracks the max single span (0 when empty) and
+    /// shrinks as spans are pared — the sizing oracle for stress step 2c.
+    #[test]
+    fn largest_free_run_tracks_max_span() {
+        let boot = boot_with(&[(0x1000, 2), (0x10000, 4), (0x100_0000, 2)]);
+        let mut fa = FrameAllocator::from_boot_info(&boot);
+        assert_eq!(fa.largest_free_run(), 4);
+        // Pare the 4-page span to 1 page; max must drop to 2.
+        assert_eq!(fa.alloc(3), Some(0x10000));
+        assert_eq!(fa.largest_free_run(), 2);
+        // Drain everything; empty list reports 0.
+        while fa.alloc(1).is_some() {}
+        assert_eq!(fa.free_pages(), 0);
+        assert_eq!(fa.largest_free_run(), 0);
+    }
+
+    /// Step 2c host proof on a fragmented map: 2-4-2 spans need largest+1
+    /// (5 pages), which cannot fit any one span, so the stress battery
+    /// must stitch >= 2 spans and still emit the exact ok line restored.
+    #[test]
+    fn frame_alloc_stress_fragmented_map_stitches_multi_span() {
+        let boot = boot_with(&[(0x1000, 2), (0x10000, 4), (0x100_0000, 2)]);
+        let mut out = Vec::new();
+        frame_alloc_stress::<core::convert::Infallible>(&boot, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let text = std::string::String::from_utf8(out).unwrap();
+        assert_eq!(text, "FRAMEALLOC ok=1 free=8 spans=3 faults=3\n");
     }
 
     /// S03 verification (host-only #59b): allocate/free large numbers of
