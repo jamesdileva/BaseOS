@@ -1622,3 +1622,42 @@ Format per entry (per `implementation-guide.md` §31):
   #124 risk 1 closed (walker path calls `pte_encode_checked` via
   `encode_table_entry`). #6 stays active. Next: guest `CR3` load + QEMU
   boot with e2e fault-line asserts, then kernel vs user mappings.
+
+## S04 slice 5 -- chained 4-level walk + kernel/user boundary (REVIEW #126 risks 1+2) (2026-09-25)
+
+- **Decision:** Host-only pre-guest slice in
+  `crates/kernel/src/page_table.rs` (guest untouched, no QEMU this cycle):
+  (a) walk_step docs record the reserved/MBZ position (REVIEW #126 risk 1)
+  -- only PRESENT is checked, reserved-bit rejection deferred until the
+  guest CR3 mode (NX/1 GiB pages) is pinned -- plus the next-level lookup
+  contract (REVIEW #126 risk 3): the returned base is physical, the guest
+  maps it to the next &[u64; 512] via its phys-to-table mapping (unsafe,
+  guest-only); (b) new `walk_chain_four_levels_with_offset_and_mid_notpresent`
+  (REVIEW #126 risk 2 cheapest disconfirm): four chained walk_step calls
+  resolve 0x5000 from 0x123456789ABC with +0xABC offset to 0x5ABC, then a
+  cleared PDPT entry fails NotPresent while PML4 still resolves; (c) new
+  `kernel_vs_user_boundary_enforced`: supervisor page vs USER page, both
+  rings, all kinds, plus the same split through classify_access (#PF
+  UserViolation vs #GP on non-canonical).
+- **Why:** REVIEW #126 ACCEPTED slice 4 @47b36f6 but named exactly these
+  three open risks for the guest-CR3/e2e slice; chaining + boundary + docs
+  are the host-provable part, leaving the guest slice as wiring-only (CR3
+  load + e2e fault asserts).
+- **Alternatives:** Guest CR3 load + QEMU fault-line asserts now (rejected:
+  doubles single-cycle risk; chain/boundary contract must exist first);
+  reserved-bit rejection now (rejected: mode-dependent, no guest CR3 mode
+  pinned yet -- documented as out-of-scope instead).
+- **Expected:** default `cargo test` 74 (72 + 2); `-p baseos-kernel` 43
+  (41 + 2); `-p baseos-boot-uefi` 10; fmt clean; clippy host + UEFI
+  `-D warnings` exit 0; no QEMU (guest untouched).
+- **Measured (2026-09-25, Win11):** default 74/74 (21+43+4+4+2);
+  `-p baseos-kernel` 43/43 (2 new chain/boundary);
+  `-p baseos-boot-uefi` 10/10; `cargo fmt --check` clean (after one
+  auto-format); `cargo clippy --all-targets -- -D warnings` exit 0 (one
+  unused-variable fix: dropped the unused PML4 base binding);
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -- -D warnings` exit 0. `git diff --stat` is `page_table.rs` only
+  (guest untouched; S03 slice-17 PASS stands). QEMU not re-run.
+- **Final:** REVIEW #126 risks 1 (documented) + 2 (chained test) closed
+  host-side; risk 3 contracted for the guest slice. #6 stays active.
+  Next: guest CR3 load + QEMU boot with e2e fault-line asserts.

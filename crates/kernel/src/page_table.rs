@@ -514,6 +514,19 @@ pub const fn encode_table_entry(phys_base: u64, flags: PageFlags) -> Result<u64,
 /// 4 KiB page base and callers add `virt & PAGE_OFFSET_MASK`.
 /// `GUARD` never appears here: entries were built by
 /// [`encode_table_entry`], which masks bit 9 to 0.
+///
+/// Reserved / MBZ-bit validation is out of scope this slice: only `PRESENT`
+/// is checked (matches the S04 software-model parity goal). A future
+/// guest-hardening slice may reject reserved bits (e.g. low-12 `CR3`
+/// controls, `NX`-disabled bit 63, large-page PAT/MBZ combos) once the
+/// guest `CR3` mode (PAE/NX/1 GiB pages) is pinned.
+///
+/// Next-level lookup contract (for the guest-`CR3` slice): the returned
+/// base is a *physical* address. The guest maps it to the next
+/// `&[u64; 512]` via its identity/offset mapping of physical memory
+/// (`phys_to_table_ptr`, unsafe, guest-only) and calls `walk_step` again;
+/// see the `walk_chain_four_levels_*` test for the host-side chaining
+/// shape with plain arrays.
 pub fn walk_step(table: &[u64; 512], virt: u64, level: u8) -> Result<u64, WalkerError> {
     if !is_canonical(virt) {
         return Err(WalkerError::NonCanonical);
@@ -842,6 +855,90 @@ mod tests {
         assert!(!is_canonical(0x0000_8000_0000_0000));
         assert!(is_canonical(0xFFFF_8000_0000_0000));
         assert!(!is_canonical(0xFFFF_7FFF_FFFF_FFFF));
+    }
+
+    #[test]
+    fn walk_chain_four_levels_with_offset_and_mid_notpresent() {
+        // Cheapest disconfirm for the guest-CR3 slice (REVIEW #126 risk 2):
+        // four chained walk_step calls resolve a 4 KiB page base, and the
+        // caller adds the page offset; a cleared mid-level entry fails
+        // closed with NotPresent before deeper levels are touched.
+        let virt: u64 = 0x0000_1234_5678_9ABC;
+        let offset = virt & PAGE_OFFSET_MASK;
+        assert_eq!(offset, 0xABC);
+        // Distinct table bases per level (all 4 KiB aligned; the PML4
+        // itself lives at the CR3 base, so only the three child bases
+        // plus the leaf page base are wired as entries).
+        let (pdpt_base, pd_base, pt_base, page_base) = (0x2000, 0x3000, 0x4000, 0x5000);
+        let mut pml4 = [0u64; 512];
+        let mut pdpt = [0u64; 512];
+        let mut pd = [0u64; 512];
+        let mut pt = [0u64; 512];
+        pml4[page_table_index(virt, 3).unwrap() as usize] =
+            encode_table_entry(pdpt_base, K_RW).unwrap();
+        pdpt[page_table_index(virt, 2).unwrap() as usize] =
+            encode_table_entry(pd_base, K_RW).unwrap();
+        pd[page_table_index(virt, 1).unwrap() as usize] =
+            encode_table_entry(pt_base, K_RW).unwrap();
+        pt[page_table_index(virt, 0).unwrap() as usize] =
+            encode_table_entry(page_base, K_RW).unwrap();
+        // Happy path: chain the decoded base of each level into the next.
+        assert_eq!(walk_step(&pml4, virt, 3), Ok(pdpt_base));
+        assert_eq!(walk_step(&pdpt, virt, 2), Ok(pd_base));
+        assert_eq!(walk_step(&pd, virt, 1), Ok(pt_base));
+        assert_eq!(walk_step(&pt, virt, 0), Ok(page_base));
+        assert_eq!(walk_step(&pt, virt, 0).unwrap() + offset, 0x5ABC);
+        // Mid-level NotPresent: clear the PDPT entry; the PDPT step fails
+        // even though PD/PT below are still present.
+        pdpt[page_table_index(virt, 2).unwrap() as usize] &= !1;
+        assert_eq!(walk_step(&pdpt, virt, 2), Err(WalkerError::NotPresent));
+        // PML4 itself still resolves (failure is local to the cleared level).
+        assert_eq!(walk_step(&pml4, virt, 3), Ok(pdpt_base));
+    }
+
+    #[test]
+    fn kernel_vs_user_boundary_enforced() {
+        // Kernel-vs-user split the guest-CR3 slice will load: supervisor
+        // page (no USER) vs user page (USER), both rings, all access kinds.
+        let mut pt = PageTable::new();
+        let k_rw = PageFlags::PRESENT.union(PageFlags::WRITABLE);
+        let u_rw = k_rw.union(PageFlags::USER);
+        pt.map(0x1000, 0xA000, k_rw).unwrap();
+        pt.map(0x2000, 0xB000, u_rw).unwrap();
+        // Supervisor page: supervisor full access, user fully denied.
+        assert_eq!(pt.check(0x1000, AccessKind::Read, false), Ok(0xA000));
+        assert_eq!(pt.check(0x1000, AccessKind::Write, false), Ok(0xA000));
+        assert_eq!(
+            pt.check(0x1000, AccessKind::Read, true),
+            Err(Fault::UserViolation)
+        );
+        assert_eq!(
+            pt.check(0x1000, AccessKind::Write, true),
+            Err(Fault::UserViolation)
+        );
+        assert_eq!(
+            pt.check(0x1000, AccessKind::Execute, true),
+            Err(Fault::UserViolation)
+        );
+        // User page: both rings pass (supervisor may access user).
+        assert_eq!(pt.check(0x2000, AccessKind::Read, true), Ok(0xB000));
+        assert_eq!(pt.check(0x2000, AccessKind::Write, true), Ok(0xB000));
+        assert_eq!(pt.check(0x2000, AccessKind::Read, false), Ok(0xB000));
+        assert_eq!(pt.check(0x2000, AccessKind::Write, false), Ok(0xB000));
+        // Same split through the canonical gate: user ring on the kernel
+        // page is #PF UserViolation, non-canonical stays #GP either way.
+        assert_eq!(
+            classify_access(&pt, 0x1000, AccessKind::Read, true),
+            Err(CpuFault::PageFault(Fault::UserViolation))
+        );
+        assert_eq!(
+            classify_access(&pt, 0x2000, AccessKind::Read, true),
+            Ok(0xB000)
+        );
+        assert_eq!(
+            classify_access(&pt, 0x8000_0000_0000, AccessKind::Read, true),
+            Err(CpuFault::GeneralProtection)
+        );
     }
 
     #[test]
