@@ -387,7 +387,7 @@ impl FrameAllocator {
 
 /// Guest-side stress proof for S03 task #5: drive the allocator over
 /// `boot`'s Usable map, inject the three fail-closed faults, and emit
-/// `FRAMEALLOC ok=<0|1> free=<dec> spans=<n> faults=<n>\n` on `emit`
+/// `FRAMEALLOC ok=<0|1> free=<dec> spans=<n> faults=<n> stitch=<n>\n` on `emit`
 /// (the `tools/qemu/boot-uefi.ps1` hard-require is `FRAMEALLOC ok=1`).
 ///
 /// Battery, in order (any failure clears `ok` but the line still prints):
@@ -413,7 +413,10 @@ impl FrameAllocator {
 ///
 /// `faults` counts faults that failed with the expected kind (3 on a full
 /// battery). An empty Usable map (`free_pages() == 0` after ingest) skips
-/// the battery entirely and reports `ok=0 free=0 spans=0 faults=0`.
+/// the battery entirely and reports `ok=0 free=0 spans=0 faults=0 stitch=0`.
+/// `stitch` is the step-2c `filled` span count (`>= 2` when the forced
+/// multi-span stitch ran, `0` when 2c skipped by its guards) so future maps
+/// distinguish ran-vs-skipped on serial alone without counting.
 /// Never panics; returns only the sink's error (COM1 is infallible in the
 /// guest; host tests collect bytes).
 pub fn frame_alloc_stress<E>(
@@ -423,6 +426,7 @@ pub fn frame_alloc_stress<E>(
     let mut fa = FrameAllocator::from_boot_info(boot);
     let mut ok = fa.free_pages() > 0;
     let mut faults = 0usize;
+    let mut stitch = 0usize;
     if ok {
         // (1) 1024x single-page sweep — every alloc/free must succeed.
         for _ in 0..1024 {
@@ -498,6 +502,7 @@ pub fn frame_alloc_stress<E>(
                         let spans_before = fa.free_span_count();
                         match fa.alloc_scatter(need, &mut runs) {
                             Some(filled) if filled >= 2 && filled <= runs.len() => {
+                                stitch = filled;
                                 let mut stitch_ok = true;
                                 let mut freed_pages = 0u64;
                                 for run in &runs[..filled] {
@@ -553,6 +558,8 @@ pub fn frame_alloc_stress<E>(
     write_u64_dec(emit, fa.free_span_count() as u64)?;
     write_str(emit, " faults=")?;
     write_u64_dec(emit, faults as u64)?;
+    write_str(emit, " stitch=")?;
+    write_u64_dec(emit, stitch as u64)?;
     write_str(emit, "\n")
 }
 
@@ -738,7 +745,8 @@ mod tests {
 
     /// S03 #5 host half of the guest stress: a healthy 16-page Usable map
     /// completes sweep + multi-page pair + three faults and emits the
-    /// exact `FRAMEALLOC ok=1 free=16 spans=1 faults=3` line.
+    /// exact `FRAMEALLOC ok=1 free=16 spans=1 faults=3 stitch=0` line
+    /// (single-span map skips step 2c, so `stitch=0`).
     #[test]
     fn frame_alloc_stress_healthy_map_emits_exact_ok_line() {
         let boot = boot_with(&[(0x1000, 16)]);
@@ -749,11 +757,11 @@ mod tests {
         })
         .unwrap();
         let text = std::string::String::from_utf8(out).unwrap();
-        assert_eq!(text, "FRAMEALLOC ok=1 free=16 spans=1 faults=3\n");
+        assert_eq!(text, "FRAMEALLOC ok=1 free=16 spans=1 faults=3 stitch=0\n");
     }
 
     /// Empty Usable map: no frames to sweep — battery skipped fail-closed,
-    /// line reports `ok=0 free=0 spans=0 faults=0` (e2e hard-require of
+    /// line reports `ok=0 free=0 spans=0 faults=0 stitch=0` (e2e hard-require of
     /// `ok=1` would fail loudly).
     #[test]
     fn frame_alloc_stress_empty_map_reports_ok_zero() {
@@ -765,12 +773,13 @@ mod tests {
         })
         .unwrap();
         let text = std::string::String::from_utf8(out).unwrap();
-        assert_eq!(text, "FRAMEALLOC ok=0 free=0 spans=0 faults=0\n");
+        assert_eq!(text, "FRAMEALLOC ok=0 free=0 spans=0 faults=0 stitch=0\n");
     }
 
     /// Scatter wire-up host proof: the 2x4-page two-span fixture runs the
     /// full stress battery including step 2b (`alloc_scatter(4)` + free of
-    /// every run) and still emits the exact ok line with spans restored.
+    /// every run) and step 2c (`need=5` stitch, `filled=2`) and still emits
+    /// the exact ok line with spans restored.
     #[test]
     fn frame_alloc_stress_two_span_map_emits_exact_ok_line() {
         let boot = boot_with(&[(0x1000, 4), (0x100_0000, 4)]);
@@ -781,7 +790,7 @@ mod tests {
         })
         .unwrap();
         let text = std::string::String::from_utf8(out).unwrap();
-        assert_eq!(text, "FRAMEALLOC ok=1 free=8 spans=2 faults=3\n");
+        assert_eq!(text, "FRAMEALLOC ok=1 free=8 spans=2 faults=3 stitch=2\n");
     }
 
     /// `largest_free_run` tracks the max single span (0 when empty) and
@@ -802,7 +811,7 @@ mod tests {
 
     /// Step 2c host proof on a fragmented map: 2-4-2 spans need largest+1
     /// (5 pages), which cannot fit any one span, so the stress battery
-    /// must stitch >= 2 spans and still emit the exact ok line restored.
+    /// must stitch 2 spans (`stitch=2`) and still emit the exact ok line restored.
     #[test]
     fn frame_alloc_stress_fragmented_map_stitches_multi_span() {
         let boot = boot_with(&[(0x1000, 2), (0x10000, 4), (0x100_0000, 2)]);
@@ -813,7 +822,7 @@ mod tests {
         })
         .unwrap();
         let text = std::string::String::from_utf8(out).unwrap();
-        assert_eq!(text, "FRAMEALLOC ok=1 free=8 spans=3 faults=3\n");
+        assert_eq!(text, "FRAMEALLOC ok=1 free=8 spans=3 faults=3 stitch=2\n");
     }
 
     /// S03 verification (host-only #59b): allocate/free large numbers of

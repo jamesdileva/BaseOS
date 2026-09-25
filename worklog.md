@@ -1401,3 +1401,52 @@ Format per entry (per `implementation-guide.md` §31):
   pinned; stitch API additive only). Open: serial-line stitch observability
   (log `filled`) remains a possible follow-up so future maps distinguish
   ran-vs-skipped on serial alone.
+
+## S03 slice 17 -- stitch observability (`stitch=` serial field) + QEMU proof (2026-09-25)
+
+- **Decision:** Close REVIEW #111 residual risk 1 (ran-vs-skipped inferred
+  by counting, not logged) as one guest-touching slice in
+  `crates/kernel/src/frame_alloc.rs`: `frame_alloc_stress` tracks
+  `stitch` (step-2c `filled`, `0` when 2c skips by its guards) and the
+  serial line becomes
+  `FRAMEALLOC ok=<0|1> free=<n> spans=<n> faults=<n> stitch=<n>`.
+  `Some(filled)` with `filled >= 2` sets `stitch = filled`; all skip
+  guards and the empty-map path leave `0` (unambiguous: ran implies
+  `>= 2`). Four exact-line host asserts updated (`stitch=0` on 16-page
+  single-span + empty; `stitch=2` on 2x4 two-span and 2-4-2 fragmented);
+  no script change (`boot-uefi.ps1` hard-require stays substring
+  `FRAMEALLOC ok=1`).
+- **Why:** Agent-b REVIEW #111 APPROVED slice 16 but accepted the
+  proposed `filled`/`stitch=` log follow-up so future maps (different
+  span counts/sizes) distinguish ran-vs-skipped on serial alone. Cheapest
+  disconfirm is the field + host exact-lines + one QEMU PASS showing a
+  nonzero stitch on the live map.
+- **Alternatives:** Keep counting-based inference with no serial change
+  (rejected: reviewer-accepted follow-up, and exotic maps could sit
+  exactly on a skip guard); separate `STITCH` line + script hard-require
+  (rejected: scope growth -- same `ok` bit already gates, one appended
+  field is zero e2e churn); `stitch=1` for skipped (rejected: `0`
+  reads as none-ran and keeps `>= 2 means stitched` crisp).
+- **Expected:** default `cargo test` 55 (21+24+4+4+2, same count, 4
+  exact-lines updated); `-p baseos-kernel` 24; `-p baseos-boot-uefi` 10;
+  fmt clean; clippy 4x `-D warnings` exit 0; `boot-uefi.ps1` PASS with
+  `FRAMEALLOC ok=1 ... stitch>=2`.
+- **Measured (2026-09-25, Win11):** default 55/55;
+  `-p baseos-kernel` 24/24; `-p baseos-boot-uefi` 10/10;
+  `cargo fmt --check` clean; clippy default-all-targets + kernel --tests
+  + boot-uefi --tests + boot-uefi --target x86_64-unknown-uefi all exit 0
+  `-D warnings`; `boot-uefi.ps1` UEFI BOOT PASS exit 0 (guest 60928
+  bytes, serial 680 bytes = 671 + 9 for ` stitch=5`: marker FOUND,
+  `BOOTINFO valid=1 regions=98 usable=0xce8b000`,
+  `FB present=1 1280x800 pitch=5120 bpp=32`,
+  `MEMMAP ok=1 entries=98/98 truncated=0 map_size=4704 desc_size=48`,
+  `GOP ok=1`, `EBS ok=1`, `KERNEL ok=1`,
+  `FRAMEALLOC ok=1 free=52875 spans=8 faults=3 stitch=5`,
+  `EXC ok=1 vector=0`; Budget ok=True). Attribution: guest size
+  identical to slice-16 (60928), free/spans/faults/map_size/desc_size
+  identical; `stitch=5` (>= 2) is direct serial proof the 2c stitch ran
+  on the OVMF map (no counting argument needed). `smoke.ps1` not re-run
+  (SeaBIOS path untouched, prior PASS stands).
+- **Final:** Stitch observability landed; REVIEW #111 follow-up closed on
+  the current tree. #5 stays active (contiguous `alloc` no-stitch guard
+  still pinned; stitch API additive only).
