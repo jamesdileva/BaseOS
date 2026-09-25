@@ -434,6 +434,100 @@ pub const fn cr3_decode(cr3: u64) -> u64 {
     cr3 & PTE_ADDR_MASK
 }
 
+/// True when `virt` is canonical: bits 48..=63 sign-extend bit 47
+/// (Intel SDM Vol. 3: non-canonical linear addresses raise `#GP(0)`,
+/// not `#PF`). `const`-compatible so the guest walker can gate on it
+/// before touching any table.
+#[must_use]
+pub const fn is_canonical(virt: u64) -> bool {
+    if (virt >> 47) & 1 == 0 {
+        virt >> 48 == 0
+    } else {
+        virt >> 48 == 0xFFFF
+    }
+}
+
+/// CPU fault classification for a linear-address access: `#GP` for
+/// non-canonical addresses, `#PF` kinds otherwise. Mirrors hardware
+/// priority (canonical check first, then the [`PageTable::check`] order)
+/// so the guest fault stub can assert one line per probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuFault {
+    /// Non-canonical address (`#GP(0)`; error code 0).
+    GeneralProtection,
+    /// Canonical-address page fault (`#PF` with U/S+R/W+I/D bits).
+    PageFault(Fault),
+}
+
+/// Classify one access: `Err(CpuFault::GeneralProtection)` when `virt`
+/// is non-canonical, else the [`PageTable::check`] verdict mapped into
+/// `CpuFault::PageFault`. Pure/host-testable; the guest stub calls this
+/// shape before asserting its fault-line output.
+pub fn classify_access(
+    pt: &PageTable,
+    virt: u64,
+    kind: AccessKind,
+    is_user: bool,
+) -> Result<u64, CpuFault> {
+    if !is_canonical(virt) {
+        return Err(CpuFault::GeneralProtection);
+    }
+    pt.check(virt, kind, is_user).map_err(CpuFault::PageFault)
+}
+
+/// Hardware-walker failure modes (fail-closed: no table mutated, no
+/// TLB touched). `MisalignedPhys` is the [`pte_encode_checked`] `None`
+/// case surfaced as a `Result`; the walker path must use
+/// [`encode_table_entry`] (checked), never unchecked [`pte_encode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkerError {
+    /// `phys_base` not 4 KiB aligned (checked-encode rejection).
+    MisalignedPhys,
+    /// `virt` is non-canonical (hardware raises `#GP`, not `#PF`).
+    NonCanonical,
+    /// Table entry not present at this level.
+    NotPresent,
+    /// `level > 3` (no such paging level).
+    InvalidLevel,
+}
+
+/// Walker-only PTE encode: fail-closed wrapper over [`pte_encode_checked`].
+///
+/// This is the single entry point the guest walker uses to build table
+/// entries, closing REVIEW #124 risk 1 (checked form with zero callers).
+/// Unchecked [`pte_encode`] stays for load-compat only (its truncation is
+/// pinned by test); new walker code must call this, verifiable by
+/// `grep walker.*pte_encode_checked` / no `pte_encode(` in walker code.
+pub const fn encode_table_entry(phys_base: u64, flags: PageFlags) -> Result<u64, WalkerError> {
+    match pte_encode_checked(phys_base, flags) {
+        Some(pte) => Ok(pte),
+        None => Err(WalkerError::MisalignedPhys),
+    }
+}
+
+/// One hardware walk step: read the `level` table entry for `virt`.
+///
+/// Validates canonical first (`NonCanonical`), then the level
+/// (`InvalidLevel`), then `PRESENT` (`NotPresent`); returns the next-level
+/// table base (`pte_decoded_phys`) on success. Full 4-level walks chain
+/// four calls (PML4 -> PDPT -> PD -> PT); the leaf PT step returns the
+/// 4 KiB page base and callers add `virt & PAGE_OFFSET_MASK`.
+/// `GUARD` never appears here: entries were built by
+/// [`encode_table_entry`], which masks bit 9 to 0.
+pub fn walk_step(table: &[u64; 512], virt: u64, level: u8) -> Result<u64, WalkerError> {
+    if !is_canonical(virt) {
+        return Err(WalkerError::NonCanonical);
+    }
+    let Some(idx) = page_table_index(virt, level) else {
+        return Err(WalkerError::InvalidLevel);
+    };
+    let pte = table[idx as usize];
+    if pte & 1 == 0 {
+        return Err(WalkerError::NotPresent);
+    }
+    Ok(pte_decoded_phys(pte))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +762,86 @@ mod tests {
         pt.map(0x2000, 0xA000, K_RW).unwrap();
         assert_eq!(pt.translate(0x1000), Some((0xA000, K_RW)));
         assert_eq!(pt.translate(0x2000), Some((0xA000, K_RW)));
+    }
+
+    #[test]
+    fn walker_entry_wires_checked_form() {
+        // REVIEW #124 risk 1: the walker path must call the checked form.
+        // encode_table_entry is that path (wraps pte_encode_checked).
+        assert_eq!(
+            encode_table_entry(0x1001, K_RW),
+            Err(WalkerError::MisalignedPhys)
+        );
+        assert_eq!(
+            encode_table_entry(0xA000, K_RW),
+            Ok(pte_encode(0xA000, K_RW))
+        );
+        // GUARD still masked on the walker path.
+        let guard_rw = PageFlags::PRESENT
+            .union(PageFlags::WRITABLE)
+            .union(PageFlags::GUARD);
+        let pte = encode_table_entry(0xA000, guard_rw).unwrap();
+        assert_eq!(pte & (1 << 9), 0);
+        assert_eq!(pte, pte_encode(0xA000, K_RW));
+    }
+
+    #[test]
+    fn walk_step_reads_indexed_pte() {
+        // One present entry at the PML4 index of 0x1000 (index 0).
+        let mut table = [0u64; 512];
+        table[0] = encode_table_entry(0xB000, K_RW).unwrap();
+        assert_eq!(walk_step(&table, 0x1000, 3), Ok(0xB000));
+        // Clear PRESENT -> NotPresent.
+        table[0] &= !1;
+        assert_eq!(walk_step(&table, 0x1000, 3), Err(WalkerError::NotPresent));
+        // Bad level rejects before touching the table.
+        assert_eq!(walk_step(&table, 0x1000, 4), Err(WalkerError::InvalidLevel));
+        // Non-canonical gates first (0x8000_0000_0000 has bit 47 set
+        // with zero upper bits).
+        assert_eq!(
+            walk_step(&table, 0x8000_0000_0000, 3),
+            Err(WalkerError::NonCanonical)
+        );
+        // Canonical-high (sign-extended) passes the gate: index of
+        // 0xFFFF_8000_0000_1000 at level 3 is 0x100, wire it present.
+        let mut hi = [0u64; 512];
+        hi[0x100] = encode_table_entry(0xC000, K_RW).unwrap();
+        assert_eq!(walk_step(&hi, 0xFFFF_8000_0000_1000, 3), Ok(0xC000));
+    }
+
+    #[test]
+    fn classify_canonical_gp_vs_pf() {
+        let mut pt = PageTable::new();
+        pt.map(0x1000, 0xA000, K_RW).unwrap();
+        pt.map(0x8000, 0x9000, PageFlags::PRESENT.union(PageFlags::GUARD))
+            .unwrap();
+        // Canonical hit passes through.
+        assert_eq!(
+            classify_access(&pt, 0x1000, AccessKind::Read, false),
+            Ok(0xA000)
+        );
+        // Canonical miss is #PF NotPresent.
+        assert_eq!(
+            classify_access(&pt, 0x2000, AccessKind::Read, false),
+            Err(CpuFault::PageFault(Fault::NotPresent))
+        );
+        // Guard reports #PF Guard (not NotPresent, not #GP).
+        assert_eq!(
+            classify_access(&pt, 0x8000, AccessKind::Read, false),
+            Err(CpuFault::PageFault(Fault::Guard))
+        );
+        // Non-canonical is #GP even where nothing is mapped (and would
+        // otherwise be NotPresent).
+        assert_eq!(
+            classify_access(&pt, 0x8000_0000_0000, AccessKind::Read, false),
+            Err(CpuFault::GeneralProtection)
+        );
+        // Boundary pins: last low-canonical, first non-canonical,
+        // first high-canonical.
+        assert!(is_canonical(0x0000_7FFF_FFFF_FFFF));
+        assert!(!is_canonical(0x0000_8000_0000_0000));
+        assert!(is_canonical(0xFFFF_8000_0000_0000));
+        assert!(!is_canonical(0xFFFF_7FFF_FFFF_FFFF));
     }
 
     #[test]

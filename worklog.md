@@ -1576,3 +1576,49 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** REVIEW #122 gaps closed on the current tree; #6 stays active.
   Next: guest walker + `CR3` load + e2e fault-line asserts (with the
   canonical-address #GP-vs-#PF decision), then kernel vs user mappings.
+
+## S04 slice 4 -- walker verbs + canonical #GP-vs-#PF (REVIEW #124 risk 1) (2026-09-25)
+
+- **Decision:** Host-only walker-contract slice in
+  `crates/kernel/src/page_table.rs` (guest untouched, no QEMU this cycle):
+  (a) `is_canonical(virt)` (bit-47 sign-extension into 48..=63,
+  `const`-compatible for the guest walker); (b) `CpuFault::{GeneralProtection,
+  PageFault(Fault)}` + `classify_access(pt, virt, kind, is_user)` (canonical
+  gate first, then `check`, so non-canonical is `#GP` and everything else
+  is `#PF`); (c) `WalkerError::{MisalignedPhys, NonCanonical, NotPresent,
+  InvalidLevel}` + `encode_table_entry(phys, flags)` (fail-closed wrapper
+  over `pte_encode_checked` -- the single walker entry point, closing
+  REVIEW #124 risk 1: checked form with zero callers) + `walk_step(table:
+  &[u64; 512], virt, level)` (canonical -> level -> PRESENT order,
+  returns `pte_decoded_phys`). Docs pin the dual-encode rule (walker code
+  must call `encode_table_entry`, unchecked `pte_encode` is load-compat
+  only). Three new tests: checked-form wiring + GUARD mask, indexed-PT
+  step incl. high-canonical, GP-vs-PF matrix + canonical boundaries.
+- **Why:** REVIEW #124 ACCEPTED slice 3 @1e7098d but required the walker to
+  wire the checked form or the fix stays latent, with `grep walker for
+  pte_encode(` as the cheapest disconfirm; canonical #GP-vs-#PF was the
+  deferred decision from #122. This slice lands both host-side so the
+  guest `CR3`-load + e2e fault-assert slice is wiring-only.
+- **Alternatives:** Guest `CR3` load + QEMU fault-line asserts now (rejected:
+  doubles single-cycle risk; walker verbs + canonical contract must exist
+  first); change `pte_encode` to return `Option` (rejected: same as slice
+  3 -- breaks the pinned truncation contract; additive walker path keeps
+  both); `debug_assert` in `pte_encode` (rejected: fires on the pinned
+  truncation test; doc rule + single walker entry point is the lighter
+  gate until the guest lands).
+- **Expected:** default `cargo test` 72 (69 + 3); `-p baseos-kernel` 41
+  (38 + 3); `-p baseos-boot-uefi` 10; fmt clean; clippy host + UEFI
+  `-D warnings` exit 0; no QEMU (guest untouched).
+- **Measured (2026-09-25, Win11):** default 72/72 (21+41+4+4+2);
+  `-p baseos-kernel` 41/41 (3 new walker/canonical);
+  `-p baseos-boot-uefi` 10/10; `cargo fmt --check` clean;
+  `cargo clippy --all-targets -- -D warnings` exit 0 (one
+  `double_must_use` fix: dropped `#[must_use]` on `encode_table_entry`,
+  `Result` is already must-use);
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -- -D warnings` exit 0. `git diff --stat` is `page_table.rs` only
+  (guest untouched; S03 slice-17 PASS stands). QEMU not re-run.
+- **Final:** Walker verbs + canonical contract landed host-green; REVIEW
+  #124 risk 1 closed (walker path calls `pte_encode_checked` via
+  `encode_table_entry`). #6 stays active. Next: guest `CR3` load + QEMU
+  boot with e2e fault-line asserts, then kernel vs user mappings.
