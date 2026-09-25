@@ -1533,3 +1533,46 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** HW PTE encode contract landed host-green; #6 active. Next:
   guest walker + `CR3` load + QEMU boot with e2e fault-line asserts, then
   kernel vs user mapping foundations.
+
+## S04 slice 3 -- REVIEW #122 hardening: trusted from_bits + checked PTE encode (2026-09-25)
+
+- **Decision:** Close both REVIEW #122 hardening gaps host-only in
+  `crates/kernel/src/page_table.rs` (guest untouched, no QEMU this cycle):
+  (a) finding 1 -- `PageFlags::from_bits` now masks to new
+  `TRUSTED_FLAGS_MASK` (PRESENT/WRITABLE/USER/NO_EXEC/GUARD only), so raw
+  `u64` callers cannot forge Accessed/Dirty or reserved bits (GUARD stays
+  forgeable by construction as trusted OS state, documented); (b) finding 2
+  -- new `pte_encode_checked(phys, flags) -> Option<u64>` (`None` on
+  misaligned, mirroring `cr3_encode`), with `pte_encode` keeping its pinned
+  masking form for load-compat and docs pointing at the checked caller;
+  (c) minor -- `page_table_index` out-of-range test now covers 4/5/100/255
+  (not just 4). Two new tests: `review_122_from_bits_masks_untrusted_bits`
+  (MAX forges GUARD but equals the trusted mask; A-D/reserved cleared; raw
+  PTE bit 9 still decodes without GUARD) and
+  `review_122_pte_encode_checked_fails_closed_on_misalign` (None on 0x1001,
+  Some == unchecked on aligned, truncation still pinned).
+- **Why:** REVIEW #122 ACCEPTED slice 2 @d43c47e but named exactly these two
+  non-blocking gaps for the next slice, with cheapest disconfirms
+  (`from_bits(MAX).contains(GUARD)` assert; checked-encode vs silent mask);
+  canonical-address validation stays deferred to the walker slice per the
+  review (#GP vs #PF decision).
+- **Alternatives:** Make `from_bits` private/rename to trusted-only
+  (rejected: decode path needs a `const` rebuild and the mask gives the
+  same forgery bound with zero API churn); change `pte_encode` itself to
+  return `Option` (rejected: breaks the load-compat truncation contract
+  its test pins; additive checked form keeps both); full guest walker now
+  (rejected: doubles single-cycle risk; hardening must land first so the
+  walker builds on locked encode semantics).
+- **Expected:** default `cargo test` 69 (67 + 2); `-p baseos-kernel` 38
+  (36 + 2); `-p baseos-boot-uefi` 10; fmt clean; clippy host + UEFI
+  `-D warnings` exit 0; no QEMU (guest untouched).
+- **Measured (2026-09-25, Win11):** default 69/69 (21+38+4+4+2);
+  `-p baseos-kernel` 38/38 (2 new review_122);
+  `-p baseos-boot-uefi` 10/10; `cargo fmt --check` clean (one auto-format
+  of a long assert line); `cargo clippy --all-targets -- -D warnings`
+  exit 0; `cargo clippy -p baseos-boot-uefi --target
+  x86_64-unknown-uefi -- -D warnings` exit 0. QEMU not re-run (guest
+  sources untouched; S03 slice-17 PASS stands).
+- **Final:** REVIEW #122 gaps closed on the current tree; #6 stays active.
+  Next: guest walker + `CR3` load + e2e fault-line asserts (with the
+  canonical-address #GP-vs-#PF decision), then kernel vs user mappings.

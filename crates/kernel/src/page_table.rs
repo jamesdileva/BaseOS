@@ -64,9 +64,14 @@ impl PageFlags {
 
     /// Rebuild from raw bits (decode path; `GUARD` naturally absent when the
     /// bits came from [`pte_decoded_flags`]).
+    ///
+    /// Masked to [`TRUSTED_FLAGS_MASK`] (REVIEW #122 finding 1): raw `u64`
+    /// callers cannot forge `Accessed`/`Dirty` or reserved bits; `GUARD`
+    /// itself stays forgeable by construction (OS state), so treat it as
+    /// trusted-only input.
     #[must_use]
     pub const fn from_bits(bits: u64) -> Self {
-        Self(bits)
+        Self(bits & TRUSTED_FLAGS_MASK)
     }
 
     /// True when all bits in `other` are set in `self`.
@@ -326,6 +331,10 @@ pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// Hardware PTE flag bits this slice loads: PRESENT(0) / WRITABLE(1) /
 /// USER(2) / NO_EXEC(63). `GUARD` (bit 9, OS-available) is never loaded.
 pub const PTE_HW_FLAGS_MASK: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 63);
+/// Trusted software flag bits: HW loadable bits plus `GUARD` (bit 9).
+/// [`PageFlags::from_bits`] masks to exactly this set so callers cannot
+/// forge `Accessed`/`Dirty` (bits 5/6), other status bits, or reserved bits.
+pub const TRUSTED_FLAGS_MASK: u64 = PTE_HW_FLAGS_MASK | (1 << 9);
 
 /// Encode a hardware PTE from a 4 KiB-aligned `phys` base and `flags`.
 ///
@@ -334,7 +343,9 @@ pub const PTE_HW_FLAGS_MASK: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 63);
 /// ignores bit 9, and a leaked 1 would survive into the real entry where a
 /// future reader could mistake OS state for a hardware bit. `Accessed` /
 /// `Dirty` (bits 5/6) load as 0; hardware sets them. Low 12 `phys` bits are
-/// masked off (caller must pass an aligned base; `map` already enforces it).
+/// masked off (caller must pass an aligned base; `map` already enforces it;
+/// the masking is load-compat, not a silent-accept contract; use
+/// [`pte_encode_checked`] for a fail-closed caller).
 #[must_use]
 pub const fn pte_encode(phys_base: u64, flags: PageFlags) -> u64 {
     let mut pte = phys_base & PTE_ADDR_MASK;
@@ -358,6 +369,18 @@ pub const fn pte_encode(phys_base: u64, flags: PageFlags) -> u64 {
 #[must_use]
 pub const fn pte_decoded_phys(pte: u64) -> u64 {
     pte & PTE_ADDR_MASK
+}
+
+/// Fail-closed PTE encode (REVIEW #122 finding 2): `None` when `phys_base`
+/// is not 4 KiB aligned, mirroring [`cr3_encode`]; `Some(pte)` otherwise.
+/// Use this from the guest walker; [`pte_encode`] keeps its masking form
+/// for load-compat and its test pins the truncation.
+#[must_use]
+pub const fn pte_encode_checked(phys_base: u64, flags: PageFlags) -> Option<u64> {
+    if phys_base & PAGE_OFFSET_MASK != 0 {
+        return None;
+    }
+    Some(pte_encode(phys_base, flags))
 }
 
 /// Permission flags decoded from a hardware PTE. `GUARD` is never
@@ -594,7 +617,39 @@ mod tests {
         assert_eq!(page_table_index(virt, 2), Some(0x195));
         assert_eq!(page_table_index(virt, 1), Some(0x19));
         assert_eq!(page_table_index(virt, 0), Some(0x1A));
-        assert_eq!(page_table_index(virt, 4), None);
+        // REVIEW #122 minor: every out-of-range level rejects, not just 4.
+        for level in [4u8, 5, 100, 255] {
+            assert_eq!(page_table_index(virt, level), None);
+        }
+    }
+
+    #[test]
+    fn review_122_from_bits_masks_untrusted_bits() {
+        // Cheapest disconfirm from REVIEW #122 finding 1: raw MAX still
+        // carries GUARD (OS state is forgeable by construction) but every
+        // untrusted bit is cleared.
+        let forged = PageFlags::from_bits(u64::MAX);
+        assert!(forged.contains(PageFlags::GUARD));
+        assert_eq!(forged.bits() & !TRUSTED_FLAGS_MASK, 0);
+        assert_eq!(forged.bits(), TRUSTED_FLAGS_MASK);
+        // Accessed/Dirty + a reserved bit never survive.
+        let ad = PageFlags::from_bits((1 << 5) | (1 << 6) | (1 << 7));
+        assert_eq!(ad.bits(), 0);
+        // A raw PTE with bit 9 set still decodes without GUARD.
+        let with_guard_bit = pte_encode(0xA000, K_RW) | (1 << 9);
+        assert_eq!(pte_decoded_flags(with_guard_bit), K_RW);
+    }
+
+    #[test]
+    fn review_122_pte_encode_checked_fails_closed_on_misalign() {
+        // REVIEW #122 finding 2: checked form mirrors cr3_encode.
+        assert_eq!(pte_encode_checked(0x1001, K_RW), None);
+        assert_eq!(
+            pte_encode_checked(0xA000, K_RW),
+            Some(pte_encode(0xA000, K_RW))
+        );
+        // Unchecked form keeps its pinned truncation (load-compat).
+        assert_eq!(pte_decoded_phys(pte_encode(0x1234_5ABC, K_RW)), 0x1234_5000);
     }
 
     #[test]
