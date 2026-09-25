@@ -23,6 +23,7 @@ extern crate std;
 use baseos_boot_info::{write_str, write_u64_dec, write_u64_hex, BootInfo};
 
 pub mod frame_alloc;
+pub mod page_table;
 
 /// Enter the kernel with the boot handoff: validate [`BootInfo`] and emit
 /// the one-line entry proof on the caller's byte sink:

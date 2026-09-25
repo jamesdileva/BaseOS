@@ -1450,3 +1450,43 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Stitch observability landed; REVIEW #111 follow-up closed on
   the current tree. #5 stays active (contiguous `alloc` no-stitch guard
   still pinned; stitch API additive only).
+
+## S04 slice 1 -- stage-1 page-table model: map/unmap + perms + guard + fault tests (2026-09-25)
+
+- **Decision:** Open S04 (#6) with a host-only, `no_std`-clean software
+  model in `crates/kernel/src/page_table.rs` (`pub mod page_table`):
+  fixed-capacity (`MAX_MAPPINGS=64`, sorted linear scan, no allocator,
+  no `unsafe`) 4 KiB page map with `PageFlags`
+  (PRESENT/WRITABLE/USER/NO_EXEC/GUARD), `map`/`unmap`/`translate`, and
+  `check(virt, AccessKind::{Read,Write,Execute}, is_user)` reporting
+  `Fault::{NotPresent,ReadOnly,NoExec,UserViolation,Guard}` (Guard first,
+  then NotPresent, User, RWX). Six host tests: roundtrip+offset,
+  double/misaligned/bad-flags fail-closed, full-64 TableFull+drain,
+  R/W/X+user matrix, guard-faults-all-kinds, fill/half-drain/remap churn.
+  Guest untouched (no QEMU re-run this slice).
+- **Why:** TASK #116 asks for the minimal S04 slice with map/unmap +
+  perms + fault tests while keeping gates green; a testable permission
+  contract must exist before any hardware PTE walk/`CR3` slice, per
+  implementation-guide §7 (safe abstraction first, rest of kernel goes
+  through it).
+- **Alternatives:** Full 4-level radix with static node pool + `CR3` load
+  now (rejected: needs guest asm + QEMU proof in the same cycle, doubles
+  single-cycle risk; model pins the fault contract the hardware slice
+  must satisfy); ad-hoc `BTreeMap`/`Vec` map (rejected: no allocator
+  post-EBS; fixed array keeps the guest path usable).
+- **Expected:** default `cargo test` 61 (55 + 6); `-p baseos-kernel` 30
+  (24 + 6); `-p baseos-boot-uefi` 10; fmt clean; clippy host + UEFI
+  `-D warnings` exit 0; no QEMU (guest untouched).
+- **Measured (2026-09-25, Win11):** default 61/61
+  (21+30+4+4+2); `-p baseos-kernel` 30/30 (6 new page_table);
+  `-p baseos-boot-uefi` 10/10; `cargo fmt --check` clean;
+  `cargo clippy --all-targets -D warnings` exit 0;
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` exit 0. Two test bugs caught red-to-green before commit:
+  `unmap(0x9999)` asserted NotMapped but is Misaligned (fixed to
+  `0x9000`); `rx` fixture lacked `NO_EXEC` so Execute returned Ok
+  (fixed to `PRESENT|USER|NO_EXEC`). QEMU not re-run (guest sources
+  untouched; S03 slice-17 PASS `stitch=5` stands).
+- **Final:** S04 permission contract landed host-green; #6 active. Next:
+  hardware PTE walk / guest wiring + e2e fault-line asserts, then kernel
+  vs user mapping foundations.
