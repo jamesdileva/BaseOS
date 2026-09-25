@@ -196,9 +196,11 @@ impl PageTable {
         Ok(())
     }
 
-    /// Remove the mapping covering the 4 KiB page containing `virt`-base.
+    /// Remove the mapping with `virt_base == virt`.
     ///
-    /// `virt` must be page-aligned; unmapped pages fail with `NotMapped`.
+    /// `virt` must be the page-aligned base (intra-page offsets fail with
+    /// `Misaligned` — this is unmap-of-exact-page, not unmap-of-containing-page);
+    /// unmapped pages fail with `NotMapped`.
     pub fn unmap(&mut self, virt: u64) -> Result<(), MapError> {
         if virt & PAGE_OFFSET_MASK != 0 {
             return Err(MapError::Misaligned);
@@ -216,6 +218,10 @@ impl PageTable {
 
     /// Translate `virt` to `(phys, flags)`; `None` when unmapped.
     ///
+    /// Raw unchecked translation — does NOT enforce permissions, including
+    /// `GUARD` (a guard page still returns `Some`; bit 9 is OS-available and
+    /// ignored by hardware). Use [`PageTable::check`] as the access gate;
+    /// the hardware-PTE slice must mask bit 9 before loading a real PTE.
     /// The low 12 bits pass through (`phys_base + offset`).
     #[must_use]
     pub fn translate(&self, virt: u64) -> Option<(u64, PageFlags)> {
@@ -232,6 +238,14 @@ impl PageTable {
     /// Permission check mirroring hardware fault priority: `Guard` first,
     /// then `NotPresent`, then `UserViolation`, then `ReadOnly` / `NoExec`.
     /// Returns the translated physical address on success.
+    ///
+    /// Priority is a software contract for the guest fault stub — hardware
+    /// `#PF` sets U/S + R/W + I/D bits together with no order. `GUARD`-only
+    /// (no `PRESENT`) intentionally reports `Guard`, not `NotPresent`. The
+    /// `!PRESENT -> NotPresent` branch is unreachable under today's `map()`
+    /// invariant (`!PRESENT` implies `GUARD`, already returned) and is
+    /// retained for hardware-PTE parity where cleared-`PRESENT` entries are
+    /// loadable.
     pub fn check(&self, virt: u64, kind: AccessKind, is_user: bool) -> Result<u64, Fault> {
         let base = virt & !PAGE_OFFSET_MASK;
         let offset = virt & PAGE_OFFSET_MASK;
@@ -402,6 +416,28 @@ mod tests {
             pt.check(0x8000, AccessKind::Read, false),
             Err(Fault::NotPresent)
         );
+    }
+
+    /// REVIEW #118 edge contract: `translate` is raw (guard still `Some`),
+    /// `check` is the gate (`GUARD`-only with no `PRESENT` reports `Guard`),
+    /// and `unmap` requires the aligned base (intra-page offset is
+    /// `Misaligned`, not unmap-of-containing-page).
+    #[test]
+    fn review_118_translate_raw_guard_only_unmap_aligned_contract() {
+        let mut pt = PageTable::new();
+        // GUARD-only (no PRESENT) is mappable and reports Guard, not NotPresent.
+        pt.map(0x8000, 0x9000, PageFlags::GUARD).unwrap();
+        assert_eq!(pt.check(0x8000, AccessKind::Read, false), Err(Fault::Guard));
+        // translate is raw: guard pages still translate; check is the gate.
+        let (phys, flags) = pt
+            .translate(0x8000)
+            .expect("raw translate passes guard through");
+        assert_eq!(phys, 0x9000);
+        assert!(flags.contains(PageFlags::GUARD));
+        // unmap requires the aligned base.
+        assert_eq!(pt.unmap(0x8ABC), Err(MapError::Misaligned));
+        pt.unmap(0x8000).unwrap();
+        assert_eq!(pt.translate(0x8000), None);
     }
 
     #[test]
