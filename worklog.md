@@ -2199,3 +2199,41 @@ Format per entry (per `implementation-guide.md` §31):
   #147 risks 1 (single-probe coverage), 4-partial (gate now covers `w`;
   `user`/`nx` still reporting-only by design); #139 note 1. Next:
   multi-probe audit (FB + low-RAM) with W or guard-page e2e. #6 stays active.
+
+## S04 slice 20 -- multi-probe PERMAUDIT2 (low-RAM 0x1000) e2e (REVIEW #147 risk 1)
+
+- **Decision:** Add a second live-leaf probe of virtual `0x1000` (low-RAM)
+  on its own `PERMAUDIT2 ok=<0|1> phys= user= nx= w=` serial line, gated
+  by `boot-uefi.ps1` on `PERMAUDIT2 ok=1`. Implementation: factor the
+  line writer into `write_tagged_permaudit_line(tag, ...)` (PERMAUDIT and
+  PERMAUDIT2 share one code path), add `probe_live_flags_for(info, virt)`
+  and keep `probe_live_flags` as the FB-default wrapper.
+- **Why:** REVIEW #147 risk 1: every live-flags audit rested on the single
+  FB leaf, so one unmapped/odd low address could hide behind it. Two
+  probes (FB `0x80000000` + low-RAM `0x1000`) make the audit a multi-point
+  sample of the firmware tables.
+- **Alternatives:** Three+ probes (rejected: scope growth -- two points
+  already break the single-probe assumption; add more only on a finding);
+  gate `w=1` on PERMAUDIT2 too (rejected: keep the W gate as the
+  slice-19-tightened PERMAUDIT contract; PERMAUDIT2 `w` stays
+  reporting-only until measured as a baseline, noted in the ps1 comment).
+- **Expected:** default 86 (unchanged, guest test lives in boot-uefi);
+  kernel 55; boot-uefi 14 (13 + 1 new PERMAUDIT2 line test); fmt clean;
+  clippy host + UEFI clean; `boot-uefi.ps1` PASS with both `PERMAUDIT
+  ok=1 ... w=1` and `PERMAUDIT2 ok=1`; smoke PASS.
+- **Measured (2026-09-26, Win11):** default 86/86 (21+55+4+4+2);
+  kernel 55/55; boot-uefi 14/14 (new `write_permaudit2_line_embeds_phys_user_nx_w`);
+  `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings`
+  exit 0; `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -- -D warnings` exit 0; `boot-uefi.ps1` UEFI BOOT PASS exit 0
+  (guest 77312 bytes, serial 834 bytes: `PERMAUDIT ok=1 phys=0x80000000
+  user=0 nx=0 w=1` + `PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=0 w=1`,
+  budget ok=True); gate substring control `ok=0`->False / `ok=1`->True;
+  `smoke.ps1` SMOKE PASS. Baseline extended: OVMF low-RAM `0x1000` leaf is
+  present, supervisor (`user=0`), executable (`nx=0`), writable (`w=1`) --
+  same shape as the FB identity map.
+- **Final:** REVIEW #147 risk 1 (single-probe) closed: audit now samples
+  two distinct leaves and the script gates both. Remaining: #147 risk 4
+  partial (`user`/`nx` still reporting-only by design), #139 note 1
+  (Reserved/MBZ). Next: guard-page e2e or `user`/`nx` baseline gating.
+  #6 stays active.

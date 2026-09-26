@@ -17,7 +17,7 @@
 //! `x86_64-unknown-uefi`, boots OVMF, and asserts the marker plus the
 //! `BOOTINFO valid=1`, `MEMMAP ok=1`, `FB present=1`, `GOP ok=1`,
 //! `EBS ok=1`, `KERNEL ok=1`, `FRAMEALLOC ok=1`, `PAGING ok=1`, `PERM ok=1`,
-//! `PERMAUDIT ok=1`,
+//! `PERMAUDIT ok=1`, `PERMAUDIT2 ok=1`,
 //! summary lines in the serial capture. The `MEMMAP` line also carries
 //! `map_size`/`desc_size` for the 16 KiB + 4 KiB budget baseline (#59a).
 
@@ -704,6 +704,10 @@ fn write_perm_line<E>(
 /// enforcement slice decides what must fail. Hard-required by
 /// `boot-uefi.ps1` (`PERMAUDIT ok=1` substring plus same-line ` w=1`
 /// regex per REVIEW #153 gap 2).
+///
+/// S04 slice 20 adds a second probe line `PERMAUDIT2` (low-RAM `0x1000`)
+/// via [`write_permaudit2_line`] so single-probe coverage (REVIEW #147
+/// risk 1) no longer rests on the FB leaf alone.
 fn write_permaudit_line<E>(
     ok: bool,
     phys: u64,
@@ -712,7 +716,36 @@ fn write_permaudit_line<E>(
     w: bool,
     emit: &mut impl FnMut(u8) -> Result<(), E>,
 ) -> Result<(), E> {
-    write_str(emit, "PERMAUDIT ok=")?;
+    write_tagged_permaudit_line("PERMAUDIT", ok, phys, user, nx, w, emit)
+}
+
+/// Emit the second-probe `PERMAUDIT2` line (slice 20, REVIEW #147 risk 1):
+/// `PERMAUDIT2 ok=<0|1> phys=<0x...> user=<0|1> nx=<0|1> w=<0|1>` — same
+/// shape as [`write_permaudit_line`] but for the low-RAM `0x1000` probe.
+/// Hard-required (`PERMAUDIT2 ok=1`) by `boot-uefi.ps1`; `w` is
+/// reporting-only until the baseline is measured.
+fn write_permaudit2_line<E>(
+    ok: bool,
+    phys: u64,
+    user: bool,
+    nx: bool,
+    w: bool,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_tagged_permaudit_line("PERMAUDIT2", ok, phys, user, nx, w, emit)
+}
+
+fn write_tagged_permaudit_line<E>(
+    tag: &str,
+    ok: bool,
+    phys: u64,
+    user: bool,
+    nx: bool,
+    w: bool,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, tag)?;
+    write_str(emit, " ok=")?;
     write_u64_dec(emit, u64::from(ok))?;
     write_str(emit, " phys=")?;
     write_u64_hex(emit, phys)?;
@@ -734,12 +767,27 @@ fn write_permaudit_line<E>(
 /// the leaf `USER` / `NO_EXEC` / `WRITABLE` bits, false when the walk
 /// failed. Never panics.
 ///
+/// S04 slice 20: thin wrapper over [`probe_live_flags_for`] (REVIEW #147
+/// risk 1 multi-probe: the low-RAM probe uses the same helper directly).
+///
 /// # Safety
 /// Post-EBS only, on the boot thread: reads firmware page tables through
 /// [`phys_to_table_ptr`] (identity-mapped).
 unsafe fn probe_live_flags(info: &BootInfo) -> (bool, u64, bool, bool, bool) {
-    let cr3 = read_cr3();
     let probe_virt = info.framebuffer_opt().map(|fb| fb.base).unwrap_or(0x1000);
+    probe_live_flags_for(info, probe_virt)
+}
+
+/// Probe one virtual address through the live firmware tables (slice 20
+/// helper for the multi-probe audit): same contract as
+/// [`probe_live_flags`] but for an explicit `probe_virt` instead of the
+/// FB-or-fallback default. Never panics.
+///
+/// # Safety
+/// Post-EBS only, on the boot thread: reads firmware page tables through
+/// [`phys_to_table_ptr`] (identity-mapped).
+unsafe fn probe_live_flags_for(info: &BootInfo, probe_virt: u64) -> (bool, u64, bool, bool, bool) {
+    let cr3 = read_cr3();
     match walk_full_leaf_flags(cr3_decode(cr3), probe_virt, |base| {
         phys_to_table_ptr(info, base)
     }) {
@@ -812,9 +860,23 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             write_perm_line::<Infallible>(perm_ok, perm_passed, perm_total, &mut emit).unwrap();
             // S04 slice 15: live leaf USER/NX audit of the PAGING probe
             // address — reporting-only baseline before any enforcement.
+            // S04 slice 20 (REVIEW #147 risk 1): second probe of low-RAM
+            // 0x1000 on its own PERMAUDIT2 line, so one unmapped/odd leaf
+            // cannot hide behind the FB probe.
             let (audit_ok, audit_phys, audit_user, audit_nx, audit_w) = probe_live_flags(&info);
             write_permaudit_line::<Infallible>(
                 audit_ok, audit_phys, audit_user, audit_nx, audit_w, &mut emit,
+            )
+            .unwrap();
+            let (audit2_ok, audit2_phys, audit2_user, audit2_nx, audit2_w) =
+                probe_live_flags_for(&info, 0x1000);
+            write_permaudit2_line::<Infallible>(
+                audit2_ok,
+                audit2_phys,
+                audit2_user,
+                audit2_nx,
+                audit2_w,
+                &mut emit,
             )
             .unwrap();
             baseos_kernel::bring_up_cpu_and_prove_exception();
@@ -1176,6 +1238,30 @@ mod tests {
             line,
             "PERMAUDIT ok=0 phys=0xffffffffffffffff user=0 nx=0 w=0\n"
         );
+    }
+
+    /// S04 slice 20 (REVIEW #147 risk 1): `PERMAUDIT2` second-probe line
+    /// shape — same fields as `PERMAUDIT`, distinct tag so the ps1 gate
+    /// can require both probes independently.
+    #[test]
+    fn write_permaudit2_line_embeds_phys_user_nx_w() {
+        let mut text = Vec::new();
+        write_permaudit2_line::<core::convert::Infallible>(
+            true,
+            0x1000,
+            false,
+            true,
+            true,
+            &mut |b| {
+                text.push(b);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(line, "PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=1 w=1\n");
+        assert!(line.contains("PERMAUDIT2 ok=1"));
+        assert!(line.contains(" w=1"));
     }
 
     /// agent-b #5 nit, GOP half: structural GOP failures (null protocol,
