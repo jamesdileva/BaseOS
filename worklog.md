@@ -2115,3 +2115,53 @@ Format per entry (per `implementation-guide.md` §31):
   partially pinned host-side), 4 (gate brittleness); #139 note 1
   (Reserved/MBZ). Next: multi-probe audit with W bit or guard-page e2e.
   #6 stays active.
+
+## S04 slice 18 -- PERMAUDIT W-bit e2e (REVIEW #147 risk 2)
+
+- **Decision:** First guest-touching close-out of REVIEW #147 risk 2 (W bit
+  pinned host-side only since slice 17): (a) `boot-uefi/main.rs`:
+  `probe_live_flags` now returns `(ok, phys, user, nx, w)` with the leaf
+  `WRITABLE` bit via `pte_decoded_flags`, and `write_permaudit_line` appends
+  ` w=<0|1>` (`PERMAUDIT ok=1 phys=0x... user=0|1 nx=0|1 w=0|1`); failure
+  shape is `w=0`, and the `PERMAUDIT ok=1` hard-require substring in
+  `boot-uefi.ps1` is byte-identical (append-only, no script change);
+  (b) exact-line host test updated (`w=1` good path, `w=0` failure path).
+- **Why:** REVIEW #151 ACCEPTED slice 17 but left risk 2 open (W-bit pinned
+  host-side only, e2e still open) and named the multi-probe W-bit audit or
+  guard-page e2e as the cheapest disconfirm. Surfacing the already-decoded
+  W bit on the live FB leaf is the smallest guest e2e step: no new walker,
+  no policy gate, reporting-only baseline first.
+- **Alternatives:** Multi-probe (FB + low-RAM) audit in the same commit
+  (rejected: doubles serial-shape churn and QEMU analysis for one cycle;
+  single-probe W first keeps risk 1 visibly open); enforce `w=1` policy now
+  (rejected: baseline unknown pre-measurement -- this slice proves `w=1`
+  on the FB, so a premature gate had no measured basis); separate `WBIT`
+  line + script hard-require (rejected: scope growth -- same `ok` bit
+  already gates, one appended field is zero e2e churn).
+- **Expected:** default 86 (unchanged, updated test); kernel 55; boot-uefi 13
+  (updated PERMAUDIT-line); fmt clean; clippy host + UEFI exit 0;
+  `boot-uefi.ps1` PASS with `PERMAUDIT ok=1 ... w=1`; smoke PASS.
+- **Measured (2026-09-26, Win11):** default 86/86 (21+55+4+4+2);
+  kernel 55/55; boot-uefi 13/13 (updated `write_permaudit_line_embeds_*`);
+  `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings`
+  exit 0; `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -- -D warnings` exit 0; `boot-uefi.ps1` UEFI BOOT PASS exit 0 (guest
+  76800 bytes, serial 790 bytes = 786 + 4 for ` w=1`: marker FOUND,
+  `BOOTINFO valid=1 regions=98 usable=0xce87000`,
+  `FB present=1 base=0x80000000 1280x800 pitch=5120 bpp=32`,
+  `MEMMAP ok=1 entries=98/98 truncated=0 map_size=4704 desc_size=48`,
+  `GOP/EBS/KERNEL ok=1`, `FRAMEALLOC ok=1 free=52871 spans=8 faults=3
+  stitch=5`, `PAGING ok=1 cr3=0xf801000 phys=0x80000000`,
+  `PERM ok=1 passed=9/9`,
+  `PERMAUDIT ok=1 phys=0x80000000 user=0 nx=0 w=1`, `EXC ok=1 vector=0`;
+  Budget ok=True); `smoke.ps1 -RequireOvmf` SMOKE PASS. Baseline extended:
+  OVMF marks the FB identity map supervisor (`user=0`), executable (`nx=0`),
+  writable (`w=1`). Note: `free=52871`/`usable=0xce87000` vs slice-15
+  `52872`/`0xce88000` is 1-page OVMF map variance (guest +512 B within the
+  same 19-page image size; regions/map_size/desc_size stable), not a
+  regression signal.
+- **Final:** W-bit now proven end-to-end (host exact-line + QEMU `w=1`
+  reporting); REVIEW #147 risk 2 closed as reporting (enforcement policy
+  still open). Remaining: #147 risks 1 (single-probe), 4 (gate
+  brittleness); #139 note 1 (Reserved/MBZ). Next: multi-probe audit or
+  guard-page e2e. #6 stays active.

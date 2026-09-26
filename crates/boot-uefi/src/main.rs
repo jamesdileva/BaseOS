@@ -694,19 +694,21 @@ fn write_perm_line<E>(
 }
 
 /// Emit the one-line `PERMAUDIT` diagnostic after the `PERM` line:
-/// `PERMAUDIT ok=<0|1> phys=<0x...> user=<0|1> nx=<0|1>` — live-table
+/// `PERMAUDIT ok=<0|1> phys=<0x...> user=<0|1> nx=<0|1> w=<0|1>` — live-table
 /// counterpart to the synthetic `PERM` matrix: `ok` is 1 only when
 /// [`walk_full_leaf_flags`] resolved the same probe address the `PAGING`
 /// line used; `phys` is the walked address (or `STRUCTURAL_FAIL`); `user`
-/// / `nx` are the decoded leaf `USER` / `NO_EXEC` bits (0 on failure).
-/// Reporting-only this slice (no policy gate): the first job is to baseline
-/// firmware USER/NX values on OVMF before any enforcement slice decides
-/// what must fail. Hard-required by `boot-uefi.ps1` (`PERMAUDIT ok=1`).
+/// / `nx` / `w` are the decoded leaf `USER` / `NO_EXEC` / `WRITABLE` bits
+/// (0 on failure). Reporting-only this slice (no policy gate): the first
+/// job is to baseline firmware USER/NX/W values on OVMF before any
+/// enforcement slice decides what must fail. Hard-required by
+/// `boot-uefi.ps1` (`PERMAUDIT ok=1` substring; appended `w=` keeps it green).
 fn write_permaudit_line<E>(
     ok: bool,
     phys: u64,
     user: bool,
     nx: bool,
+    w: bool,
     emit: &mut impl FnMut(u8) -> Result<(), E>,
 ) -> Result<(), E> {
     write_str(emit, "PERMAUDIT ok=")?;
@@ -717,6 +719,8 @@ fn write_permaudit_line<E>(
     write_u64_dec(emit, u64::from(user))?;
     write_str(emit, " nx=")?;
     write_u64_dec(emit, u64::from(nx))?;
+    write_str(emit, " w=")?;
+    write_u64_dec(emit, u64::from(w))?;
     write_str(emit, "\n")
 }
 
@@ -725,13 +729,14 @@ fn write_permaudit_line<E>(
 /// else low `0x1000`) through [`walk_full_leaf_flags`] with the identity-map
 /// lookup.
 ///
-/// Returns `(ok, phys_or_sentinel, user, nx)`: `user` / `nx` are the leaf
-/// `USER` / `NO_EXEC` bits, false when the walk failed. Never panics.
+/// Returns `(ok, phys_or_sentinel, user, nx, w)`: `user` / `nx` / `w` are
+/// the leaf `USER` / `NO_EXEC` / `WRITABLE` bits, false when the walk
+/// failed. Never panics.
 ///
 /// # Safety
 /// Post-EBS only, on the boot thread: reads firmware page tables through
 /// [`phys_to_table_ptr`] (identity-mapped).
-unsafe fn probe_live_flags(info: &BootInfo) -> (bool, u64, bool, bool) {
+unsafe fn probe_live_flags(info: &BootInfo) -> (bool, u64, bool, bool, bool) {
     let cr3 = read_cr3();
     let probe_virt = info.framebuffer_opt().map(|fb| fb.base).unwrap_or(0x1000);
     match walk_full_leaf_flags(cr3_decode(cr3), probe_virt, |base| {
@@ -742,8 +747,9 @@ unsafe fn probe_live_flags(info: &BootInfo) -> (bool, u64, bool, bool) {
             phys,
             flags.contains(baseos_kernel::page_table::PageFlags::USER),
             flags.contains(baseos_kernel::page_table::PageFlags::NO_EXEC),
+            flags.contains(baseos_kernel::page_table::PageFlags::WRITABLE),
         ),
-        Err(_) => (false, STRUCTURAL_FAIL as u64, false, false),
+        Err(_) => (false, STRUCTURAL_FAIL as u64, false, false, false),
     }
 }
 
@@ -805,9 +811,9 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             write_perm_line::<Infallible>(perm_ok, perm_passed, perm_total, &mut emit).unwrap();
             // S04 slice 15: live leaf USER/NX audit of the PAGING probe
             // address — reporting-only baseline before any enforcement.
-            let (audit_ok, audit_phys, audit_user, audit_nx) = probe_live_flags(&info);
+            let (audit_ok, audit_phys, audit_user, audit_nx, audit_w) = probe_live_flags(&info);
             write_permaudit_line::<Infallible>(
-                audit_ok, audit_phys, audit_user, audit_nx, &mut emit,
+                audit_ok, audit_phys, audit_user, audit_nx, audit_w, &mut emit,
             )
             .unwrap();
             baseos_kernel::bring_up_cpu_and_prove_exception();
@@ -1127,8 +1133,9 @@ mod tests {
         assert_eq!(line, "PERM ok=0 passed=8/9\n");
     }
 
-    /// S04 slice 15: `PERMAUDIT` line shape — live leaf flags, reporting-only;
-    /// e2e hard-require substring (`PERMAUDIT ok=1`) is byte-identical.
+    /// S04 slice 15/18: `PERMAUDIT` line shape — live leaf flags, reporting-only;
+    /// e2e hard-require substring (`PERMAUDIT ok=1`) is byte-identical
+    /// (slice 18 appends `w=`; prefix unchanged).
     #[test]
     fn write_permaudit_line_embeds_phys_user_nx() {
         let mut text = Vec::new();
@@ -1137,6 +1144,7 @@ mod tests {
             0x8000_0000,
             false,
             true,
+            true,
             &mut |b| {
                 text.push(b);
                 Ok(())
@@ -1144,7 +1152,7 @@ mod tests {
         )
         .unwrap();
         let line = core::str::from_utf8(&text).unwrap();
-        assert_eq!(line, "PERMAUDIT ok=1 phys=0x80000000 user=0 nx=1\n");
+        assert_eq!(line, "PERMAUDIT ok=1 phys=0x80000000 user=0 nx=1 w=1\n");
         assert!(line.contains("PERMAUDIT ok=1"));
 
         let mut text = Vec::new();
@@ -1153,6 +1161,7 @@ mod tests {
             STRUCTURAL_FAIL as u64,
             false,
             false,
+            false,
             &mut |b| {
                 text.push(b);
                 Ok(())
@@ -1160,7 +1169,10 @@ mod tests {
         )
         .unwrap();
         let line = core::str::from_utf8(&text).unwrap();
-        assert_eq!(line, "PERMAUDIT ok=0 phys=0xffffffffffffffff user=0 nx=0\n");
+        assert_eq!(
+            line,
+            "PERMAUDIT ok=0 phys=0xffffffffffffffff user=0 nx=0 w=0\n"
+        );
     }
 
     /// agent-b #5 nit, GOP half: structural GOP failures (null protocol,
