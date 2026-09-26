@@ -1909,5 +1909,50 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** REVIEW #139 note 2 closed (all four levels now pinned for
   `walk_step`-on-`PS` -> `NotPresent`). Remaining: #139 notes 1/3/4
   (Reserved variant diagnostics, reserved/MBZ bits, guest `CR3`
-  bounds/OOM + e2e/QEMU). Next: guest `CR3` read + identity
-  `phys_to_table_ptr` bounds/OOM wiring. #6 stays active.
+   bounds/OOM + e2e/QEMU). Next: guest `CR3` read + identity
+   `phys_to_table_ptr` bounds/OOM wiring. #6 stays active.
+
+## S04 slice 13 -- guest CR3 read + BootInfo-bounded phys_to_table_ptr + PAGING e2e (2026-09-26)
+
+- **Decision:** First guest-touching S04 slice: (a) `kernel/page_table.rs`:
+  new pure `table_base_in_boot_map(&BootInfo, phys)` (aligned + non-zero +
+  no-overflow + whole 4 KiB frame inside one `BootInfo` region, any kind)
+  plus `table_base_in_boot_map_bounds_gate` test (in-map usable/firmware
+  pass; zero/misaligned/outside/straddle/wrap/corrupt-handoff fail closed);
+  (b) `boot-uefi/main.rs`: `read_cr3` (`mov {}, cr3`), `phys_to_table_ptr`
+  (bounds gate -> `None` -> `MissingTable`, else identity-map deref),
+  `probe_paging` (post-EBS: `CR3` + `walk_full` over framebuffer base or
+  low `0x1000`, sentinel `STRUCTURAL_FAIL` phys on failure) emitting
+  `PAGING ok=<0|1> cr3=0x... phys=0x...` after `FRAMEALLOC`, plus exact-line
+  `write_paging_line_embeds_cr3_and_phys` host test; (c) `boot-uefi.ps1`
+  hard-requires `PAGING ok=1` (missing = FAIL).
+- **Why:** REVIEW #141 accepted slice 12 and agreed next is guest `CR3`
+  read + `phys_to_table_ptr` bounds/OOM; OVMF identity-maps RAM with
+  large pages, so the slice-10 `PS`-leaf rule gets its first live-table
+  proof here (FB probe resolves through a firmware large-page leaf).
+- **Alternatives:** Bounds-check against usable-only regions (rejected:
+  firmware tables live in reserved/firmware regions — any-kind containment
+  admits the real PML4); probe low RAM only (rejected: FB base exercises
+  the large-page path the guest slice exists to prove; `0x1000` stays the
+  no-FB fallback).
+- **Expected:** default 82 (81 + 1); kernel 51 (50 + 1); boot-uefi 11
+  (10 + 1); fmt clean; clippy host + UEFI clean; `boot-uefi.ps1` PASS
+  with `PAGING ok=1`.
+- **Measured (2026-09-26, Win11):** default 82/82 (21+51+4+4+2);
+  kernel 51/51 (1 new bounds-gate); boot-uefi 11/11 (1 new PAGING-line);
+  `cargo fmt --check` clean (after auto-format); `cargo clippy
+  --all-targets -- -D warnings` clean (one `identity_op` fix in the new
+  test); `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -- -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial
+  722 bytes: marker FOUND, `BOOTINFO valid=1 regions=98`,
+  `FB present=1 base=0x80000000`, `MEMMAP ok=1 entries=98/98 truncated=0
+  map_size=4704 desc_size=48`, `GOP/EBS/KERNEL ok=1`, `FRAMEALLOC ok=1
+  free=52874 spans=8 faults=3 stitch=5`, `PAGING ok=1 cr3=0xf801000
+  phys=0x80000000` (FB identity map resolved; live PML4 admitted by the
+  bounds gate), `EXC ok=1 vector=0`; guest `bootx64.efi` 65536 bytes.
+  Note: `free=52874` vs S03 slice-17 `52875` is 1-page OVMF map variance
+  (regions 98, same as recent boots), not a regression signal.
+- **Final:** Live-`CR3` walk proven end-to-end with fail-closed bounds
+  (`MissingTable`) + `PAGING` hard gate. Remaining: #139 notes 1/3
+  (Reserved-variant diagnostics, reserved/MBZ policy). Next: kernel vs
+  user mapping foundations / permission-fault e2e. #6 stays active.

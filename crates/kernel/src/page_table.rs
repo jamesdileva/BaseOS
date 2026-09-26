@@ -25,6 +25,8 @@
 //!
 //! `no_std`-clean (`core` only).
 
+use baseos_boot_info::BootInfo;
+
 /// Page shift for 4 KiB pages.
 pub const PAGE_SHIFT: u32 = 12;
 /// Page size in bytes.
@@ -568,6 +570,29 @@ pub fn walk_step(table: &[u64; 512], virt: u64, level: u8) -> Result<u64, Walker
         return Err(WalkerError::NotPresent);
     }
     Ok(pte_decoded_phys(pte))
+}
+
+/// Guest `phys_to_table_ptr` bounds gate (S04 slice 13): true only when
+/// `phys` is a 4 KiB-aligned, non-zero base whose whole 4 KiB table frame
+/// lies inside one [`BootInfo`] region (any kind — firmware page tables may
+/// live in reserved/firmware regions, not just usable ones).
+///
+/// Pure / `no_std`-clean so both host tests and the guest lookup share it:
+/// the guest maps `false` to `None` -> [`WalkerError::MissingTable`]
+/// (out-of-bounds / OOM), distinct from cleared-`PRESENT`
+/// ([`WalkerError::NotPresent`]). `memory_map()` is empty on an invalid
+/// header, so a corrupt handoff fails closed here too.
+#[must_use]
+pub fn table_base_in_boot_map(info: &BootInfo, phys: u64) -> bool {
+    if phys == 0 || phys & PAGE_OFFSET_MASK != 0 {
+        return false;
+    }
+    let Some(end) = phys.checked_add(PAGE_SIZE) else {
+        return false;
+    };
+    info.memory_map()
+        .iter()
+        .any(|r| r.page_count > 0 && phys >= r.start && end <= r.end())
 }
 
 /// Full 4-level walk from a `CR3` base through a next-table lookup.
@@ -1284,6 +1309,28 @@ mod tests {
             walk_full(pml4_base, virt_1g, lookup_bad),
             Err(WalkerError::NotPresent)
         );
+    }
+
+    #[test]
+    fn table_base_in_boot_map_bounds_gate() {
+        use baseos_boot_info::{BootInfo, MemoryKind, MemoryRegion};
+        let mut info = BootInfo::new();
+        assert!(info.push_region(MemoryRegion::new(0x1000, 4, MemoryKind::Usable)));
+        assert!(info.push_region(MemoryRegion::new(0x8000_0000, 256, MemoryKind::Firmware)));
+        // Aligned bases fully inside a region pass (any kind).
+        assert!(table_base_in_boot_map(&info, 0x1000));
+        assert!(table_base_in_boot_map(&info, 0x8000_0000));
+        // Zero / misaligned / outside / straddling fail closed.
+        assert!(!table_base_in_boot_map(&info, 0));
+        assert!(!table_base_in_boot_map(&info, 0x1001));
+        assert!(!table_base_in_boot_map(&info, 0x5000));
+        assert!(!table_base_in_boot_map(&info, 0x0FFF_0000));
+        // Wrap-around addition fails closed instead of landing in-map.
+        assert!(!table_base_in_boot_map(&info, u64::MAX - PAGE_OFFSET_MASK));
+        // Corrupt handoff (invalid magic) has an empty map -> false.
+        let mut bad = BootInfo::new();
+        bad.magic = 0xDEAD;
+        assert!(!table_base_in_boot_map(&bad, 0x1000));
     }
 
     #[test]

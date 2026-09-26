@@ -16,7 +16,7 @@
 //! and enters the kernel. `tools/qemu/boot-uefi.ps1` builds this for
 //! `x86_64-unknown-uefi`, boots OVMF, and asserts the marker plus the
 //! `BOOTINFO valid=1`, `MEMMAP ok=1`, `FB present=1`, `GOP ok=1`,
-//! `EBS ok=1`, `KERNEL ok=1`, `FRAMEALLOC ok=1`, and `EXC ok=1 vector=0`
+//! `EBS ok=1`, `KERNEL ok=1`, `FRAMEALLOC ok=1`, `PAGING ok=1`, and `EXC ok=1 vector=0`
 //! summary lines in the serial capture. The `MEMMAP` line also carries
 //! `map_size`/`desc_size` for the 16 KiB + 4 KiB budget baseline (#59a).
 
@@ -33,6 +33,7 @@
 
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
 use baseos_kernel::kernel_entry;
+use baseos_kernel::page_table::{cr3_decode, table_base_in_boot_map, walk_full};
 use baseos_serial_marker::write_marker;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -596,6 +597,77 @@ fn write_ebs_line(ok: bool, status: usize) {
     let _ = write_str(&mut emit, "\n");
 }
 
+/// Read the live `CR3` (PML4 base + flags) on the boot CPU.
+///
+/// # Safety
+/// Pure register read; valid on x86-64 at any privilege level.
+unsafe fn read_cr3() -> u64 {
+    let value: u64;
+    asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags));
+    value
+}
+
+/// Map a physical table base to the next `&[u64; 512]` via the OVMF
+/// identity map (firmware identity-maps RAM, so phys == virt here).
+///
+/// Fail-closed (`None` -> `walk_full` [`MissingTable`](baseos_kernel::page_table::WalkerError::MissingTable)):
+/// misaligned / zero / outside every [`BootInfo`] region (OOM) via
+/// [`table_base_in_boot_map`]. Callers must only pass bases produced by
+/// the walker, never attacker-controlled values.
+///
+/// # Safety
+/// `phys` must be a live firmware page-table frame (bounds-checked above);
+/// the returned reference borrows firmware-owned memory for the call only.
+unsafe fn phys_to_table_ptr(info: &BootInfo, phys: u64) -> Option<&[u64; 512]> {
+    if !table_base_in_boot_map(info, phys) {
+        return None;
+    }
+    Some(&*(phys as *const [u64; 512]))
+}
+
+/// Emit the one-line `PAGING` diagnostic after the frame-allocator proof:
+/// `PAGING ok=<0|1> cr3=0x... phys=0x...` — `ok` is 1 only when a full
+/// [`walk_full`] from the live `CR3` resolved the probe address; `phys` is
+/// the resolved physical address, or `0xffffffffffffffff`
+/// ([`STRUCTURAL_FAIL`]) when the walk failed so serial never shows a
+/// bare `phys=0x0` success/failure ambiguity.
+fn write_paging_line<E>(
+    ok: bool,
+    cr3: u64,
+    phys: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "PAGING ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " cr3=")?;
+    write_u64_hex(emit, cr3)?;
+    write_str(emit, " phys=")?;
+    write_u64_hex(emit, phys)?;
+    write_str(emit, "\n")
+}
+
+/// Probe live paging post-`ExitBootServices`: read `CR3`, resolve one
+/// known-mapped address (framebuffer base when GOP filled it, else low
+/// `0x1000`) through [`walk_full`] with the identity-map lookup.
+///
+/// Returns `(ok, cr3, phys_or_sentinel)`: `phys` is the walked address on
+/// success, [`STRUCTURAL_FAIL`] as `u64` on failure. Never panics.
+///
+/// # Safety
+/// Post-EBS only, on the boot thread: reads `CR3` and dereferences
+/// firmware page tables through [`phys_to_table_ptr`] (identity-mapped).
+unsafe fn probe_paging(info: &BootInfo) -> (bool, u64, u64) {
+    let cr3 = read_cr3();
+    let probe_virt = info.framebuffer_opt().map(|fb| fb.base).unwrap_or(0x1000);
+    let ok_phys = walk_full(cr3_decode(cr3), probe_virt, |base| {
+        phys_to_table_ptr(info, base)
+    });
+    match ok_phys {
+        Ok(phys) => (true, cr3, phys),
+        Err(_) => (false, cr3, STRUCTURAL_FAIL as u64),
+    }
+}
+
 /// UEFI entry point: marker, memory-map + framebuffer fill, summary,
 /// `ExitBootServices`, kernel handoff + CPU bring-up, park.
 ///
@@ -642,6 +714,11 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // (`FRAMEALLOC ok=1` hard-required by boot-uefi.ps1) before
             // the GDT/IDT/#DE bring-up parks the guest.
             baseos_kernel::frame_alloc::frame_alloc_stress::<Infallible>(&info, &mut emit).unwrap();
+            // S04 slice 13: post-EBS live-paging proof — read CR3, walk the
+            // framebuffer (or low RAM) through the identity map, emit the
+            // PAGING line (hard-required by boot-uefi.ps1) before bring-up.
+            let (paging_ok, paging_cr3, paging_phys) = probe_paging(&info);
+            write_paging_line::<Infallible>(paging_ok, paging_cr3, paging_phys, &mut emit).unwrap();
             baseos_kernel::bring_up_cpu_and_prove_exception();
         }
         // EBS failed: still own boot services — park fail-loud (e2e sees
@@ -903,6 +980,36 @@ mod tests {
             line,
             "MEMMAP ok=1 status=0x0 entries=2/3 truncated=1 map_size=144 desc_size=48\n"
         );
+    }
+
+    /// S04 slice 13: `PAGING` line shape — ok carries the walked phys,
+    /// failure carries the sentinel (never a bare `phys=0x0` ambiguity),
+    /// and the e2e hard-require substring (`PAGING ok=1`) is byte-identical.
+    #[test]
+    fn write_paging_line_embeds_cr3_and_phys() {
+        let mut text = Vec::new();
+        write_paging_line::<core::convert::Infallible>(true, 0x1000, 0x8000_0000, &mut |b| {
+            text.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(line, "PAGING ok=1 cr3=0x1000 phys=0x80000000\n");
+        assert!(line.contains("PAGING ok=1"));
+
+        let mut text = Vec::new();
+        write_paging_line::<core::convert::Infallible>(
+            false,
+            0x1000,
+            STRUCTURAL_FAIL as u64,
+            &mut |b| {
+                text.push(b);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(line, "PAGING ok=0 cr3=0x1000 phys=0xffffffffffffffff\n");
     }
 
     /// agent-b #5 nit, GOP half: structural GOP failures (null protocol,

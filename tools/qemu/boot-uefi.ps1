@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S03 slice 7: #6 refresh >16KiB fail-closed + budget value e2e) ==="
+Write-Output "=== BaseOS UEFI guest boot (S04 slice 13: live CR3 paging probe + PAGING e2e) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -147,6 +147,7 @@ if ($serialText -and $serialText.Contains($marker)) {
   $ebs = "EBS ok=1"
   $kernel = "KERNEL ok=1"
   $framealloc = "FRAMEALLOC ok=1"
+  $paging = "PAGING ok=1"
   $exc = "EXC ok=1 vector=0"
   # #59a value check (agent-b REVIEW #75 finding 1): presence of the
   # substrings alone would let map_size=999999999 or map_size=abc PASS.
@@ -180,10 +181,11 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasEbs = $serialText.Contains($ebs)
   $hasKernel = $serialText.Contains($kernel)
   $hasFramealloc = $serialText.Contains($framealloc)
+  $hasPaging = $serialText.Contains($paging)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasExc) {
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasExc) {
     Write-Output ("Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $mapsize + $descsize + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -194,6 +196,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "FB present=1 present=$hasFb, GOP ok=1 present=$hasGop, " +
       "EBS ok=1 present=$hasEbs, KERNEL ok=1 present=$hasKernel, " +
       "FRAMEALLOC ok=1 present=$hasFramealloc, " +
+      "PAGING ok=1 present=$hasPaging, " +
       "EXC ok=1 vector=0 present=$hasExc; " +
       "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/frame-alloc/#DE path failed " +
       "-- see serial log)")
