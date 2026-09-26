@@ -670,6 +670,53 @@ where
     Ok(base + (virt & PAGE_OFFSET_MASK))
 }
 
+/// Synthetic permission-fault self-test for the guest `PERM` e2e line.
+///
+/// Builds a fixed 5-entry [`PageTable`] (kernel RO at `0x1000`, kernel RW
+/// at `0x2000`, user RW at `0x3000`, user NX at `0x4000`, guard at
+/// `0x5000`) and runs 9 [`classify_access`] probes covering the S04
+/// verification kinds: read/write/execute, user-vs-supervisor, guard,
+/// unmapped, and non-canonical. Pure / `no_std`-clean so host tests and
+/// the post-EBS guest share it; the guest maps `ok` to `PERM ok=1`
+/// (hard-required by `boot-uefi.ps1`). Returns `(ok, passed, total)`.
+#[must_use]
+pub fn perm_selftest() -> (bool, u32, u32) {
+    let mut pt = PageTable::new();
+    let k_ro = PageFlags::PRESENT;
+    let k_rw = PageFlags::PRESENT.union(PageFlags::WRITABLE);
+    let u_rw = k_rw.union(PageFlags::USER);
+    let u_nx = PageFlags::PRESENT
+        .union(PageFlags::USER)
+        .union(PageFlags::NO_EXEC);
+    let guard = PageFlags::PRESENT.union(PageFlags::GUARD);
+    // Fixed map; `map` cannot fail here (aligned, distinct, PRESENT/GUARD).
+    let _ = pt.map(0x1000, 0xA000, k_ro);
+    let _ = pt.map(0x2000, 0xB000, k_rw);
+    let _ = pt.map(0x3000, 0xC000, u_rw);
+    let _ = pt.map(0x4000, 0xD000, u_nx);
+    let _ = pt.map(0x5000, 0xE000, guard);
+    let cases: [(u64, AccessKind, bool, bool); 9] = [
+        // (virt, kind, is_user, expect_ok)
+        (0x1000, AccessKind::Read, false, true), // kernel RO supervisor read
+        (0x1000, AccessKind::Write, false, false), // kernel RO supervisor write
+        (0x2000, AccessKind::Read, true, false), // kernel RW user read
+        (0x3000, AccessKind::Write, true, true), // user RW user write
+        (0x3000, AccessKind::Write, false, true), // supervisor may access user
+        (0x4000, AccessKind::Execute, true, false), // user NX fetch
+        (0x5000, AccessKind::Read, false, false), // guard faults
+        (0x6000, AccessKind::Read, false, false), // unmapped
+        (0x8000_0000_0000, AccessKind::Read, false, false), // non-canonical
+    ];
+    let mut passed: u32 = 0;
+    for (virt, kind, is_user, expect_ok) in cases {
+        if classify_access(&pt, virt, kind, is_user).is_ok() == expect_ok {
+            passed += 1;
+        }
+    }
+    let total = cases.len() as u32;
+    (passed == total, passed, total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1354,5 +1401,12 @@ mod tests {
             pt.unmap(0x1000 + i * PAGE_SIZE).unwrap();
         }
         assert!(pt.is_empty());
+    }
+
+    #[test]
+    fn perm_selftest_all_nine_probes_pass() {
+        let (ok, passed, total) = perm_selftest();
+        assert_eq!((passed, total), (9, 9));
+        assert!(ok);
     }
 }

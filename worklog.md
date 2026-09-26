@@ -1956,3 +1956,46 @@ Format per entry (per `implementation-guide.md` §31):
   (`MissingTable`) + `PAGING` hard gate. Remaining: #139 notes 1/3
   (Reserved-variant diagnostics, reserved/MBZ policy). Next: kernel vs
   user mapping foundations / permission-fault e2e. #6 stays active.
+
+## S04 slice 14 -- synthetic permission-fault matrix + PERM e2e (2026-09-26)
+
+- **Decision:** Second guest-touching S04 slice: (a) `kernel/page_table.rs`:
+  new pure `perm_selftest() -> (ok, passed, total)` building a fixed 5-entry
+  table (kernel RO `0x1000`, kernel RW `0x2000`, user RW `0x3000`, user NX
+  `0x4000`, guard `0x5000`) and running 9 `classify_access` probes (RO-write,
+  user-on-kernel, supervisor-on-user, NX-fetch, guard, unmapped,
+  non-canonical) plus `perm_selftest_all_nine_probes_pass` test;
+  (b) `boot-uefi/main.rs`: `write_perm_line` (`PERM ok=<0|1> passed=<n>/<m>`)
+  plus `write_perm_line_embeds_passed_total` test, emitted post-EBS after
+  `PAGING` before bring-up (pure software model, no live-table mutation);
+  (c) `boot-uefi.ps1` hard-requires `PERM ok=1` (missing = FAIL).
+- **Why:** REVIEW #143 accepted slice 13 and agreed next is kernel-vs-user /
+  permission-fault e2e; the software `check`/`classify` matrix had host tests
+  but no guest proof, and live PTE USER/NX auditing needs the reserved/MBZ
+  mode pin (#139 note 1/3, still open) — a deterministic synthetic matrix is
+  the smallest end-to-end permission gate before touching live flags.
+- **Alternatives:** Live leaf-PTE USER/NX decode on the FB probe (rejected:
+  needs NX-mode + reserved-bit policy pinned first; synthetic matrix proves
+  the enforcement contract without it); fault-injection via real #PF handler
+  (rejected: IDT fault path is S02-controlled-#DE only, far larger slice).
+- **Expected:** default 83 (82 + 1); kernel 52 (51 + 1); boot-uefi 12
+  (11 + 1); fmt clean; clippy host + UEFI clean; `boot-uefi.ps1` PASS
+  with `PAGING ok=1` + `PERM ok=1`.
+- **Measured (2026-09-26, Win11):** default 83/83 (21+52+4+4+2);
+  kernel 52/52 (1 new perm-selftest); boot-uefi 12/12 (1 new PERM-line);
+  `cargo fmt --check` clean (after auto-format of a collapsed test line);
+  `cargo clippy --all-targets -- -D warnings` clean;
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings`
+  clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 743 bytes:
+  `BOOTINFO valid=1 regions=98 usable=0xce88000`,
+  `FB present=1 base=0x80000000`, `MEMMAP ok=1 entries=98/98 truncated=0
+  map_size=4704 desc_size=48`, `GOP/EBS/KERNEL ok=1`, `FRAMEALLOC ok=1
+  free=52872 spans=8 faults=3 stitch=5`, `PAGING ok=1 cr3=0xf801000
+  phys=0x80000000`, `PERM ok=1 passed=9/9`, `EXC ok=1 vector=0`;
+  guest `bootx64.efi` 74240 bytes. Note: `free=52872` vs slice-13 `52874`
+  is OVMF/image-size variance (guest grew with the PERM wiring; regions 98
+  stable), not a regression signal.
+- **Final:** Permission-fault matrix proven end-to-end with `PERM` hard gate.
+  Remaining: #139 notes 1/3 (Reserved-variant diagnostics, reserved/MBZ
+  policy incl. live USER/NX audit). Next: live permission-bit audit or
+  guard-page e2e. #6 stays active.

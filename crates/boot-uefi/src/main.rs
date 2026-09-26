@@ -16,7 +16,7 @@
 //! and enters the kernel. `tools/qemu/boot-uefi.ps1` builds this for
 //! `x86_64-unknown-uefi`, boots OVMF, and asserts the marker plus the
 //! `BOOTINFO valid=1`, `MEMMAP ok=1`, `FB present=1`, `GOP ok=1`,
-//! `EBS ok=1`, `KERNEL ok=1`, `FRAMEALLOC ok=1`, `PAGING ok=1`, and `EXC ok=1 vector=0`
+//! `EBS ok=1`, `KERNEL ok=1`, `FRAMEALLOC ok=1`, `PAGING ok=1`, `PERM ok=1`,
 //! summary lines in the serial capture. The `MEMMAP` line also carries
 //! `map_size`/`desc_size` for the 16 KiB + 4 KiB budget baseline (#59a).
 
@@ -33,7 +33,7 @@
 
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
 use baseos_kernel::kernel_entry;
-use baseos_kernel::page_table::{cr3_decode, table_base_in_boot_map, walk_full};
+use baseos_kernel::page_table::{cr3_decode, perm_selftest, table_base_in_boot_map, walk_full};
 use baseos_serial_marker::write_marker;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -668,6 +668,28 @@ unsafe fn probe_paging(info: &BootInfo) -> (bool, u64, u64) {
     }
 }
 
+/// Emit the one-line `PERM` diagnostic after the `PAGING` line:
+/// `PERM ok=<0|1> passed=<n>/<total>` — `ok` is 1 only when the synthetic
+/// [`perm_selftest`] permission matrix (kernel RO/RW, user RW/NX, guard,
+/// unmapped, non-canonical) passes all 9 probes. Pure software model, no
+/// live-table mutation, so it runs deterministically post-EBS on any
+/// firmware map; the live-table USER/NX-bit audit rides with a later
+/// guest-hardening slice (reserved/MBZ open, #139 note 1).
+fn write_perm_line<E>(
+    ok: bool,
+    passed: u32,
+    total: u32,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "PERM ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " passed=")?;
+    write_u64_dec(emit, u64::from(passed))?;
+    write_str(emit, "/")?;
+    write_u64_dec(emit, u64::from(total))?;
+    write_str(emit, "\n")
+}
+
 /// UEFI entry point: marker, memory-map + framebuffer fill, summary,
 /// `ExitBootServices`, kernel handoff + CPU bring-up, park.
 ///
@@ -719,6 +741,11 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // PAGING line (hard-required by boot-uefi.ps1) before bring-up.
             let (paging_ok, paging_cr3, paging_phys) = probe_paging(&info);
             write_paging_line::<Infallible>(paging_ok, paging_cr3, paging_phys, &mut emit).unwrap();
+            // S04 slice 14: synthetic permission-fault matrix (kernel/user,
+            // guard, NX, canonical) — deterministic post-EBS proof with a
+            // hard-required PERM line before bring-up.
+            let (perm_ok, perm_passed, perm_total) = perm_selftest();
+            write_perm_line::<Infallible>(perm_ok, perm_passed, perm_total, &mut emit).unwrap();
             baseos_kernel::bring_up_cpu_and_prove_exception();
         }
         // EBS failed: still own boot services — park fail-loud (e2e sees
@@ -1010,6 +1037,30 @@ mod tests {
         .unwrap();
         let line = core::str::from_utf8(&text).unwrap();
         assert_eq!(line, "PAGING ok=0 cr3=0x1000 phys=0xffffffffffffffff\n");
+    }
+
+    /// S04 slice 14: `PERM` line shape — ok carries passed/total, and the
+    /// e2e hard-require substring (`PERM ok=1`) is byte-identical.
+    #[test]
+    fn write_perm_line_embeds_passed_total() {
+        let mut text = Vec::new();
+        write_perm_line::<core::convert::Infallible>(true, 9, 9, &mut |b| {
+            text.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(line, "PERM ok=1 passed=9/9\n");
+        assert!(line.contains("PERM ok=1"));
+
+        let mut text = Vec::new();
+        write_perm_line::<core::convert::Infallible>(false, 8, 9, &mut |b| {
+            text.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(line, "PERM ok=0 passed=8/9\n");
     }
 
     /// agent-b #5 nit, GOP half: structural GOP failures (null protocol,
