@@ -1730,3 +1730,41 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** REVIEW #130 notes 1+2 closed on the current tree; note 3
   (bounds/OOM vs NotPresent) plus reserved-bit policy plus guest CR3
   load plus e2e fault asserts stay next. #6 stays active.
+
+## S04 slice 8 -- MissingTable vs NotPresent split (REVIEW #131 risk 1 / #130 note 3) (2026-09-26)
+
+- **Decision:** Host-only error-split slice in
+  `crates/kernel/src/page_table.rs` (guest untouched, no QEMU this cycle):
+  new `WalkerError::MissingTable` for `walk_full` lookup misses
+  (`lookup(base)` returns `None`: unmapped table base, which the guest
+  `phys_to_table_ptr` maps to out-of-bounds / OOM); cleared-`PRESENT`
+  mid-level stays `NotPresent` via `walk_step`. `walk_full` docs updated;
+  `walk_full_missing_table_base_is_notpresent` renamed to
+  `walk_full_missing_table_base_is_missing_table` asserting
+  `MissingTable`, with a comment pinning the distinction against
+  `walk_full_mid_level_notpresent_propagates` (`NotPresent`).
+- **Why:** REVIEW #131 ACCEPTED slice 7 @3b93589 but flagged the
+  lookup-miss vs cleared-PRESENT conflation (both `NotPresent`) as the
+  open risk for guest fault asserts / OOM-bounds mapping; REVIEW #130
+  note 3 deferred exactly this mapping to the phys_to_table_ptr wiring.
+  Splitting host-side keeps the guest slice wiring-only (bounds/OOM ->
+  `None` -> `MissingTable`, no new error needed there). By-value generic
+  `lookup: F` kept (REVIEW #131 risk 2): existing tests move the closure
+  by value; guest closure must be `Copy`/cheap (fn pointer) -- pinned in
+  docs on the guest slice, not this one.
+- **Alternatives:** Keep conflated `NotPresent` until the guest slice
+  (rejected: reviewer named the split as the cheapest disconfirm now,
+  and e2e asserts need the distinction before wiring); split inside
+  `walk_step` too (rejected: `walk_step` takes a live table reference,
+  so a miss is impossible there -- only `walk_full` looks up).
+- **Expected:** default 79 (same count, 1 renamed); kernel 48; boot-uefi
+  10; fmt clean; clippy host + UEFI clean; no QEMU (guest untouched).
+- **Measured (2026-09-26, Win11):** default 79/79 (21+48+4+4+2);
+  kernel 48/48 (renamed missing-table test); boot-uefi 10/10;
+  `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings`
+  exit 0; `cargo clippy -p baseos-boot-uefi --target
+  x86_64-unknown-uefi -- -D warnings` exit 0. Diff is page_table.rs only
+  (guest untouched; S03 slice-17 PASS stands). QEMU not re-run.
+- **Final:** REVIEW #131 risk 1 / #130 note 3 closed on the current tree;
+  reserved-bit policy plus guest CR3 load plus e2e fault asserts stay
+  next. #6 stays active.

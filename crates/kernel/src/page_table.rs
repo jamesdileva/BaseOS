@@ -487,6 +487,12 @@ pub enum WalkerError {
     NonCanonical,
     /// Table entry not present at this level.
     NotPresent,
+    /// Next-table lookup missed: `lookup(base)` returned `None`
+    /// (unmapped table base; the guest `phys_to_table_ptr` maps this to
+    /// out-of-bounds / OOM). Distinct from cleared-`PRESENT` (`NotPresent`)
+    /// so e2e fault asserts can tell a missing table from a present-but-
+    /// empty entry (REVIEW #131 risk 1).
+    MissingTable,
     /// `level > 3` (no such paging level).
     InvalidLevel,
 }
@@ -554,7 +560,7 @@ pub fn walk_step(table: &[u64; 512], virt: u64, level: u8) -> Result<u64, Walker
 ///
 /// Fail-closed: misaligned `cr3_base` -> `MisalignedPhys`, non-canonical
 /// `virt` -> `NonCanonical` (via the first [`walk_step`]), a lookup miss
-/// (unmapped table base) -> `NotPresent`, cleared-`PRESENT` mid-level ->
+/// (unmapped table base) -> `MissingTable`, cleared-`PRESENT` mid-level ->
 /// `NotPresent`. Returns the 4 KiB page base plus `virt & PAGE_OFFSET_MASK`.
 ///
 /// Reserved / MBZ-bit policy is unchanged from [`walk_step`]: only
@@ -572,7 +578,7 @@ where
     }
     let mut base = cr3_base;
     for level in [3u8, 2, 1, 0] {
-        let table = lookup(base).ok_or(WalkerError::NotPresent)?;
+        let table = lookup(base).ok_or(WalkerError::MissingTable)?;
         base = walk_step(table, virt, level)?;
     }
     Ok(base + (virt & PAGE_OFFSET_MASK))
@@ -1038,10 +1044,10 @@ mod tests {
     }
 
     #[test]
-    fn walk_full_missing_table_base_is_notpresent() {
-        // Unknown table base (unmapped next level) is NotPresent. Kept
-        // distinct from cleared-PRESENT until phys_to_table_ptr bounds/OOM
-        // mapping is pinned in the guest-CR3 slice (REVIEW #130 note 3).
+    fn walk_full_missing_table_base_is_missing_table() {
+        // Lookup miss (unmapped table base) is MissingTable, distinct from
+        // cleared-PRESENT NotPresent: the guest phys_to_table_ptr maps this
+        // to out-of-bounds / OOM (REVIEW #131 risk 1, closes #130 note 3).
         let virt: u64 = 0x0000_1234_5678_9ABC;
         let pml4_base = 0x1000;
         let (pml4, _, _, _, _) = walk_four_levels_fixture(virt);
@@ -1054,8 +1060,10 @@ mod tests {
         };
         assert_eq!(
             walk_full(pml4_base, virt, missing),
-            Err(WalkerError::NotPresent)
+            Err(WalkerError::MissingTable)
         );
+        // And the distinction is load-bearing: cleared-PRESENT stays
+        // NotPresent (see walk_full_mid_level_notpresent_propagates).
     }
 
     #[test]
