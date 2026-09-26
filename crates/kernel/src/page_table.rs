@@ -569,6 +569,12 @@ pub fn walk_step(table: &[u64; 512], virt: u64, level: u8) -> Result<u64, Walker
 ///
 /// `lookup` is generic (`F: Fn(u64) -> Option<&[u64; 512]>`) so the guest
 /// fault path inlines instead of dynamically dispatching per level.
+///
+/// `lookup` is taken by value: pass a `Copy`/cheap callable (a `fn` pointer
+/// or a non-capturing closure, both `Copy`; existing host tests move a
+/// non-capturing closure). The guest `CR3` slice reuses this shape with its
+/// `phys_to_table_ptr` fn pointer, keeping the per-level call a direct
+/// inlined call with no dynamic dispatch (REVIEW #133 caveat 2).
 pub fn walk_full<'a, F>(cr3_base: u64, virt: u64, lookup: F) -> Result<u64, WalkerError>
 where
     F: Fn(u64) -> Option<&'a [u64; 512]>,

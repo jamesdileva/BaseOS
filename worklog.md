@@ -1768,3 +1768,38 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** REVIEW #131 risk 1 / #130 note 3 closed on the current tree;
   reserved-bit policy plus guest CR3 load plus e2e fault asserts stay
   next. #6 stays active.
+
+## S04 slice 9 -- walk_full lookup Copy/cheap doc + independent gate re-run (REVIEW #133 caveats 1+2) (2026-09-26)
+
+- **Decision:** Host-only doc slice in `crates/kernel/src/page_table.rs`
+  (guest untouched, no QEMU this cycle): `walk_full` docs now pin that
+  `lookup: F` is taken by value and callers must pass a `Copy`/cheap
+  callable (`fn` pointer or non-capturing closure; host tests already move
+  a non-capturing closure, guest `CR3` slice reuses a `phys_to_table_ptr`
+  fn pointer with no per-level dynamic dispatch). No code or test-count
+  change; independent re-run of the REVIEW #133-owed gates on the current
+  tree.
+- **Why:** REVIEW #133 ACCEPTED slice 8 @a5fcb27 but left (1) gates
+  unverified this cycle (SKIPPED -- 79/48/10 + fmt/clippy claims trusted,
+  independent re-run owed before any guest slice) and (2) by-value `F`
+  Copy/cheap doc deferred to the guest slice. Pinning the doc now keeps
+  the guest `CR3` slice wiring-only (bounds/OOM -> `None` ->
+  `MissingTable`) instead of mixing a doc contract into a guest/QEMU
+  cycle.
+- **Alternatives:** Roll the doc into the guest `CR3` slice (rejected:
+  mixes a zero-risk doc pin into a guest-touching QEMU cycle); add a
+  `F: Copy` bound now (rejected: needlessly rejects capturing closures on
+  the host path -- doc pins the cheap-callable contract without narrowing
+  the generic).
+- **Expected:** default 79 (21+48+4+4+2); kernel 48; boot-uefi 10;
+  fmt clean; clippy host + UEFI clean; no QEMU (guest untouched).
+- **Measured (2026-09-26, Win11):** default 79/79 (21+48+4+4+2);
+  kernel 48/48; boot-uefi 10/10; `cargo fmt --check` clean;
+  `cargo clippy --all-targets -- -D warnings` exit 0;
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -- -D warnings` exit 0. Diff is page_table.rs docs + this worklog entry
+  (guest untouched; S03 slice-17 PASS stands). QEMU not re-run.
+- **Final:** REVIEW #133 caveats 1+2 closed on the current tree;
+  reserved-bit policy plus guest CR3 `phys_to_table_ptr` bounds/OOM ->
+  `None` -> `MissingTable` wiring plus e2e fault asserts stay next. #6
+  stays active.
