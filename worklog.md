@@ -1803,3 +1803,40 @@ Format per entry (per `implementation-guide.md` §31):
   reserved-bit policy plus guest CR3 `phys_to_table_ptr` bounds/OOM ->
   `None` -> `MissingTable` wiring plus e2e fault asserts stay next. #6
   stays active.
+
+## S04 slice 10 -- walk_full large-page (PS) leaves for firmware tables (2026-09-26)
+
+- **Decision:** Host-only walker slice in
+  `crates/kernel/src/page_table.rs` (guest untouched, no QEMU this cycle):
+  new `PTE_PS_BIT` (bit 7) plus 1 GiB / 2 MiB offset masks; `walk_full`
+  now reads each entry directly (same canonical -> level -> PRESENT order
+  as `walk_step`) and stops at a `PS` leaf: level 2 returns the 1 GiB base
+  plus `virt & 30-bit offset`, level 1 the 2 MiB base plus `virt & 21-bit
+  offset`; `PS` at PML4 (3) / PT (0) is reserved -> `NotPresent`.
+  `walk_step` unchanged (4 KiB steps only). One new test:
+  `walk_full_large_pages_stop_at_ps_leaf` (1 GiB happy + 2 MiB happy +
+  reserved-PS-at-PML4 fail-closed).
+- **Why:** OVMF identity-maps RAM with 1 GiB / 2 MiB pages, so the planned
+  guest `CR3` walk (read live `CR3` + identity `phys_to_table_ptr` +
+  `PAGING` serial line) would misread every firmware large-page leaf as a
+  table pointer without this stop-at-leaf rule. Pinning it host-side keeps
+  the guest slice wiring-only. Other reserved/MBZ bits stay out of scope
+  (only `PRESENT` + `PS`-at-level checked), documented on `walk_full`.
+- **Alternatives:** Guest `CR3` walk now without PS handling (rejected:
+  would fail on the first firmware large-page entry, burning a QEMU cycle
+  for a host-provable rule); full reserved-bit rejection now (rejected:
+  mode-dependent NX/PAT/MBZ combos still need the guest `CR3` mode pin).
+- **Expected:** default 80 (79 + 1); kernel 49 (48 + 1); boot-uefi 10;
+  fmt clean; clippy host + UEFI clean; no QEMU (guest untouched).
+- **Measured (2026-09-26, Win11):** default 80/80 (21+49+4+4+2);
+  kernel 49/49 (1 new large-page); boot-uefi 10/10;
+  `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings`
+  exit 0; `cargo clippy -p baseos-boot-uefi --target
+  x86_64-unknown-uefi -- -D warnings` exit 0 (one pre-commit test fix:
+  1 GiB expectation typo `0x4011_2345` -> `0x4001_2345`, caught
+  red-to-green). Diff is page_table.rs + this worklog entry (guest
+  untouched; S03 slice-17 PASS stands). QEMU not re-run.
+- **Final:** Firmware-table large-page rule landed host-green. Next:
+  guest `CR3` read + identity `phys_to_table_ptr` bounds/OOM -> `None`
+  -> `MissingTable` wiring + `PAGING` serial line + e2e assert + QEMU.
+  #6 stays active.

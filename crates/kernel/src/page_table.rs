@@ -328,6 +328,14 @@ impl Default for PageTable {
 
 /// Physical-address field of a 4 KiB PTE / `CR3`: bits 12..=51.
 pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+/// Page-size bit in a paging-structure entry (bit 7): when set at PDPT
+/// (level 2) the entry maps a 1 GiB page, at PD (level 1) a 2 MiB page.
+/// Set at PML4 (level 3) or PT (level 0) it is reserved and fails closed.
+pub const PTE_PS_BIT: u64 = 1 << 7;
+/// Offset mask within a 1 GiB large page (low 30 bits of `virt`).
+pub const LARGE_1G_OFFSET_MASK: u64 = (1 << 30) - 1;
+/// Offset mask within a 2 MiB large page (low 21 bits of `virt`).
+pub const LARGE_2M_OFFSET_MASK: u64 = (1 << 21) - 1;
 /// Hardware PTE flag bits this slice loads: PRESENT(0) / WRITABLE(1) /
 /// USER(2) / NO_EXEC(63). `GUARD` (bit 9, OS-available) is never loaded.
 pub const PTE_HW_FLAGS_MASK: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 63);
@@ -559,13 +567,19 @@ pub fn walk_step(table: &[u64; 512], virt: u64, level: u8) -> Result<u64, Walker
 /// one chaining shape.
 ///
 /// Fail-closed: misaligned `cr3_base` -> `MisalignedPhys`, non-canonical
-/// `virt` -> `NonCanonical` (via the first [`walk_step`]), a lookup miss
+/// `virt` -> `NonCanonical` (via the first step), a lookup miss
 /// (unmapped table base) -> `MissingTable`, cleared-`PRESENT` mid-level ->
-/// `NotPresent`. Returns the 4 KiB page base plus `virt & PAGE_OFFSET_MASK`.
+/// `NotPresent`. Returns the 4 KiB page base plus `virt & PAGE_OFFSET_MASK`,
+/// or the large-page base plus the in-page offset when a `PS` leaf is hit
+/// (1 GiB at level 2, 2 MiB at level 1; `PS` at level 3/0 is reserved ->
+/// `NotPresent`).
 ///
-/// Reserved / MBZ-bit policy is unchanged from [`walk_step`]: only
-/// `PRESENT` is checked; large-page (`PS`, bit 7) / `NX`-disabled combos
-/// stay out of scope until the guest `CR3` mode (PAE/NX/1 GiB) is pinned.
+/// Large-page (`PS`, bit 7) policy (S04 slice 10): firmware (OVMF) identity
+/// maps RAM with 1 GiB / 2 MiB pages, so a guest `CR3` walk must stop at a
+/// `PS` leaf instead of treating it as a table pointer. Other reserved /
+/// MBZ bits stay out of scope (only `PRESENT` + `PS`-at-level are checked;
+/// `NX`-disabled bit-63 and PAT/MBZ combos ride with the guest `CR3` mode
+/// pin, as before).
 ///
 /// `lookup` is generic (`F: Fn(u64) -> Option<&[u64; 512]>`) so the guest
 /// fault path inlines instead of dynamically dispatching per level.
@@ -585,7 +599,34 @@ where
     let mut base = cr3_base;
     for level in [3u8, 2, 1, 0] {
         let table = lookup(base).ok_or(WalkerError::MissingTable)?;
-        base = walk_step(table, virt, level)?;
+        // Read the entry directly so a `PS` large-page leaf stops the walk
+        // instead of being misread as a next-table pointer. Order matches
+        // `walk_step`: canonical -> level -> PRESENT -> PS-at-level.
+        if !is_canonical(virt) {
+            return Err(WalkerError::NonCanonical);
+        }
+        let Some(idx) = page_table_index(virt, level) else {
+            return Err(WalkerError::InvalidLevel);
+        };
+        let pte = table[idx as usize];
+        if pte & 1 == 0 {
+            return Err(WalkerError::NotPresent);
+        }
+        if pte & PTE_PS_BIT != 0 {
+            match level {
+                2 => {
+                    let leaf = pte & PTE_ADDR_MASK & !LARGE_1G_OFFSET_MASK;
+                    return Ok(leaf + (virt & LARGE_1G_OFFSET_MASK));
+                }
+                1 => {
+                    let leaf = pte & PTE_ADDR_MASK & !LARGE_2M_OFFSET_MASK;
+                    return Ok(leaf + (virt & LARGE_2M_OFFSET_MASK));
+                }
+                // PML4 (3) / PT (0) never carry PS: reserved -> fail closed.
+                _ => return Err(WalkerError::NotPresent),
+            }
+        }
+        base = pte_decoded_phys(pte);
     }
     Ok(base + (virt & PAGE_OFFSET_MASK))
 }
@@ -1108,6 +1149,69 @@ mod tests {
         assert_eq!(
             walk_full(pml4_base, 0x8000_0000_0000, lookup),
             Err(WalkerError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn walk_full_large_pages_stop_at_ps_leaf() {
+        // OVMF identity-maps RAM with 1 GiB / 2 MiB PS leaves: walk_full
+        // must stop there instead of following the leaf as a table base.
+        // virt 0x4001_2345: PML4 idx 0, PDPT idx 1 (1 GiB leaf at
+        // 0x4000_0000), low-30 offset 0x12_345.
+        let virt_1g: u64 = 0x4001_2345;
+        let pml4_base = 0x1000;
+        let mut pml4 = [0u64; 512];
+        let mut pdpt = [0u64; 512];
+        pml4[page_table_index(virt_1g, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap();
+        pdpt[page_table_index(virt_1g, 2).unwrap() as usize] =
+            encode_table_entry(0x4000_0000, K_RW).unwrap() | PTE_PS_BIT;
+        let lookup_1g = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                _ => None,
+            }
+        };
+        // Leaf base 0x4000_0000 + offset (virt & 30-bit mask) = 0x4001_2345.
+        assert_eq!(walk_full(pml4_base, virt_1g, lookup_1g), Ok(0x4001_2345));
+
+        // 2 MiB leaf at PD (level 1): virt 0x21_3456 -> PD entry with PS,
+        // leaf base 0x200_000 + low-21 offset 0x1_3456 = 0x213_456.
+        let virt_2m: u64 = 0x21_3456;
+        let mut pd = [0u64; 512];
+        let mut pdpt2 = [0u64; 512];
+        let mut pml4_2 = [0u64; 512];
+        pml4_2[page_table_index(virt_2m, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap();
+        pdpt2[page_table_index(virt_2m, 2).unwrap() as usize] =
+            encode_table_entry(0x3000, K_RW).unwrap();
+        pd[page_table_index(virt_2m, 1).unwrap() as usize] =
+            encode_table_entry(0x20_0000, K_RW).unwrap() | PTE_PS_BIT;
+        let lookup_2m = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4_2),
+                0x2000 => Some(&pdpt2),
+                0x3000 => Some(&pd),
+                _ => None,
+            }
+        };
+        assert_eq!(walk_full(pml4_base, virt_2m, lookup_2m), Ok(0x21_3456));
+
+        // PS at PML4 (3) / PT (0) is reserved -> NotPresent, not a leaf.
+        let mut pml4_bad = [0u64; 512];
+        pml4_bad[page_table_index(virt_1g, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap() | PTE_PS_BIT;
+        let lookup_bad = |base: u64| -> Option<&[u64; 512]> {
+            if base == pml4_base {
+                Some(&pml4_bad)
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            walk_full(pml4_base, virt_1g, lookup_bad),
+            Err(WalkerError::NotPresent)
         );
     }
 
