@@ -1696,3 +1696,37 @@ Format per entry (per `implementation-guide.md` §31):
   not re-run.
 - **Final:** Lookup-closure contract landed in code; reserved-bit policy plus
   guest CR3 load plus e2e fault asserts stay next. #6 stays active.
+
+## S04 slice 7 -- walk_full generic lookup + split fail-closed tests (REVIEW #130 notes 1+2) (2026-09-26)
+
+- **Decision:** Host-only hardening slice in
+  `crates/kernel/src/page_table.rs` (guest untouched, no QEMU this cycle):
+  (a) `walk_full` takes a generic `F: Fn(u64) -> Option<&[u64; 512]>`
+  instead of `&dyn Fn` (REVIEW #130 note 1 -- inlinable per level on the
+  perf-first guest fault path; same fail-closed behavior); (b) the one
+  5-assert `walk_full_chains_lookup_closure_*` test splits into happy +
+  4 failure tests (REVIEW #130 note 2) sharing a
+  `walk_four_levels_fixture` helper, so an early panic can no longer hide
+  later fail-closed cases; (c) missing-table test documents note 3 as
+  still open (lookup-miss NotPresent vs cleared-PRESENT must be
+  disambiguated by phys_to_table_ptr bounds/OOM wiring).
+- **Why:** REVIEW #130 ACCEPTED slice 6 @4e68bd7 and named exactly these
+  two non-blocking notes for the guest-CR3 slice; both are host-only and
+  keep the guest slice wiring-only.
+- **Alternatives:** Guest CR3 load + QEMU fault asserts now (rejected:
+  doubles single-cycle risk; generic + split must land first);
+  distinct `TableMissing` error now (rejected: note 3 explicitly defers
+  the mapping to phys_to_table_ptr wiring -- no new error before the
+  guest bounds contract exists).
+- **Expected:** default 79 (75 + 4); kernel 48 (44 + 4); boot-uefi 10;
+  fmt clean; clippy host + UEFI clean; no QEMU (guest untouched).
+- **Measured (2026-09-26, Win11):** default 79/79 (21+48+4+4+2);
+  kernel 48/48 (fixture + 5 walk_full tests); boot-uefi 10/10;
+  `cargo fmt --check` clean (after one auto-format of the generic
+  signature); `cargo clippy --all-targets -- -D warnings` clean;
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` clean. Diff is page_table.rs only (guest untouched;
+  S03 slice-17 PASS stands). QEMU not re-run.
+- **Final:** REVIEW #130 notes 1+2 closed on the current tree; note 3
+  (bounds/OOM vs NotPresent) plus reserved-bit policy plus guest CR3
+  load plus e2e fault asserts stay next. #6 stays active.

@@ -560,11 +560,13 @@ pub fn walk_step(table: &[u64; 512], virt: u64, level: u8) -> Result<u64, Walker
 /// Reserved / MBZ-bit policy is unchanged from [`walk_step`]: only
 /// `PRESENT` is checked; large-page (`PS`, bit 7) / `NX`-disabled combos
 /// stay out of scope until the guest `CR3` mode (PAE/NX/1 GiB) is pinned.
-pub fn walk_full<'a>(
-    cr3_base: u64,
-    virt: u64,
-    lookup: &'a dyn Fn(u64) -> Option<&'a [u64; 512]>,
-) -> Result<u64, WalkerError> {
+///
+/// `lookup` is generic (`F: Fn(u64) -> Option<&[u64; 512]>`) so the guest
+/// fault path inlines instead of dynamically dispatching per level.
+pub fn walk_full<'a, F>(cr3_base: u64, virt: u64, lookup: F) -> Result<u64, WalkerError>
+where
+    F: Fn(u64) -> Option<&'a [u64; 512]>,
+{
     if cr3_base & PAGE_OFFSET_MASK != 0 {
         return Err(WalkerError::MisalignedPhys);
     }
@@ -976,14 +978,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn walk_full_chains_lookup_closure_with_offset_and_failures() {
-        // Same 4-level shape as walk_chain_four_levels_*, now through the
-        // shared walk_full helper the guest CR3 slice will reuse: the
-        // lookup closure plays the role of guest phys_to_table_ptr.
-        let virt: u64 = 0x0000_1234_5678_9ABC;
-        let (pml4_base, pdpt_base, pd_base, pt_base, page_base) =
-            (0x1000, 0x2000, 0x3000, 0x4000, 0x5000);
+    fn walk_four_levels_fixture(
+        virt: u64,
+    ) -> ([u64; 512], [u64; 512], [u64; 512], [u64; 512], u64) {
+        let (pdpt_base, pd_base, pt_base, page_base) = (0x2000, 0x3000, 0x4000, 0x5000);
         let mut pml4 = [0u64; 512];
         let mut pdpt = [0u64; 512];
         let mut pd = [0u64; 512];
@@ -996,21 +994,35 @@ mod tests {
             encode_table_entry(pt_base, K_RW).unwrap();
         pt[page_table_index(virt, 0).unwrap() as usize] =
             encode_table_entry(page_base, K_RW).unwrap();
-        {
-            let lookup = |base: u64| -> Option<&[u64; 512]> {
-                match base {
-                    0x1000 => Some(&pml4),
-                    0x2000 => Some(&pdpt),
-                    0x3000 => Some(&pd),
-                    0x4000 => Some(&pt),
-                    _ => None,
-                }
-            };
-            assert_eq!(walk_full(pml4_base, virt, &lookup), Ok(0x5ABC));
-        }
-        // Mid-level NotPresent propagates.
+        (pml4, pdpt, pd, pt, page_base)
+    }
+
+    #[test]
+    fn walk_full_happy_path_adds_offset() {
+        // Shared walk_full helper the guest CR3 slice reuses: the lookup
+        // closure plays the role of guest phys_to_table_ptr.
+        let virt: u64 = 0x0000_1234_5678_9ABC;
+        let pml4_base = 0x1000;
+        let (pml4, pdpt, pd, pt, _) = walk_four_levels_fixture(virt);
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd),
+                0x4000 => Some(&pt),
+                _ => None,
+            }
+        };
+        assert_eq!(walk_full(pml4_base, virt, lookup), Ok(0x5ABC));
+    }
+
+    #[test]
+    fn walk_full_mid_level_notpresent_propagates() {
+        let virt: u64 = 0x0000_1234_5678_9ABC;
+        let pml4_base = 0x1000;
+        let (pml4, mut pdpt, pd, pt, _) = walk_four_levels_fixture(virt);
         pdpt[page_table_index(virt, 2).unwrap() as usize] &= !1;
-        let lookup2 = |base: u64| -> Option<&[u64; 512]> {
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
             match base {
                 0x1000 => Some(&pml4),
                 0x2000 => Some(&pdpt),
@@ -1020,10 +1032,19 @@ mod tests {
             }
         };
         assert_eq!(
-            walk_full(pml4_base, virt, &lookup2),
+            walk_full(pml4_base, virt, lookup),
             Err(WalkerError::NotPresent)
         );
-        // Unknown table base (unmapped next level) is NotPresent.
+    }
+
+    #[test]
+    fn walk_full_missing_table_base_is_notpresent() {
+        // Unknown table base (unmapped next level) is NotPresent. Kept
+        // distinct from cleared-PRESENT until phys_to_table_ptr bounds/OOM
+        // mapping is pinned in the guest-CR3 slice (REVIEW #130 note 3).
+        let virt: u64 = 0x0000_1234_5678_9ABC;
+        let pml4_base = 0x1000;
+        let (pml4, _, _, _, _) = walk_four_levels_fixture(virt);
         let missing = |base: u64| -> Option<&[u64; 512]> {
             if base == pml4_base {
                 Some(&pml4)
@@ -1032,16 +1053,46 @@ mod tests {
             }
         };
         assert_eq!(
-            walk_full(pml4_base, virt, &missing),
+            walk_full(pml4_base, virt, missing),
             Err(WalkerError::NotPresent)
         );
-        // Misaligned CR3 and non-canonical virt fail closed first.
+    }
+
+    #[test]
+    fn walk_full_misaligned_cr3_fails_closed() {
+        let virt: u64 = 0x0000_1234_5678_9ABC;
+        let (pml4, pdpt, pd, pt, _) = walk_four_levels_fixture(virt);
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd),
+                0x4000 => Some(&pt),
+                _ => None,
+            }
+        };
         assert_eq!(
-            walk_full(0x1001, virt, &lookup2),
+            walk_full(0x1001, virt, lookup),
             Err(WalkerError::MisalignedPhys)
         );
+    }
+
+    #[test]
+    fn walk_full_noncanonical_fails_closed() {
+        let virt: u64 = 0x0000_1234_5678_9ABC;
+        let pml4_base = 0x1000;
+        let (pml4, pdpt, pd, pt, _) = walk_four_levels_fixture(virt);
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd),
+                0x4000 => Some(&pt),
+                _ => None,
+            }
+        };
         assert_eq!(
-            walk_full(pml4_base, 0x8000_0000_0000, &lookup2),
+            walk_full(pml4_base, 0x8000_0000_0000, lookup),
             Err(WalkerError::NonCanonical)
         );
     }
