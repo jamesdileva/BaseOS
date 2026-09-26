@@ -521,11 +521,21 @@ pub const fn encode_table_entry(phys_base: u64, flags: PageFlags) -> Result<u64,
 
 /// One hardware walk step: read the `level` table entry for `virt`.
 ///
+/// 4 KiB-only step: `PS` (bit 7) set on the entry is NOT followed as a
+/// next-table pointer — it fails closed with `NotPresent`. Large-page
+/// leaves (1 GiB at level 2, 2 MiB at level 1) are resolved only by
+/// [`walk_full`], which reads the entry directly and stops at the leaf.
+/// This pins the deliberate divergence: chaining `walk_step` over firmware
+/// tables that contain `PS` leaves mis-walks silently without this gate,
+/// so `walk_step` refuses instead. `PS` at level 3/0 is likewise
+/// `NotPresent` (reserved), matching `walk_full`.
+///
 /// Validates canonical first (`NonCanonical`), then the level
-/// (`InvalidLevel`), then `PRESENT` (`NotPresent`); returns the next-level
-/// table base (`pte_decoded_phys`) on success. Full 4-level walks chain
-/// four calls (PML4 -> PDPT -> PD -> PT); the leaf PT step returns the
-/// 4 KiB page base and callers add `virt & PAGE_OFFSET_MASK`.
+/// (`InvalidLevel`), then `PRESENT` (`NotPresent`), then `PS`
+/// (`NotPresent`); returns the next-level table base (`pte_decoded_phys`)
+/// on success. Full 4-level walks chain four calls (PML4 -> PDPT -> PD ->
+/// PT); the leaf PT step returns the 4 KiB page base and callers add
+/// `virt & PAGE_OFFSET_MASK`.
 /// `GUARD` never appears here: entries were built by
 /// [`encode_table_entry`], which masks bit 9 to 0.
 ///
@@ -551,6 +561,10 @@ pub fn walk_step(table: &[u64; 512], virt: u64, level: u8) -> Result<u64, Walker
     };
     let pte = table[idx as usize];
     if pte & 1 == 0 {
+        return Err(WalkerError::NotPresent);
+    }
+    if pte & PTE_PS_BIT != 0 {
+        // 4 KiB-only gate: never follow a PS leaf as a table pointer.
         return Err(WalkerError::NotPresent);
     }
     Ok(pte_decoded_phys(pte))
@@ -910,6 +924,46 @@ mod tests {
         let mut hi = [0u64; 512];
         hi[0x100] = encode_table_entry(0xC000, K_RW).unwrap();
         assert_eq!(walk_step(&hi, 0xFFFF_8000_0000_1000, 3), Ok(0xC000));
+    }
+
+    #[test]
+    fn walk_step_ps_is_4k_only_fail_closed() {
+        // REVIEW #137 risk 1: walk_step no longer follows a PS leaf as a
+        // table pointer. walk_full stops at the same leaf (divergence is
+        // deliberate and pinned here).
+        let virt_2m: u64 = 0x21_3456;
+        let mut pd = [0u64; 512];
+        pd[page_table_index(virt_2m, 1).unwrap() as usize] =
+            encode_table_entry(0x20_0000, K_RW).unwrap() | PTE_PS_BIT;
+        assert_eq!(walk_step(&pd, virt_2m, 1), Err(WalkerError::NotPresent));
+        // PS + !PRESENT still reports NotPresent (PRESENT checked first).
+        pd[page_table_index(virt_2m, 1).unwrap() as usize] &= !1;
+        assert_eq!(walk_step(&pd, virt_2m, 1), Err(WalkerError::NotPresent));
+        // PS at PT (level 0) is reserved -> NotPresent (was untested).
+        let virt_4k: u64 = 0x1000;
+        let mut pt = [0u64; 512];
+        pt[page_table_index(virt_4k, 0).unwrap() as usize] =
+            encode_table_entry(0xB000, K_RW).unwrap() | PTE_PS_BIT;
+        assert_eq!(walk_step(&pt, virt_4k, 0), Err(WalkerError::NotPresent));
+        // Same 2 MiB leaf through walk_full resolves (stops at leaf).
+        let mut pdpt = [0u64; 512];
+        let mut pml4 = [0u64; 512];
+        let mut pd_ok = [0u64; 512];
+        pd_ok[page_table_index(virt_2m, 1).unwrap() as usize] =
+            encode_table_entry(0x20_0000, K_RW).unwrap() | PTE_PS_BIT;
+        pml4[page_table_index(virt_2m, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap();
+        pdpt[page_table_index(virt_2m, 2).unwrap() as usize] =
+            encode_table_entry(0x3000, K_RW).unwrap();
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd_ok),
+                _ => None,
+            }
+        };
+        assert_eq!(walk_full(0x1000, virt_2m, lookup), Ok(0x21_3456));
     }
 
     #[test]

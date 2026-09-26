@@ -1840,3 +1840,44 @@ Format per entry (per `implementation-guide.md` §31):
   guest `CR3` read + identity `phys_to_table_ptr` bounds/OOM -> `None`
   -> `MissingTable` wiring + `PAGING` serial line + e2e assert + QEMU.
   #6 stays active.
+
+## S04 slice 11 -- walk_step 4KiB-only PS fail-closed (REVIEW #137 risk 1) (2026-09-26)
+
+- **Decision:** Host-only walker-divergence slice in
+  `crates/kernel/src/page_table.rs` (guest untouched, no QEMU this cycle):
+  `walk_step` now fails closed with `NotPresent` when `PS` (bit 7) is set
+  instead of returning the leaf as a next-table base, and docs pin it as
+  the 4 KiB-only step (`PS` leaves resolve only via `walk_full`, which
+  reads the entry directly and stops). Order stays canonical -> level ->
+  PRESENT -> PS. New test `walk_step_ps_is_4k_only_fail_closed` pins the
+  deliberate divergence plus two untested gaps: `PS` at PD (level 1)
+  fails via `walk_step` while the same leaf resolves via `walk_full`
+  (`0x21_3456`), `PS` + `!PRESENT` stays `NotPresent`, and `PS` at PT
+  (level 0) is `NotPresent`.
+- **Why:** REVIEW #137 ACCEPTED slice 10 @f513c37 but named the
+  `walk_step`/`walk_full` divergence as the main carry risk: `walk_full`
+  stopped calling `walk_step` and inlined its own loop, while `walk_step`
+  still treated a `PS` leaf as a table base with no doc mention, so any
+  future caller chaining `walk_step` on firmware tables mis-walks
+  silently. The cheapest disconfirm/fix named in the review is exactly
+  this: document `walk_step` as 4 KiB-only plus a `NotPresent`-on-`PS`
+  gate with a divergence-pinning test.
+- **Alternatives:** Refactor `walk_full` to call `walk_step` then PS-check
+  (rejected: `walk_step` returns only the decoded base, losing the raw
+  `PS` bit the leaf rule needs -- would require a second table read or
+  a signature change, heavier than the gate); new `LargePage` error for
+  `walk_step` (rejected: `NotPresent` already means do-not-follow here
+  and keeps the fail-closed set unchanged for callers).
+- **Expected:** default 81 (80 + 1); kernel 50 (49 + 1); boot-uefi 10;
+  fmt clean; clippy host + UEFI clean; no QEMU (guest untouched).
+- **Measured (2026-09-26, Win11):** default 81/81 (21+50+4+4+2);
+  kernel 50/50 (1 new walk_step-PS); boot-uefi 10/10;
+  `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings`
+  exit 0; `cargo clippy -p baseos-boot-uefi --target
+  x86_64-unknown-uefi -- -D warnings` exit 0. Diff is page_table.rs +
+  this worklog entry (guest untouched; S03 slice-17 PASS stands). QEMU
+  not re-run.
+- **Final:** REVIEW #137 risk 1 closed on the current tree (divergence
+  deliberate, documented, and test-pinned). Next: guest `CR3` read +
+  identity `phys_to_table_ptr` bounds/OOM wiring + `PAGING` serial line
+  + e2e fault asserts + QEMU. #6 stays active.
