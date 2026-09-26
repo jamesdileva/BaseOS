@@ -2053,3 +2053,34 @@ Format per entry (per `implementation-guide.md` §31):
   (reporting-only). Remaining: #139 notes 1/3 (Reserved diagnostics,
   reserved/MBZ policy + enforcement gate on the now-measured baseline).
   Next: guard-page e2e or NX/USER enforcement policy slice. #6 stays active.
+
+## S04 slice 16 -- walk_full vs leaf_flags error parity (REVIEW #147 risk 3)
+
+- **Decision:** Host-only close-out of REVIEW #147 risk 3 (duplication drift):
+  new `walk_full_leaf_flags_err_parity_matches_walk_full` test asserting
+  `walk_full` and `walk_full_leaf_flags` agree exactly on the three cases
+  the prior test's comment claimed but never exercised — cleared-PRESENT
+  mid-level, reserved PS@L3, reserved PS@L0 (all `NotPresent`) — plus
+  success-path phys parity on the 4 KiB chain. Narrowed the prior test's
+  comment to the cases it really covers (missing/non-canonical/misaligned).
+  Guest untouched; no serial/ps1 change.
+- **Why:** Two copies of the walk logic exist by design (address-only vs
+  address+flags); without a parity pin they can drift silently. The cheapest
+  disconfirm is a direct both-walkers-agree test, not a shared-helper
+  refactor (which would touch the guest path and need a QEMU re-run).
+- **Alternatives:** Share one inner helper between the walkers (rejected:
+  guest-touching refactor, larger blast radius for a parity claim a test
+  pins); W-bit audit extension in the same commit (rejected: changes the
+  PERMAUDIT serial shape + ps1 gate, needs QEMU — keep this slice host-only
+  and green).
+- **Expected:** default 85 (84 + 1); kernel 54 (53 + 1); boot-uefi 13;
+  fmt clean; clippy host + UEFI clean; guest untouched (no QEMU re-run).
+- **Measured (2026-09-26, Win11):** default 85/85 (21+54+4+4+2);
+  kernel 54/54 (1 new parity); boot-uefi 13/13; `cargo fmt --check` clean;
+  `cargo clippy --all-targets -- -D warnings` clean;
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings`
+  clean. Guest untouched.
+- **Final:** Duplication-drift parity pinned; REVIEW #147 risk 3 closed.
+  Remaining: #147 risks 1 (single-probe coverage), 2 (W bit), 4 (gate
+  brittleness); #139 note 1 (Reserved/MBZ). Next: multi-probe audit with W
+  bit or guard-page e2e. #6 stays active.

@@ -1569,8 +1569,9 @@ mod tests {
         assert_eq!(phys_1g, 0x4001_2345);
         assert!(!flags_1g.contains(PageFlags::USER));
 
-        // Error parity with walk_full: missing table, not-present,
-        // non-canonical, reserved PS@L3 all propagate identically.
+        // Error parity with walk_full: missing table, non-canonical,
+        // misaligned CR3 propagate identically (reserved-PS + cleared
+        // PRESENT parity lives in walk_full_leaf_flags_err_parity_* below).
         let missing = |base: u64| -> Option<&[u64; 512]> {
             if base == pml4_base {
                 Some(&pml4)
@@ -1590,5 +1591,88 @@ mod tests {
             walk_full_leaf_flags(0x1001, virt, lookup),
             Err(WalkerError::MisalignedPhys)
         );
+    }
+
+    /// REVIEW #147 risk 3: `walk_full` vs `walk_full_leaf_flags` error parity
+    /// for the reserved-PS + cleared-PRESENT cases the prior test's comment
+    /// claimed but never exercised. Both walkers share the same
+    /// canonical -> PRESENT -> PS-at-level order, so every failure maps to
+    /// the identical [`WalkerError`]; phys agrees on every success.
+    #[test]
+    fn walk_full_leaf_flags_err_parity_matches_walk_full() {
+        let virt: u64 = 0x0000_1234_5678_9ABC;
+        let pml4_base = 0x1000;
+        // Cleared-PRESENT mid-level: both fail closed with NotPresent.
+        let (pml4c, mut pdptc, pdc, ptc, _) = walk_four_levels_fixture(virt);
+        pdptc[page_table_index(virt, 2).unwrap() as usize] &= !1;
+        let lookup_c = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4c),
+                0x2000 => Some(&pdptc),
+                0x3000 => Some(&pdc),
+                0x4000 => Some(&ptc),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            walk_full(pml4_base, virt, lookup_c),
+            Err(WalkerError::NotPresent)
+        );
+        assert_eq!(
+            walk_full_leaf_flags(pml4_base, virt, lookup_c),
+            Err(WalkerError::NotPresent)
+        );
+        // Reserved PS at PML4 (level 3): both reject, never a leaf.
+        let mut pml4_ps3 = [0u64; 512];
+        pml4_ps3[page_table_index(virt, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap() | PTE_PS_BIT;
+        let lookup_ps3 = |base: u64| -> Option<&[u64; 512]> {
+            if base == pml4_base {
+                Some(&pml4_ps3)
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            walk_full(pml4_base, virt, lookup_ps3),
+            Err(WalkerError::NotPresent)
+        );
+        assert_eq!(
+            walk_full_leaf_flags(pml4_base, virt, lookup_ps3),
+            Err(WalkerError::NotPresent)
+        );
+        // Reserved PS at PT (level 0): both reject, never a leaf.
+        let (pml4z, pdptz, pdz, mut ptz, _) = walk_four_levels_fixture(virt);
+        ptz[page_table_index(virt, 0).unwrap() as usize] |= PTE_PS_BIT;
+        let lookup_ps0 = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4z),
+                0x2000 => Some(&pdptz),
+                0x3000 => Some(&pdz),
+                0x4000 => Some(&ptz),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            walk_full(pml4_base, virt, lookup_ps0),
+            Err(WalkerError::NotPresent)
+        );
+        assert_eq!(
+            walk_full_leaf_flags(pml4_base, virt, lookup_ps0),
+            Err(WalkerError::NotPresent)
+        );
+        // Success parity: leaf_flags phys equals walk_full phys.
+        let (pml4s, pdpts, pds, pts, _) = walk_four_levels_fixture(virt);
+        let lookup_s = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4s),
+                0x2000 => Some(&pdpts),
+                0x3000 => Some(&pds),
+                0x4000 => Some(&pts),
+                _ => None,
+            }
+        };
+        let (phys_flags, _) = walk_full_leaf_flags(pml4_base, virt, lookup_s).unwrap();
+        assert_eq!(phys_flags, walk_full(pml4_base, virt, lookup_s).unwrap());
     }
 }
