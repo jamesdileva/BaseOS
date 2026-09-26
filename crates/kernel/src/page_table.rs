@@ -940,6 +940,23 @@ mod tests {
         pd[page_table_index(virt_2m, 1).unwrap() as usize] &= !1;
         assert_eq!(walk_step(&pd, virt_2m, 1), Err(WalkerError::NotPresent));
         // PS at PT (level 0) is reserved -> NotPresent (was untested).
+        // REVIEW #139 note 2: PS@L3 was only covered via walk_full, so pin
+        // walk_step fail-closed at L3/L2 here too (reserved/leaf-as-pointer).
+        let virt_l3: u64 = 0x4001_2345;
+        let mut pml4_ps = [0u64; 512];
+        pml4_ps[page_table_index(virt_l3, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap() | PTE_PS_BIT;
+        assert_eq!(
+            walk_step(&pml4_ps, virt_l3, 3),
+            Err(WalkerError::NotPresent)
+        );
+        let mut pdpt_ps = [0u64; 512];
+        pdpt_ps[page_table_index(virt_l3, 2).unwrap() as usize] =
+            encode_table_entry(0x4000_0000, K_RW).unwrap() | PTE_PS_BIT;
+        assert_eq!(
+            walk_step(&pdpt_ps, virt_l3, 2),
+            Err(WalkerError::NotPresent)
+        );
         let virt_4k: u64 = 0x1000;
         let mut pt = [0u64; 512];
         pt[page_table_index(virt_4k, 0).unwrap() as usize] =

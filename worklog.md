@@ -1881,3 +1881,33 @@ Format per entry (per `implementation-guide.md` §31):
   deliberate, documented, and test-pinned). Next: guest `CR3` read +
   identity `phys_to_table_ptr` bounds/OOM wiring + `PAGING` serial line
   + e2e fault asserts + QEMU. #6 stays active.
+
+## S04 slice 12 -- walk_step PS@L3/L2 pins (REVIEW #139 note 2) (2026-09-26)
+
+- **Decision:** Host-only test extension in
+  `crates/kernel/src/page_table.rs` (guest untouched, no QEMU this cycle):
+  extend `walk_step_ps_is_4k_only_fail_closed` with `PS` at PML4 (level 3,
+  reserved) and at PDPT (level 2, 1 GiB leaf-as-pointer) fail-closed pins
+  (`NotPresent`), closing REVIEW #139 note 2 (`PS@L3` was only covered via
+  `walk_full`).
+- **Why:** REVIEW #139 ACCEPTED slice 11 @b0538a3 but listed four
+  non-blocking notes; note 2 (`PS@L3` not explicitly tested for
+  `walk_step`, only L1/L0) is the cheapest host-provable close-out with
+  zero API change.
+- **Alternatives:** New `Reserved` error variant for PS@L3/L0 (rejected:
+  diagnostics-only per #139 note 1, breaks fail-closed set for callers --
+  needs a DECISION mail, not a silent slice); full guest `CR3` wiring now
+  (rejected: larger guest-touching slice with QEMU, violates one small
+  segment per cycle).
+- **Expected:** default 81 (unchanged, extended test); kernel 50; boot-uefi
+  10; fmt clean; clippy clean; no QEMU (guest untouched).
+- **Measured (2026-09-26, Win11):** default 81/81 (21+50+4+4+2);
+  kernel 50/50 (extended walk_step-PS); boot-uefi 10/10;
+  `cargo fmt --check` clean; `cargo clippy -p baseos-kernel --all-targets
+  -- -D warnings` clean. Diff is page_table.rs + this worklog entry
+  (guest untouched; S03 slice-17 PASS stands). QEMU not re-run.
+- **Final:** REVIEW #139 note 2 closed (all four levels now pinned for
+  `walk_step`-on-`PS` -> `NotPresent`). Remaining: #139 notes 1/3/4
+  (Reserved variant diagnostics, reserved/MBZ bits, guest `CR3`
+  bounds/OOM + e2e/QEMU). Next: guest `CR3` read + identity
+  `phys_to_table_ptr` bounds/OOM wiring. #6 stays active.
