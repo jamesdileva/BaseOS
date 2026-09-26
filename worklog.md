@@ -1999,3 +1999,57 @@ Format per entry (per `implementation-guide.md` §31):
   Remaining: #139 notes 1/3 (Reserved-variant diagnostics, reserved/MBZ
   policy incl. live USER/NX audit). Next: live permission-bit audit or
   guard-page e2e. #6 stays active.
+
+## S04 slice 15 -- live leaf USER/NX audit + PERMAUDIT e2e (2026-09-26)
+
+- **Decision:** Third guest-touching S04 slice, closing REVIEW #145 residual
+  (1) (`PERM ok=1` was synthetic-only): (a) `kernel/page_table.rs`: new pure
+  `walk_full_leaf_flags(cr3, virt, lookup) -> (phys, flags)` mirroring
+  `walk_full` level-for-level (same `MisalignedPhys`/`NonCanonical`/
+  `MissingTable`/`NotPresent`/PS@3-0 rules) but returning the leaf
+  `pte_decoded_flags` (4 KiB PTE at L0, PS leaf at L2/L1) plus
+  `walk_full_leaf_flags_reports_live_user_nx_bits` test (4 KiB USER/NX,
+  2 MiB + 1 GiB PS-leaf flags, phys parity with `walk_full`, error parity);
+  fixed a first-pass bug the new test caught (L0 arm returned the table base
+  + offset instead of `pte_decoded_phys(pte)` + offset).
+  (b) `boot-uefi/main.rs`: `probe_live_flags` (post-EBS, same probe virt as
+  `PAGING`: FB base or low `0x1000`) + `write_permaudit_line`
+  (`PERMAUDIT ok=<0|1> phys=<0x...> user=<0|1> nx=<0|1>`) with
+  `write_permaudit_line_embeds_phys_user_nx` shape test, emitted after `PERM`
+  before bring-up; reporting-only (no policy gate: baseline firmware values
+  first). (c) `boot-uefi.ps1` hard-requires `PERMAUDIT ok=1`.
+- **Why:** Agent-b REVIEW #145 ACCEPTED slice 14 but flagged the synthetic
+  gap explicitly: firmware USER/NX misconfig cannot fail `PERM ok=1`. The
+  smallest live close-out is a decoded-flags read of the exact entry the
+  `PAGING` walk used (no second walk, no drift), reported on serial and
+  hard-required for walk success — enforcement policy rides later once the
+  baseline is recorded.
+- **Alternatives:** PML4-entry USER/NX census across 512 entries (rejected:
+  larger serial surface, still needs the leaf-decode helper first; PML4 bits
+  alone do not determine effective access); enforce `user=0/nx=1` now
+  (rejected: OVMF baseline unknown pre-measurement — this slice proves it is
+  `user=0 nx=0` on the FB, so a premature gate would have failed loudly for
+  the wrong reason); real `#PF` fault injection (rejected: same as slice 14,
+  IDT path far larger).
+- **Expected:** default 84 (83 + 1); kernel 53 (52 + 1); boot-uefi 13
+  (12 + 1); fmt clean; clippy host + UEFI clean; `boot-uefi.ps1` PASS
+  with `PAGING ok=1` + `PERM ok=1` + `PERMAUDIT ok=1`.
+- **Measured (2026-09-26, Win11):** default 84/84 (21+53+4+4+2);
+  kernel 53/53 (1 new leaf-flags); boot-uefi 13/13 (1 new PERMAUDIT-line);
+  `cargo fmt --check` clean (after `cargo fmt` on the long import/call/test
+  lines); `cargo clippy --all-targets -- -D warnings` clean;
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings`
+  clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 786 bytes:
+  `BOOTINFO valid=1 regions=98 usable=0xce88000`,
+  `FB present=1 base=0x80000000`, `MEMMAP ok=1 entries=98/98 truncated=0
+  map_size=4704 desc_size=48`, `GOP/EBS/KERNEL ok=1`, `FRAMEALLOC ok=1
+  free=52872 spans=8 faults=3 stitch=5`, `PAGING ok=1 cr3=0xf801000
+  phys=0x80000000`, `PERM ok=1 passed=9/9`,
+  `PERMAUDIT ok=1 phys=0x80000000 user=0 nx=0`, `EXC ok=1 vector=0`;
+  guest `bootx64.efi` 76288 bytes. Baseline recorded: OVMF marks the FB
+  identity map supervisor (`user=0`) and executable (`nx=0`) — enforcement
+  must account for executable MMIO before gating `nx=1`.
+- **Final:** Live USER/NX decode proven end-to-end with `PERMAUDIT` hard gate
+  (reporting-only). Remaining: #139 notes 1/3 (Reserved diagnostics,
+  reserved/MBZ policy + enforcement gate on the now-measured baseline).
+  Next: guard-page e2e or NX/USER enforcement policy slice. #6 stays active.

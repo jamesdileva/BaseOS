@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S04 slice 14: perm-fault matrix + PERM e2e) ==="
+Write-Output "=== BaseOS UEFI guest boot (S04 slice 15: live USER/NX audit + PERMAUDIT e2e) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -149,6 +149,7 @@ if ($serialText -and $serialText.Contains($marker)) {
   $framealloc = "FRAMEALLOC ok=1"
   $paging = "PAGING ok=1"
   $perm = "PERM ok=1"
+  $permaudit = "PERMAUDIT ok=1"
   $exc = "EXC ok=1 vector=0"
   # #59a value check (agent-b REVIEW #75 finding 1): presence of the
   # substrings alone would let map_size=999999999 or map_size=abc PASS.
@@ -184,10 +185,11 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasFramealloc = $serialText.Contains($framealloc)
   $hasPaging = $serialText.Contains($paging)
   $hasPerm = $serialText.Contains($perm)
+  $hasPermaudit = $serialText.Contains($permaudit)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasExc) {
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasPermaudit -and $hasExc) {
     Write-Output ("Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $mapsize + $descsize + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + $permaudit + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -200,6 +202,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "FRAMEALLOC ok=1 present=$hasFramealloc, " +
       "PAGING ok=1 present=$hasPaging, " +
       "PERM ok=1 present=$hasPerm, " +
+      "PERMAUDIT ok=1 present=$hasPermaudit, " +
       "EXC ok=1 vector=0 present=$hasExc; " +
       "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/frame-alloc/#DE path failed " +
       "-- see serial log)")

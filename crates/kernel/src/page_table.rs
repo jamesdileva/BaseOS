@@ -670,6 +670,68 @@ where
     Ok(base + (virt & PAGE_OFFSET_MASK))
 }
 
+/// Full 4-level walk returning the leaf permission flags alongside the
+/// physical address: `Ok((phys, flags))` where `flags` is
+/// [`pte_decoded_flags`] of the leaf entry (4 KiB PTE at level 0, or the
+/// `PS` leaf at level 2/1 for 1 GiB / 2 MiB pages). Mirrors [`walk_full`]
+/// level-for-level (misaligned `CR3` -> `MisalignedPhys`, non-canonical ->
+/// `NonCanonical`, lookup miss -> `MissingTable`, cleared-`PRESENT` ->
+/// `NotPresent`, `PS` at 3/0 -> `NotPresent`) so the guest live-flag audit
+/// reads exactly the bits the address walk used — no second walk, no drift.
+///
+/// `GUARD` never appears: firmware entries were not built by
+/// [`encode_table_entry`] and bit 9 is OS-available, but the decoder only
+/// reconstructs `PRESENT/WRITABLE/USER/NO_EXEC` (see [`pte_decoded_flags`]).
+/// Reserved / MBZ bits stay out of scope like [`walk_full`] (#139 note 1).
+pub fn walk_full_leaf_flags<'a, F>(
+    cr3_base: u64,
+    virt: u64,
+    lookup: F,
+) -> Result<(u64, PageFlags), WalkerError>
+where
+    F: Fn(u64) -> Option<&'a [u64; 512]>,
+{
+    if cr3_base & PAGE_OFFSET_MASK != 0 {
+        return Err(WalkerError::MisalignedPhys);
+    }
+    let mut base = cr3_base;
+    for level in [3u8, 2, 1, 0] {
+        let table = lookup(base).ok_or(WalkerError::MissingTable)?;
+        if !is_canonical(virt) {
+            return Err(WalkerError::NonCanonical);
+        }
+        let Some(idx) = page_table_index(virt, level) else {
+            return Err(WalkerError::InvalidLevel);
+        };
+        let pte = table[idx as usize];
+        if pte & 1 == 0 {
+            return Err(WalkerError::NotPresent);
+        }
+        if pte & PTE_PS_BIT != 0 {
+            match level {
+                2 => {
+                    let leaf = pte & PTE_ADDR_MASK & !LARGE_1G_OFFSET_MASK;
+                    return Ok((leaf + (virt & LARGE_1G_OFFSET_MASK), pte_decoded_flags(pte)));
+                }
+                1 => {
+                    let leaf = pte & PTE_ADDR_MASK & !LARGE_2M_OFFSET_MASK;
+                    return Ok((leaf + (virt & LARGE_2M_OFFSET_MASK), pte_decoded_flags(pte)));
+                }
+                _ => return Err(WalkerError::NotPresent),
+            }
+        }
+        if level == 0 {
+            return Ok((
+                pte_decoded_phys(pte) + (virt & PAGE_OFFSET_MASK),
+                pte_decoded_flags(pte),
+            ));
+        }
+        base = pte_decoded_phys(pte);
+    }
+    // Unreachable: the level-0 arm above always returns.
+    Err(WalkerError::InvalidLevel)
+}
+
 /// Synthetic permission-fault self-test for the guest `PERM` e2e line.
 ///
 /// Builds a fixed 5-entry [`PageTable`] (kernel RO at `0x1000`, kernel RW
@@ -1408,5 +1470,125 @@ mod tests {
         let (ok, passed, total) = perm_selftest();
         assert_eq!((passed, total), (9, 9));
         assert!(ok);
+    }
+
+    #[test]
+    fn walk_full_leaf_flags_reports_live_user_nx_bits() {
+        // 4 KiB leaf preserves USER + NO_EXEC alongside the address.
+        let virt: u64 = 0x0000_1234_5678_9ABC;
+        let pml4_base = 0x1000;
+        let (pml4, pdpt, pd, pt, _) = walk_four_levels_fixture(virt);
+        // Fixture leaves are K_RW (PRESENT+WRITABLE, no USER, no NX).
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd),
+                0x4000 => Some(&pt),
+                _ => None,
+            }
+        };
+        let (phys, flags) = walk_full_leaf_flags(pml4_base, virt, lookup).unwrap();
+        assert_eq!(phys, walk_full(pml4_base, virt, lookup).unwrap());
+        assert!(flags.contains(PageFlags::PRESENT));
+        assert!(flags.contains(PageFlags::WRITABLE));
+        assert!(!flags.contains(PageFlags::USER));
+        assert!(!flags.contains(PageFlags::NO_EXEC));
+
+        // USER + NX leaf decodes through the same path.
+        let user_nx = PageFlags::PRESENT
+            .union(PageFlags::WRITABLE)
+            .union(PageFlags::USER)
+            .union(PageFlags::NO_EXEC);
+        let mut pt_nx = [0u64; 512];
+        let mut pd_nx = [0u64; 512];
+        let mut pdpt_nx = [0u64; 512];
+        let mut pml4_nx = [0u64; 512];
+        pml4_nx[page_table_index(virt, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap();
+        pdpt_nx[page_table_index(virt, 2).unwrap() as usize] =
+            encode_table_entry(0x3000, K_RW).unwrap();
+        pd_nx[page_table_index(virt, 1).unwrap() as usize] =
+            encode_table_entry(0x4000, K_RW).unwrap();
+        pt_nx[page_table_index(virt, 0).unwrap() as usize] =
+            encode_table_entry(0x5000, user_nx).unwrap();
+        let lookup_nx = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4_nx),
+                0x2000 => Some(&pdpt_nx),
+                0x3000 => Some(&pd_nx),
+                0x4000 => Some(&pt_nx),
+                _ => None,
+            }
+        };
+        let (phys_nx, flags_nx) = walk_full_leaf_flags(pml4_base, virt, lookup_nx).unwrap();
+        assert_eq!(phys_nx, 0x5000 + (virt & PAGE_OFFSET_MASK));
+        assert!(flags_nx.contains(PageFlags::USER));
+        assert!(flags_nx.contains(PageFlags::NO_EXEC));
+
+        // 2 MiB PS leaf flags come from the leaf entry itself.
+        let virt_2m: u64 = 0x21_3456;
+        let mut pd_ps = [0u64; 512];
+        let mut pdpt2 = [0u64; 512];
+        let mut pml4_2 = [0u64; 512];
+        pml4_2[page_table_index(virt_2m, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap();
+        pdpt2[page_table_index(virt_2m, 2).unwrap() as usize] =
+            encode_table_entry(0x3000, K_RW).unwrap();
+        pd_ps[page_table_index(virt_2m, 1).unwrap() as usize] =
+            encode_table_entry(0x20_0000, user_nx).unwrap() | PTE_PS_BIT;
+        let lookup_2m = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4_2),
+                0x2000 => Some(&pdpt2),
+                0x3000 => Some(&pd_ps),
+                _ => None,
+            }
+        };
+        let (phys_2m, flags_2m) = walk_full_leaf_flags(pml4_base, virt_2m, lookup_2m).unwrap();
+        assert_eq!(phys_2m, walk_full(pml4_base, virt_2m, lookup_2m).unwrap());
+        assert!(flags_2m.contains(PageFlags::USER));
+        assert!(flags_2m.contains(PageFlags::NO_EXEC));
+
+        // 1 GiB PS leaf likewise.
+        let virt_1g: u64 = 0x4001_2345;
+        let mut pml4_1g = [0u64; 512];
+        let mut pdpt_1g = [0u64; 512];
+        pml4_1g[page_table_index(virt_1g, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap();
+        pdpt_1g[page_table_index(virt_1g, 2).unwrap() as usize] =
+            encode_table_entry(0x4000_0000, K_RW).unwrap() | PTE_PS_BIT;
+        let lookup_1g = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4_1g),
+                0x2000 => Some(&pdpt_1g),
+                _ => None,
+            }
+        };
+        let (phys_1g, flags_1g) = walk_full_leaf_flags(pml4_base, virt_1g, lookup_1g).unwrap();
+        assert_eq!(phys_1g, 0x4001_2345);
+        assert!(!flags_1g.contains(PageFlags::USER));
+
+        // Error parity with walk_full: missing table, not-present,
+        // non-canonical, reserved PS@L3 all propagate identically.
+        let missing = |base: u64| -> Option<&[u64; 512]> {
+            if base == pml4_base {
+                Some(&pml4)
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            walk_full_leaf_flags(pml4_base, virt, missing),
+            Err(WalkerError::MissingTable)
+        );
+        assert_eq!(
+            walk_full_leaf_flags(pml4_base, 0x8000_0000_0000, lookup),
+            Err(WalkerError::NonCanonical)
+        );
+        assert_eq!(
+            walk_full_leaf_flags(0x1001, virt, lookup),
+            Err(WalkerError::MisalignedPhys)
+        );
     }
 }
