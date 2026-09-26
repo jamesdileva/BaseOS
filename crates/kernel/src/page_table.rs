@@ -1675,4 +1675,96 @@ mod tests {
         let (phys_flags, _) = walk_full_leaf_flags(pml4_base, virt, lookup_s).unwrap();
         assert_eq!(phys_flags, walk_full(pml4_base, virt, lookup_s).unwrap());
     }
+
+    /// REVIEW #149 minor gap: success parity between `walk_full` and
+    /// `walk_full_leaf_flags` was pinned only for the 4 KiB chain, so the
+    /// `PS` arms (1 GiB at level 2, 2 MiB at level 1) could drift in
+    /// phys computation or flag decode without a test noticing. Pins
+    /// phys parity plus exact flag decode for both leaf sizes across
+    /// WRITABLE/USER/NO_EXEC variants (also a first W-bit pin on the
+    /// leaf_flags path toward #147 risk 2).
+    #[test]
+    fn walk_full_leaf_flags_large_page_phys_flags_parity() {
+        let pml4_base = 0x1000;
+        let flag_sets: [(PageFlags, bool, bool, bool); 4] = [
+            (K_RW, true, false, false),
+            (K_RW.union(PageFlags::USER), true, true, false),
+            (
+                K_RW.union(PageFlags::USER).union(PageFlags::NO_EXEC),
+                true,
+                true,
+                true,
+            ),
+            (
+                PageFlags::PRESENT.union(PageFlags::NO_EXEC),
+                false,
+                false,
+                true,
+            ),
+        ];
+        for (leaf_flags, want_w, want_u, want_nx) in flag_sets {
+            // 1 GiB leaf at level 2.
+            let virt_1g: u64 = 0x4001_2345;
+            let mut pml4 = [0u64; 512];
+            let mut pdpt = [0u64; 512];
+            pml4[page_table_index(virt_1g, 3).unwrap() as usize] =
+                encode_table_entry(0x2000, K_RW).unwrap();
+            pdpt[page_table_index(virt_1g, 2).unwrap() as usize] =
+                encode_table_entry(0x4000_0000, leaf_flags).unwrap() | PTE_PS_BIT;
+            let lookup_1g = |base: u64| -> Option<&[u64; 512]> {
+                match base {
+                    0x1000 => Some(&pml4),
+                    0x2000 => Some(&pdpt),
+                    _ => None,
+                }
+            };
+            let expect_1g =
+                (0x4000_0000 & !LARGE_1G_OFFSET_MASK) + (virt_1g & LARGE_1G_OFFSET_MASK);
+            assert_eq!(walk_full(pml4_base, virt_1g, lookup_1g), Ok(expect_1g));
+            let (phys_1g, flags_1g) = walk_full_leaf_flags(pml4_base, virt_1g, lookup_1g).unwrap();
+            assert_eq!(phys_1g, expect_1g);
+            assert_eq!(phys_1g, walk_full(pml4_base, virt_1g, lookup_1g).unwrap());
+            assert_eq!(
+                flags_1g,
+                pte_decoded_flags(pdpt[page_table_index(virt_1g, 2).unwrap() as usize])
+            );
+            assert!(flags_1g.contains(PageFlags::PRESENT));
+            assert_eq!(flags_1g.contains(PageFlags::WRITABLE), want_w);
+            assert_eq!(flags_1g.contains(PageFlags::USER), want_u);
+            assert_eq!(flags_1g.contains(PageFlags::NO_EXEC), want_nx);
+
+            // 2 MiB leaf at level 1.
+            let virt_2m: u64 = 0x21_3456;
+            let mut pml4_2 = [0u64; 512];
+            let mut pdpt2 = [0u64; 512];
+            let mut pd = [0u64; 512];
+            pml4_2[page_table_index(virt_2m, 3).unwrap() as usize] =
+                encode_table_entry(0x2000, K_RW).unwrap();
+            pdpt2[page_table_index(virt_2m, 2).unwrap() as usize] =
+                encode_table_entry(0x3000, K_RW).unwrap();
+            pd[page_table_index(virt_2m, 1).unwrap() as usize] =
+                encode_table_entry(0x20_0000, leaf_flags).unwrap() | PTE_PS_BIT;
+            let lookup_2m = |base: u64| -> Option<&[u64; 512]> {
+                match base {
+                    0x1000 => Some(&pml4_2),
+                    0x2000 => Some(&pdpt2),
+                    0x3000 => Some(&pd),
+                    _ => None,
+                }
+            };
+            let expect_2m = (0x20_0000 & !LARGE_2M_OFFSET_MASK) + (virt_2m & LARGE_2M_OFFSET_MASK);
+            assert_eq!(walk_full(pml4_base, virt_2m, lookup_2m), Ok(expect_2m));
+            let (phys_2m, flags_2m) = walk_full_leaf_flags(pml4_base, virt_2m, lookup_2m).unwrap();
+            assert_eq!(phys_2m, expect_2m);
+            assert_eq!(phys_2m, walk_full(pml4_base, virt_2m, lookup_2m).unwrap());
+            assert_eq!(
+                flags_2m,
+                pte_decoded_flags(pd[page_table_index(virt_2m, 1).unwrap() as usize])
+            );
+            assert!(flags_2m.contains(PageFlags::PRESENT));
+            assert_eq!(flags_2m.contains(PageFlags::WRITABLE), want_w);
+            assert_eq!(flags_2m.contains(PageFlags::USER), want_u);
+            assert_eq!(flags_2m.contains(PageFlags::NO_EXEC), want_nx);
+        }
+    }
 }

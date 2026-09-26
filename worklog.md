@@ -2084,3 +2084,34 @@ Format per entry (per `implementation-guide.md` §31):
   Remaining: #147 risks 1 (single-probe coverage), 2 (W bit), 4 (gate
   brittleness); #139 note 1 (Reserved/MBZ). Next: multi-probe audit with W
   bit or guard-page e2e. #6 stays active.
+
+## S04 slice 17 -- large-page phys+flags parity (REVIEW #149 minor gap)
+
+- **Decision:** Host-only parity close-out in
+  `crates/kernel/src/page_table.rs` (guest untouched, no QEMU this cycle):
+  new `walk_full_leaf_flags_large_page_phys_flags_parity` test asserting
+  `walk_full` and `walk_full_leaf_flags` agree on phys plus exact
+  `pte_decoded_flags` for both PS leaf sizes (1 GiB at L2, 2 MiB at L1)
+  across 4 flag variants (RW supervisor, RW user, RWX-user NX, RO NX),
+  pinning the WRITABLE bit on the leaf_flags path for the first time.
+- **Why:** REVIEW #149 ACCEPTED slice 16 @ae67f9e but flagged success parity
+  as 4 KiB-only: the PS arms (lines 656-663 vs 712-719) could drift in phys
+  masking or flag decode with no test noticing. Direct both-walkers-agree
+  test is the cheapest disconfirm, not a shared-helper refactor.
+- **Alternatives:** Shared inner helper between walkers (rejected: same as
+  slice 16 -- guest-touching refactor for a parity claim a test pins);
+  fold into the multi-probe W-bit audit with serial/ps1 change (rejected:
+  needs QEMU + gate design; this host-only pin keeps one small segment).
+- **Expected:** default 86 (85 + 1); kernel 55 (54 + 1); boot-uefi 13;
+  fmt clean; clippy host + UEFI clean; guest untouched (no QEMU re-run).
+- **Measured (2026-09-26, Win11):** default 86/86 (21+55+4+4+2);
+  kernel 55/55 (1 new large-page parity); boot-uefi 13/13;
+  `cargo fmt --check` clean (after one `cargo fmt`);
+  `cargo clippy --all-targets -- -D warnings` exit 0;
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings`
+  exit 0. Guest untouched.
+- **Final:** PS-arm phys+flags parity pinned; REVIEW #149 minor gap closed.
+  Remaining: #147 risks 1 (single-probe coverage), 2 (W bit e2e -- now
+  partially pinned host-side), 4 (gate brittleness); #139 note 1
+  (Reserved/MBZ). Next: multi-probe audit with W bit or guard-page e2e.
+  #6 stays active.
