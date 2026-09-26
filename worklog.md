@@ -2165,3 +2165,37 @@ Format per entry (per `implementation-guide.md` §31):
   still open). Remaining: #147 risks 1 (single-probe), 4 (gate
   brittleness); #139 note 1 (Reserved/MBZ). Next: multi-probe audit or
   guard-page e2e. #6 stays active.
+
+## S04 slice 19 -- PERMAUDIT W gate tightening + stale test rename (REVIEW #153 gaps 2+3)
+
+- **Decision:** Close REVIEW #153 gaps (2) and (3) in one minimal slice:
+  (a) `boot-uefi.ps1` now hard-requires same-line ` w=1` via regex
+  `PERMAUDIT ok=1 [^\r\n]* w=1` in addition to the `PERMAUDIT ok=1`
+  substring (both must hold for PASS; MISSING detail reports each);
+  (b) rename stale host test `write_permaudit_line_embeds_phys_user_nx`
+  to `write_permaudit_line_embeds_phys_user_nx_w` and lock the gate shape
+  with an explicit `contains(" w=1")` assert plus updated doc comments.
+- **Why:** REVIEW #153 ACCEPTED slice 18 but showed `ok` is walk-success,
+  independent of `w`, so a `w=0` regression would still PASS e2e; and the
+  test name no longer described what it pins. Both are cheap to close
+  before the multi-probe audit.
+- **Alternatives:** Enforce `w=1` policy in-guest (fail-closed line)
+  (rejected: baseline just proven on one OVMF config -- gate the script
+  first, decide enforcement after multi-probe); multi-probe audit in the
+  same commit (rejected: doubles QEMU analysis; gate tightening is
+  zero-guest-change).
+- **Expected:** default 86 (unchanged, renamed test); kernel 55; boot-uefi 13;
+  fmt clean; clippy host + UEFI clean; `boot-uefi.ps1` PASS with
+  `PERMAUDIT ok=1 ... w=1`; smoke PASS; regex negative control `w=0` fails.
+- **Measured (2026-09-26, Win11):** default 86/86 (21+55+4+4+2);
+  kernel 55/55; boot-uefi 13/13 (renamed test);
+  `cargo fmt --check` clean; `cargo clippy --all-targets` and
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi` clean;
+  `boot-uefi.ps1` UEFI BOOT PASS exit 0 (guest 76800 bytes, serial 790 bytes:
+  `PERMAUDIT ok=1 phys=0x80000000 user=0 nx=0 w=1`, budget ok=True);
+  regex control `w=1`->True, `w=0`->False;
+  `smoke.ps1 -RequireOvmf` SMOKE PASS.
+- **Final:** REVIEW #153 gaps (2)+(3) closed on the current tree. Remaining:
+  #147 risks 1 (single-probe coverage), 4-partial (gate now covers `w`;
+  `user`/`nx` still reporting-only by design); #139 note 1. Next:
+  multi-probe audit (FB + low-RAM) with W or guard-page e2e. #6 stays active.

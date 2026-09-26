@@ -702,7 +702,8 @@ fn write_perm_line<E>(
 /// (0 on failure). Reporting-only this slice (no policy gate): the first
 /// job is to baseline firmware USER/NX/W values on OVMF before any
 /// enforcement slice decides what must fail. Hard-required by
-/// `boot-uefi.ps1` (`PERMAUDIT ok=1` substring; appended `w=` keeps it green).
+/// `boot-uefi.ps1` (`PERMAUDIT ok=1` substring plus same-line ` w=1`
+/// regex per REVIEW #153 gap 2).
 fn write_permaudit_line<E>(
     ok: bool,
     phys: u64,
@@ -1133,11 +1134,12 @@ mod tests {
         assert_eq!(line, "PERM ok=0 passed=8/9\n");
     }
 
-    /// S04 slice 15/18: `PERMAUDIT` line shape — live leaf flags, reporting-only;
-    /// e2e hard-require substring (`PERMAUDIT ok=1`) is byte-identical
-    /// (slice 18 appends `w=`; prefix unchanged).
+    /// S04 slice 15/18/19: `PERMAUDIT` line shape — live leaf flags;
+    /// e2e hard-requires `PERMAUDIT ok=1` AND ` w=1` on the same line
+    /// (slice 19 gate tightening per REVIEW #153 gap 2: `ok` is
+    /// walk-success, independent of `w`).
     #[test]
-    fn write_permaudit_line_embeds_phys_user_nx() {
+    fn write_permaudit_line_embeds_phys_user_nx_w() {
         let mut text = Vec::new();
         write_permaudit_line::<core::convert::Infallible>(
             true,
@@ -1154,6 +1156,7 @@ mod tests {
         let line = core::str::from_utf8(&text).unwrap();
         assert_eq!(line, "PERMAUDIT ok=1 phys=0x80000000 user=0 nx=1 w=1\n");
         assert!(line.contains("PERMAUDIT ok=1"));
+        assert!(line.contains(" w=1"));
 
         let mut text = Vec::new();
         write_permaudit_line::<core::convert::Infallible>(
