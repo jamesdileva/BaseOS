@@ -1661,3 +1661,38 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** REVIEW #126 risks 1 (documented) + 2 (chained test) closed
   host-side; risk 3 contracted for the guest slice. #6 stays active.
   Next: guest CR3 load + QEMU boot with e2e fault-line asserts.
+
+## S04 slice 6 -- walk_full CR3-rooted walk via lookup closure (2026-09-26)
+
+- **Decision:** Host-only pre-guest slice in
+  `crates/kernel/src/page_table.rs` (guest untouched, no QEMU this cycle):
+  new `walk_full(cr3_base, virt, lookup)` chaining four `walk_step` calls
+  from a CR3 PML4 base through `lookup(phys_base)` returning the next table
+  (the host closure plays the guest phys_to_table_ptr role; the PML4 itself
+  also resolves via `lookup` so host and guest share one shape). Fail-closed:
+  misaligned CR3 gives MisalignedPhys, non-canonical gives NonCanonical,
+  lookup miss or cleared-PRESENT mid-level gives NotPresent; returns page
+  base plus offset. Docs record the reserved/MBZ policy as unchanged (only
+  PRESENT checked; PS/NX combos deferred until the guest CR3 mode is pinned).
+  One new test covers happy-path offset, mid-NotPresent, missing-table,
+  misaligned-CR3, and non-canonical.
+- **Why:** REVIEW #128 ACCEPTED slice 5 and left three opens for the
+  guest-CR3 slice (reserved-bit policy, phys_to_table_ptr wiring, QEMU fault
+  asserts); this slice locks the lookup-closure contract host-side so the
+  guest slice is wiring-only (identity-map phys_to_table_ptr plus CR3 load
+  plus fault lines).
+- **Alternatives:** Guest CR3 load plus QEMU fault asserts now (rejected:
+  replacing live OVMF tables needs an identity-preserving PML4 copy plus a
+  fault handler, doubling single-cycle risk; lookup contract must exist
+  first); reserved-bit rejection now (rejected: mode-dependent, no NX/1GiB
+  pin yet, documented instead).
+- **Expected:** default 75 (74 + 1); kernel 44 (43 + 1); boot-uefi 10; fmt
+  clean; clippy host + UEFI clean; no QEMU (guest untouched).
+- **Measured (2026-09-26, Win11):** default 75/75 (21+44+4+4+2);
+  kernel 44/44 (1 new walk_full); boot-uefi 10/10; fmt clean;
+  clippy all-targets clean (one dropping_copy_types fix: scoped blocks
+  instead of drop on closures); UEFI-target clippy clean. Diff is
+  page_table.rs only (guest untouched; S03 slice-17 PASS stands). QEMU
+  not re-run.
+- **Final:** Lookup-closure contract landed in code; reserved-bit policy plus
+  guest CR3 load plus e2e fault asserts stay next. #6 stays active.

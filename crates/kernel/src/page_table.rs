@@ -526,7 +526,8 @@ pub const fn encode_table_entry(phys_base: u64, flags: PageFlags) -> Result<u64,
 /// `&[u64; 512]` via its identity/offset mapping of physical memory
 /// (`phys_to_table_ptr`, unsafe, guest-only) and calls `walk_step` again;
 /// see the `walk_chain_four_levels_*` test for the host-side chaining
-/// shape with plain arrays.
+/// shape with plain arrays. [`walk_full`] below locks that chaining shape
+/// behind a lookup closure so the guest `CR3` slice reuses it directly.
 pub fn walk_step(table: &[u64; 512], virt: u64, level: u8) -> Result<u64, WalkerError> {
     if !is_canonical(virt) {
         return Err(WalkerError::NonCanonical);
@@ -539,6 +540,40 @@ pub fn walk_step(table: &[u64; 512], virt: u64, level: u8) -> Result<u64, Walker
         return Err(WalkerError::NotPresent);
     }
     Ok(pte_decoded_phys(pte))
+}
+
+/// Full 4-level walk from a `CR3` base through a next-table lookup.
+///
+/// `lookup(phys_base)` maps a *physical* table base (as returned by the
+/// previous [`walk_step`]) to the next `&[u64; 512]` — the host passes a
+/// closure over plain arrays, the guest passes its identity/offset-mapped
+/// `phys_to_table_ptr` (unsafe, guest-only). `cr3_base` is the PML4 table
+/// base (low 12 bits must be clear, mirroring [`cr3_encode`]); the initial
+/// PML4 itself is resolved through `lookup` so both host and guest share
+/// one chaining shape.
+///
+/// Fail-closed: misaligned `cr3_base` -> `MisalignedPhys`, non-canonical
+/// `virt` -> `NonCanonical` (via the first [`walk_step`]), a lookup miss
+/// (unmapped table base) -> `NotPresent`, cleared-`PRESENT` mid-level ->
+/// `NotPresent`. Returns the 4 KiB page base plus `virt & PAGE_OFFSET_MASK`.
+///
+/// Reserved / MBZ-bit policy is unchanged from [`walk_step`]: only
+/// `PRESENT` is checked; large-page (`PS`, bit 7) / `NX`-disabled combos
+/// stay out of scope until the guest `CR3` mode (PAE/NX/1 GiB) is pinned.
+pub fn walk_full<'a>(
+    cr3_base: u64,
+    virt: u64,
+    lookup: &'a dyn Fn(u64) -> Option<&'a [u64; 512]>,
+) -> Result<u64, WalkerError> {
+    if cr3_base & PAGE_OFFSET_MASK != 0 {
+        return Err(WalkerError::MisalignedPhys);
+    }
+    let mut base = cr3_base;
+    for level in [3u8, 2, 1, 0] {
+        let table = lookup(base).ok_or(WalkerError::NotPresent)?;
+        base = walk_step(table, virt, level)?;
+    }
+    Ok(base + (virt & PAGE_OFFSET_MASK))
 }
 
 #[cfg(test)]
@@ -938,6 +973,76 @@ mod tests {
         assert_eq!(
             classify_access(&pt, 0x8000_0000_0000, AccessKind::Read, true),
             Err(CpuFault::GeneralProtection)
+        );
+    }
+
+    #[test]
+    fn walk_full_chains_lookup_closure_with_offset_and_failures() {
+        // Same 4-level shape as walk_chain_four_levels_*, now through the
+        // shared walk_full helper the guest CR3 slice will reuse: the
+        // lookup closure plays the role of guest phys_to_table_ptr.
+        let virt: u64 = 0x0000_1234_5678_9ABC;
+        let (pml4_base, pdpt_base, pd_base, pt_base, page_base) =
+            (0x1000, 0x2000, 0x3000, 0x4000, 0x5000);
+        let mut pml4 = [0u64; 512];
+        let mut pdpt = [0u64; 512];
+        let mut pd = [0u64; 512];
+        let mut pt = [0u64; 512];
+        pml4[page_table_index(virt, 3).unwrap() as usize] =
+            encode_table_entry(pdpt_base, K_RW).unwrap();
+        pdpt[page_table_index(virt, 2).unwrap() as usize] =
+            encode_table_entry(pd_base, K_RW).unwrap();
+        pd[page_table_index(virt, 1).unwrap() as usize] =
+            encode_table_entry(pt_base, K_RW).unwrap();
+        pt[page_table_index(virt, 0).unwrap() as usize] =
+            encode_table_entry(page_base, K_RW).unwrap();
+        {
+            let lookup = |base: u64| -> Option<&[u64; 512]> {
+                match base {
+                    0x1000 => Some(&pml4),
+                    0x2000 => Some(&pdpt),
+                    0x3000 => Some(&pd),
+                    0x4000 => Some(&pt),
+                    _ => None,
+                }
+            };
+            assert_eq!(walk_full(pml4_base, virt, &lookup), Ok(0x5ABC));
+        }
+        // Mid-level NotPresent propagates.
+        pdpt[page_table_index(virt, 2).unwrap() as usize] &= !1;
+        let lookup2 = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd),
+                0x4000 => Some(&pt),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            walk_full(pml4_base, virt, &lookup2),
+            Err(WalkerError::NotPresent)
+        );
+        // Unknown table base (unmapped next level) is NotPresent.
+        let missing = |base: u64| -> Option<&[u64; 512]> {
+            if base == pml4_base {
+                Some(&pml4)
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            walk_full(pml4_base, virt, &missing),
+            Err(WalkerError::NotPresent)
+        );
+        // Misaligned CR3 and non-canonical virt fail closed first.
+        assert_eq!(
+            walk_full(0x1001, virt, &lookup2),
+            Err(WalkerError::MisalignedPhys)
+        );
+        assert_eq!(
+            walk_full(pml4_base, 0x8000_0000_0000, &lookup2),
+            Err(WalkerError::NonCanonical)
         );
     }
 
