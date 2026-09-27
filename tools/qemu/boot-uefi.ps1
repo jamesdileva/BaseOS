@@ -153,12 +153,15 @@ if ($serialText -and $serialText.Contains($marker)) {
   # REVIEW #153 gap (2): `ok` is walk-success, independent of `w`, so a w=0
   # regression still matched the substring above. Hard-require the W bit on
   # the same line via regex (slice19 gate tightening; baseline OVMF is w=1).
-  $permauditWPat = "PERMAUDIT ok=1 [^\r\n]* w=1"
+  # Slice 22 tightens `w=1` with `(\s|$)` so `w=10` no longer matches
+  # (REVIEW #158 finding 1); see tools/qemu/test-boot-uefi-gates.ps1.
+  $permauditWPat = "PERMAUDIT ok=1 [^\r\n]* w=1(\s|$)"
   # S04 slice 20 (REVIEW #147 risk 1 multi-probe): second low-RAM probe on
   # its own line. Slice 21 gates `w=1` same-line (baseline measured w=1 on
   # OVMF in slice 20); `user`/`nx` stay reporting-only by design.
+  # Slice 22 tightens both W patterns with `(\s|$)` (finding 1).
   $permaudit2 = "PERMAUDIT2 ok=1"
-  $permaudit2WPat = "PERMAUDIT2 ok=1 [^\r\n]* w=1"
+  $permaudit2WPat = "PERMAUDIT2 ok=1 [^\r\n]* w=1(\s|$)"
   $exc = "EXC ok=1 vector=0"
   # #59a value check (agent-b REVIEW #75 finding 1): presence of the
   # substrings alone would let map_size=999999999 or map_size=abc PASS.

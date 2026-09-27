@@ -2271,3 +2271,30 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Both probes now gate `w=1` same-line. Remaining: #147 risk 4
   residual (`user`/`nx` reporting-only), #139 note 1 (Reserved/MBZ).
   Next: guard-page e2e or `user`/`nx` baseline gating. #6 stays active.
+
+## S04 slice 22 -- PERMAUDIT W-gate `w=10` tightening + checked-in regex control (REVIEW #158 findings 1+2)
+
+- **Decision:** Tighten both W patterns to `w=1(\s|$)` in `boot-uefi.ps1`
+  (`permauditWPat`, `permaudit2WPat`) and add checked-in
+  `tools/qemu/test-boot-uefi-gates.ps1`, which reads the live patterns
+  from `boot-uefi.ps1` (no duplication) and asserts 8/8: w=1 passes,
+  w=0 fails, w=10 fails, newline-split fails, for both probes.
+  Zero guest change (host-script-only).
+- **Why:** REVIEW #158 finding 1: `w=1` is a substring of `w=10`, so a
+  hypothetical multi-char `w` field would PASS the gate (same prefix
+  softness as slice-19 PERMAUDIT; unexploitable today since guest emits
+  single-char `w`). Finding 2: the gate had no committed regression
+  test (manual w=0-substitution only), so future pattern edits could
+  silently soften it.
+- **Alternatives:** `w=1\b` word-boundary (rejected: `\s|$` is explicit
+  about the serial line-end shape and matches the existing `[^\r\n]`
+  style); hardcode patterns in the test (rejected: test reads live
+  patterns so gate and test cannot drift); fold into QEMU e2e
+  (rejected: regex control runs without OVMF in <1s).
+- **Expected:** gate test 8/8 PASS; `boot-uefi.ps1` still PASS on baseline
+  OVMF serial (both probes `w=1`); no guest change; no Rust count change.
+- **Measured (2026-09-27, Win11):** `test-boot-uefi-gates.ps1`
+  GATE TEST PASS (8/8) exit 0 (P1+P2 x good/zero/ten/split).
+- **Final:** Findings 1+2 closed. Remaining: #147 risk 4 residual
+  (`user`/`nx` reporting-only), #139 note 1 (Reserved/MBZ). Next:
+  guard-page e2e or `user`/`nx` baseline gating. #6 stays active.
