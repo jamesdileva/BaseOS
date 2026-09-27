@@ -40,9 +40,12 @@ foreach ($p in @($w1, $w2)) {
     exit 1
   }
 }
-# REVIEW #168 nit-1/nit-2 lock: GUARD pattern must carry the `ok=1` boundary
-# tightening and pin `passed=7/7` on the same line.
-if ($g -notlike '*GUARD ok=1*passed=7/7(\s|$)*') {
+# REVIEW #168 nit-1/nit-2 lock, tightened per REVIEW #170 nit:
+# GUARD pattern must carry literal space after `ok=1` (boundary), same-line
+# `[^\r\n]*passed`, pin `passed=7/7`, and `(\s|$)` boundary. The prior lock
+# `*GUARD ok=1*passed=7/7(\s|$)*` let `*` match zero chars, so a regression
+# to the boundary-less form still passed the lock line (caught only by G-ten).
+if (($g -notlike '*GUARD ok=1 *') -or (-not $g.Contains('[^\r\n]*passed=7/7')) -or ($g -notlike '*passed=7/7(\s|$)*')) {
   Write-Output "GATE TEST FAIL (GUARD pattern missing ok=1/passed=7/7 tightening: $g)"
   exit 1
 }
