@@ -25,11 +25,13 @@ function Get-Pat([string]$name) {
 $w1 = Get-Pat "permauditWPat"
 $w2 = Get-Pat "permaudit2WPat"
 
-# Finding-1 lock: both patterns must carry the (\s|$) tightening so w=10
-# cannot match via the w=1 substring.
+# Finding-1 lock: both patterns must carry the literal `w=1(\s|$)` tightening
+# so w=10 cannot match via the w=1 substring. Match the literal suffix
+# (REVIEW #162 nit: `*w=1(*` would also accept a wrong-but-parenthesized
+# variant such as `w=1(x)`).
 foreach ($p in @($w1, $w2)) {
-  if ($p -notlike '*w=1(*') {
-    Write-Output "GATE TEST FAIL (pattern missing w=1 tightening: $p)"
+  if ($p -notlike '*w=1(\s|$)*') {
+    Write-Output "GATE TEST FAIL (pattern missing w=1(\s|$) tightening: $p)"
     exit 1
   }
 }

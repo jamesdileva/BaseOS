@@ -2298,3 +2298,31 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Findings 1+2 closed. Remaining: #147 risk 4 residual
   (`user`/`nx` reporting-only), #139 note 1 (Reserved/MBZ). Next:
   guard-page e2e or `user`/`nx` baseline gating. #6 stays active.
+
+## S04 slice 23 -- gate-test lock literal `(\s|$)` (REVIEW #162 nit)
+
+- **Decision:** Tighten the finding-1 lock in
+  `tools/qemu/test-boot-uefi-gates.ps1` from `-notlike '*w=1(*'` to
+  `-notlike '*w=1(\s|$)*'` (literal substring for the exact tightening).
+  Zero guest change; zero `boot-uefi.ps1` change (host-script-only).
+- **Why:** REVIEW #162 ACCEPTED slice 22 @3b3d44f (gate test 8/8 re-verified)
+  but noted the lock would also accept a wrong-but-parenthesized variant
+  such as `w=1(x)`; the live `w=1(\s|$)` regex already rejects `w=1(x)`
+  (`(` is neither whitespace nor end), only the meta-check was soft.
+- **Alternatives:** Add a `w=1(x)` live-pattern case to the 8 (rejected:
+  the 8 already pin live-pattern behavior; the gap was the lock string,
+  one literal fixes it with no new cases); leave the nit open (rejected:
+  one-line, zero-risk, reviewer-named).
+- **Expected:** gate test 8/8 PASS; default 86, kernel 55, boot-uefi 14;
+  fmt clean; clippy host + UEFI clean; guest untouched.
+- **Measured (2026-09-27, Win11):** `test-boot-uefi-gates.ps1`
+  GATE TEST PASS (8/8) exit 0; default 86/86 (21+55+4+4+2); kernel 55/55;
+  boot-uefi 14/14; `cargo fmt --check` clean; `cargo clippy --all-targets
+  -- -D warnings` clean; `clippy -p baseos-boot-uefi --target
+  x86_64-unknown-uefi -- -D warnings` clean. Lock verified: good pattern
+  contains the literal and passes, `w=1(x)` lacks it and is rejected,
+  and the live regex returns False on a `w=1(x)` sample. Guest untouched
+  (QEMU re-run rides with the next guest-touching slice).
+- **Final:** REVIEW #162 nit closed. Remaining: #147 risk 4 residual
+  (`user`/`nx` reporting-only), #139 note 1 (Reserved/MBZ). Next:
+  guard-page e2e or `user`/`nx` baseline gating. #6 stays active.
