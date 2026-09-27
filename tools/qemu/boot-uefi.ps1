@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S04 slice 27: permaudit user/nx shape gate + GUARD line) ==="
+Write-Output "=== BaseOS UEFI guest boot (S04 slice 28: permaudit user boundary + GUARD line) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -170,7 +170,14 @@ if ($serialText -and $serialText.Contains($marker)) {
   # same-line instead so a dropped/truncated/multi-char field fails e2e:
   # ` user=[01] ` (literal trailing space = single-char boundary, consumed
   # once) then `[^\r\n]*nx=[01](\s|$)` (space before w=1 or line end).
-  $permauditUNPat = "PERMAUDIT ok=1 [^\r\n]* user=[01] [^\r\n]*nx=[01](\s|$)"
+  # S04 slice 28 (#182 nit2 carried): `user=[01]` now uses `[ \t]`
+  # instead of the slice-27 literal space. `[ \t]` pins the same
+  # single-char boundary (space/tab, same-line) without assuming only
+  # spaces; `(\s|$)` was rejected mid-line here because `\s` matches
+  # `\n` and let a newline-split `user`/`nx` pair false-pass (caught by
+  # the gate test this slice). `nx` keeps `(\s|$)` because it sits
+  # before ` w=` or line-end, consistent with `w=1(\s|$)`.
+  $permauditUNPat = "PERMAUDIT ok=1 [^\r\n]* user=[01][ \t][^\r\n]*nx=[01](\s|$)"
   # S04 slice 20 (REVIEW #147 risk 1 multi-probe): second low-RAM probe on
   # its own line. Slice 21 gates `w=1` same-line (baseline measured w=1 on
   # OVMF in slice 20); `user`/`nx` stay reporting-only by design.
@@ -178,7 +185,7 @@ if ($serialText -and $serialText.Contains($marker)) {
   $permaudit2 = "PERMAUDIT2 ok=1"
   $permaudit2WPat = "PERMAUDIT2 ok=1 [^\r\n]* w=1(\s|$)"
   # Slice 27 mirror for the low-RAM probe (same shape gate, same rationale).
-  $permaudit2UNPat = "PERMAUDIT2 ok=1 [^\r\n]* user=[01] [^\r\n]*nx=[01](\s|$)"
+  $permaudit2UNPat = "PERMAUDIT2 ok=1 [^\r\n]* user=[01][ \t][^\r\n]*nx=[01](\s|$)"
   $exc = "EXC ok=1 vector=0"
   # #59a value check (agent-b REVIEW #75 finding 1): presence of the
   # substrings alone would let map_size=999999999 or map_size=abc PASS.

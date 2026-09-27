@@ -2518,3 +2518,49 @@ Format per entry (per `implementation-guide.md` §31):
   #139 note 1 (Reserved/MBZ), #168 nit 4 (live `#PF` injection), future
   user/nx VALUE policy (NX/SMEP enforcement slice). Next: live `#PF`
   injection or Reserved/MBZ audit. #6 stays active.
+
+## S04 slice 28 -- user-boundary hardening (REVIEW #182 nit2 carried)
+
+- **Decision:** Close REVIEW #182 nit2 (carried from slice 27) with a
+  host-script-only tightening, zero guest change: (a) `boot-uefi.ps1`:
+  both `permauditUNPat`/`permaudit2UNPat` change `user=[01] ` (literal
+  trailing space) to `user=[01][ \t]` (space-or-tab, same-line blank),
+  banner bumped to slice 28; (b) `test-boot-uefi-gates.ps1`: lock
+  updated from `Contains('user=[01] ')` to
+  `Contains('user=[01][ \t]')`, control extended from 26/26 to 30/30
+  with 4 new cases per probe-pair (user=10 / user=1x fail, both probes).
+- **Why:** The slice-27 literal space assumed space-only mid-line
+  `phys/user/nx/w` order while `nx`/`w` use `(\s|$)` -- inconsistent,
+  and tab-separated output would miss the gate. `(\s|$)` was tried
+  first for `user` and REJECTED: `\s` matches `\n`, so the
+  newline-split `user`/`nx` pair false-passed (U1-split/U2-split went
+  red, 28/30). `[ \t]` pins the same single-char boundary without
+  crossing lines, keeping the split cases failing; `nx` keeps
+  `(\s|$)` because it sits before ` w=` or line-end.
+- **Alternatives:** `user=[01](\s|$)` for full nx/w consistency
+  (rejected: false-passes newline-split, proven red this slice);
+  leave the literal space with an order-note comment (rejected:
+  reviewer-named one-line hardening, tab robustness is free with the
+  same-line guarantee intact); fold into live `#PF` injection
+  (rejected: IDT fault path is the larger blast radius, still
+  deferred per #168 nit 4).
+- **Expected:** gate test 30/30 PASS; default 87, kernel 56, boot-uefi
+  15 unchanged; fmt/clippy clean; guest untouched (host-only skip on
+  top of the slice-26 verified tree, same precedent as slices
+  22-23/25/27).
+- **Measured (2026-09-27, Win11):** `test-boot-uefi-gates.ps1` GATE TEST
+  PASS (30/30: 8 W + 16 user/nx-shape + 6 GUARD) exit 0; intermediate
+  red verified during dev (first `(\s|$)` draft failed U1-split/U2-split
+  as above, caught by the existing split cases before the `[ \t]`
+  fix); default `cargo test` 87/87, `-p baseos-kernel` 56/56,
+  `-p baseos-boot-uefi` 15/15, `cargo fmt --check` clean,
+  `cargo clippy --all-targets -- -D warnings` clean. Guest untouched
+  (`git status` ps1-only two files). Sitrep note: the sitrep 2-file
+  flag was STALE at cycle start (clean tree + empty diff verified
+  before edits -- eighth false alarm); the tree is now genuinely dirty
+  with this slice's two ps1 files.
+- **Final:** REVIEW #182 nit2 closed; both probes now gate `ok=1` +
+  `w=1` + user/nx-shape with `[ \t]`/`(\s|$)` boundaries documented.
+  Remaining: #139 note 1 (Reserved/MBZ), #168 nit 4 (live `#PF`
+  injection), future user/nx VALUE policy (NX/SMEP enforcement slice).
+  Next: live `#PF` injection or Reserved/MBZ audit. #6 stays active.
