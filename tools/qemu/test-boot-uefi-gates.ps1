@@ -1,11 +1,13 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Checked-in regex control for boot-uefi.ps1 gates (S04 slices 22+25).
-  Reads the live W patterns + GUARD pattern from boot-uefi.ps1 (no
-  duplication) and asserts:
+  Checked-in regex control for boot-uefi.ps1 gates (S04 slices 22+25+27).
+  Reads the live W + user/nx-shape patterns + GUARD pattern from boot-uefi.ps1
+  (no duplication) and asserts:
   PERMAUDIT/W: w=1 passes, w=0 fails, w=10 fails (REVIEW #158 finding 1),
   newline-split fails (same-line gate). Covers both PERMAUDIT and PERMAUDIT2.
+  PERMAUDIT user/nx shape (slice 27 #147r4): good passes, user=2 fails,
+  nx=2 fails, missing-user fails, newline-split fails (value-free, both probes).
   GUARD (REVIEW #168 nits 1-3): ok=1 passed=7/7 passes; ok=10 / ok=1x fail
   (boundary tightening); passed=6/7 fails (coverage pin); missing passed
   fails; newline-split fails.
@@ -28,6 +30,8 @@ function Get-Pat([string]$name) {
 
 $w1 = Get-Pat "permauditWPat"
 $w2 = Get-Pat "permaudit2WPat"
+$u1 = Get-Pat "permauditUNPat"
+$u2 = Get-Pat "permaudit2UNPat"
 $g = Get-Pat "guardPat"
 
 # Finding-1 lock: both patterns must carry the literal `w=1(\s|$)` tightening
@@ -37,6 +41,15 @@ $g = Get-Pat "guardPat"
 foreach ($p in @($w1, $w2)) {
   if ($p -notlike '*w=1(\s|$)*') {
     Write-Output "GATE TEST FAIL (pattern missing w=1(\s|$) tightening: $p)"
+    exit 1
+  }
+}
+# Slice 27 lock: user/nx-shape patterns must carry the literal
+# `user=[01] ` (trailing space = single-char boundary) and `nx=[01]`
+# pins, value-free so a future user=1/nx=1 policy still passes the shape.
+foreach ($p in @($u1, $u2)) {
+  if ((-not $p.Contains('user=[01] ')) -or (-not $p.Contains('nx=[01]'))) {
+    Write-Output "GATE TEST FAIL (user/nx-shape pattern missing user=[01]/nx=[01] pins: $p)"
     exit 1
   }
 }
@@ -60,6 +73,18 @@ $cases = @(
   @("P2-zero", $w2, "PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=0 w=0`n", $false, "w=0 fails"),
   @("P2-ten", $w2, "PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=0 w=10`n", $false, "w=10 fails"),
   @("P2-split", $w2, "PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=0`n w=1`n", $false, "newline-split fails"),
+  @("U1-good", $u1, "PERMAUDIT ok=1 phys=0x80000000 user=0 nx=0 w=1`n", $true, "user/nx shape passes"),
+  @("U1-good-flip", $u1, "PERMAUDIT ok=1 phys=0x80000000 user=1 nx=1 w=1`n", $true, "flipped values still pass shape"),
+  @("U1-baduser", $u1, "PERMAUDIT ok=1 phys=0x80000000 user=2 nx=0 w=1`n", $false, "user=2 fails"),
+  @("U1-nouser", $u1, "PERMAUDIT ok=1 phys=0x80000000 nx=0 w=1`n", $false, "missing user fails"),
+  @("U1-badnx", $u1, "PERMAUDIT ok=1 phys=0x80000000 user=0 nx=2 w=1`n", $false, "nx=2 fails"),
+  @("U1-split", $u1, "PERMAUDIT ok=1 phys=0x80000000 user=0`n nx=0 w=1`n", $false, "newline-split fails"),
+  @("U2-good", $u2, "PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=0 w=1`n", $true, "user/nx shape passes"),
+  @("U2-good-flip", $u2, "PERMAUDIT2 ok=1 phys=0x1000 user=1 nx=1 w=1`n", $true, "flipped values still pass shape"),
+  @("U2-baduser", $u2, "PERMAUDIT2 ok=1 phys=0x1000 user=2 nx=0 w=1`n", $false, "user=2 fails"),
+  @("U2-nouser", $u2, "PERMAUDIT2 ok=1 phys=0x1000 nx=0 w=1`n", $false, "missing user fails"),
+  @("U2-badnx", $u2, "PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=2 w=1`n", $false, "nx=2 fails"),
+  @("U2-split", $u2, "PERMAUDIT2 ok=1 phys=0x1000 user=0`n nx=0 w=1`n", $false, "newline-split fails"),
   @("G-good", $g, "GUARD ok=1 passed=7/7`n", $true, "ok=1 7/7 passes"),
   @("G-ten", $g, "GUARD ok=10 passed=7/7`n", $false, "ok=10 fails"),
   @("G-onex", $g, "GUARD ok=1x passed=7/7`n", $false, "ok=1x fails"),
@@ -84,5 +109,5 @@ if ($failed -gt 0) {
   Write-Output "GATE TEST FAIL ($failed cases)"
   exit 1
 }
-Write-Output "GATE TEST PASS (14/14)"
+Write-Output "GATE TEST PASS (26/26)"
 exit 0

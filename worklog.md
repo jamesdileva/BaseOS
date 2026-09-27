@@ -2468,3 +2468,53 @@ Format per entry (per `implementation-guide.md` §31):
   reporting-only -- agreed next, smaller blast radius than live `#PF`),
   #139 note 1 (Reserved/MBZ), #168 nit 4 (live `#PF` injection). Next:
   `user`/`nx` report-only closeout (#147r4). #6 stays active.
+
+## S04 slice 27 -- PERMAUDIT user/nx shape gate (REVIEW #147 risk 4 report-only closeout)
+
+- **Decision:** Close REVIEW #147 risk 4 residual (`user`/`nx`
+  reporting-only) with a value-free SHAPE gate, host-script-only, zero guest
+  change: (a) `boot-uefi.ps1`: two new patterns
+  `permauditUNPat`/`permaudit2UNPat` =
+  `PERMAUDIT[2] ok=1 [^\r\n]* user=[01] [^\r\n]*nx=[01](\s|$)`, hard-required
+  alongside the existing `ok=1` + `w=1` gates (banner bumped to slice 27);
+  (b) `test-boot-uefi-gates.ps1`: checked-in control extended from 14/14 to
+  26/26 with 12 new cases (per probe: good passes, flipped user=1/nx=1 still
+  passes the shape, user=2 / missing-user / nx=2 fail, newline-split fails)
+  plus a literal `Contains('user=[01] ')` / `Contains('nx=[01]')` lock so the
+  pins cannot regress silently.
+- **Why:** The `w=1` value gate (slices 19/21/22) was safe because writable
+  is the measured OVMF baseline for both probes; `user=0`/`nx=0` is also the
+  measured baseline, but pinning those VALUES would fail loudly the moment a
+  future NX/SMEP hardening slice flips them -- the correct report-only
+  closeout pins field PRESENCE/shape (single-char `[01]`, same-line,
+  boundary-tight) while leaving values free for the enforcement-policy slice.
+- **Alternatives:** Gate `user=0 nx=0` values like `w=1` (rejected: locks the
+  firmware baseline against the S29 NX direction; shape gate fails a dropped
+  field just as loudly with no policy commitment); in-guest fail-closed line
+  (rejected: script gate first, same precedent as slices 19/21); fold into
+  live `#PF` injection (rejected: IDT fault path is the larger blast radius
+  this slice explicitly defers per #168 nit 4).
+- **Expected:** gate test 26/26 PASS; default 87, kernel 56, boot-uefi 15
+  unchanged; fmt clean; clippy host + UEFI clean; guest untouched (no QEMU
+  re-run -- one host-only skip on top of the slice-26 verified tree, same
+  precedent as slices 22-23/25).
+- **Measured (2026-09-27, Win11):** `test-boot-uefi-gates.ps1` GATE TEST
+  PASS (26/26: 8 W + 12 user/nx-shape + 6 GUARD) exit 0; intermediate red
+  verified during dev (first UN-pattern draft double-counted the
+  user/nx separator space -- all 4 good cases failed while the 8 negative
+  cases passed -- caught by the new cases before the
+  `user=[01] [^\r\n]*nx=` fix; `-like '*user=[01] *'` lock also failed
+  because `[01]` is a wildcard class there, fixed to literal `Contains`);
+  default `cargo test` 87/87 (21+56+4+4+2), `-p baseos-kernel` 56/56,
+  `-p baseos-boot-uefi` 15/15, `cargo fmt --check` clean,
+  `cargo clippy --all-targets -- -D warnings` clean,
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings`
+  clean. Guest untouched (`git status` ps1-only two files). Sitrep note:
+  the sitrep 2-file flag was STALE at cycle start (clean tree + empty diff
+  verified before edits -- fifth false alarm); the tree is now genuinely
+  dirty with this slice's two ps1 files.
+- **Final:** REVIEW #147 risk 4 closed as a value-free shape gate; both
+  probes now gate `ok=1` + `w=1` + user/nx-shape same-line. Remaining:
+  #139 note 1 (Reserved/MBZ), #168 nit 4 (live `#PF` injection), future
+  user/nx VALUE policy (NX/SMEP enforcement slice). Next: live `#PF`
+  injection or Reserved/MBZ audit. #6 stays active.

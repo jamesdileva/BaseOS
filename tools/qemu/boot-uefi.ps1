@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S04 slice 25: guard-gate hardening + GUARD line) ==="
+Write-Output "=== BaseOS UEFI guest boot (S04 slice 27: permaudit user/nx shape gate + GUARD line) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -164,12 +164,21 @@ if ($serialText -and $serialText.Contains($marker)) {
   # Slice 22 tightens `w=1` with `(\s|$)` so `w=10` no longer matches
   # (REVIEW #158 finding 1); see tools/qemu/test-boot-uefi-gates.ps1.
   $permauditWPat = "PERMAUDIT ok=1 [^\r\n]* w=1(\s|$)"
+  # S04 slice 27 (#147r4 user/nx report-only closeout): `user`/`nx` stay
+  # value-free by design (baseline OVMF is user=0 nx=0, but a future NX/SMEP
+  # policy may flip nx/user -- do NOT pin 0). Hard-require the field SHAPE
+  # same-line instead so a dropped/truncated/multi-char field fails e2e:
+  # ` user=[01] ` (literal trailing space = single-char boundary, consumed
+  # once) then `[^\r\n]*nx=[01](\s|$)` (space before w=1 or line end).
+  $permauditUNPat = "PERMAUDIT ok=1 [^\r\n]* user=[01] [^\r\n]*nx=[01](\s|$)"
   # S04 slice 20 (REVIEW #147 risk 1 multi-probe): second low-RAM probe on
   # its own line. Slice 21 gates `w=1` same-line (baseline measured w=1 on
   # OVMF in slice 20); `user`/`nx` stay reporting-only by design.
   # Slice 22 tightens both W patterns with `(\s|$)` (finding 1).
   $permaudit2 = "PERMAUDIT2 ok=1"
   $permaudit2WPat = "PERMAUDIT2 ok=1 [^\r\n]* w=1(\s|$)"
+  # Slice 27 mirror for the low-RAM probe (same shape gate, same rationale).
+  $permaudit2UNPat = "PERMAUDIT2 ok=1 [^\r\n]* user=[01] [^\r\n]*nx=[01](\s|$)"
   $exc = "EXC ok=1 vector=0"
   # #59a value check (agent-b REVIEW #75 finding 1): presence of the
   # substrings alone would let map_size=999999999 or map_size=abc PASS.
@@ -208,10 +217,12 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasGuard = [regex]::IsMatch($serialText, $guardPat)
   $hasPermaudit = $serialText.Contains($permaudit)
   $hasPermauditW = [regex]::IsMatch($serialText, $permauditWPat)
+  $hasPermauditUN = [regex]::IsMatch($serialText, $permauditUNPat)
   $hasPermaudit2 = $serialText.Contains($permaudit2)
   $hasPermaudit2W = [regex]::IsMatch($serialText, $permaudit2WPat)
+  $hasPermaudit2UN = [regex]::IsMatch($serialText, $permaudit2UNPat)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermaudit2 -and $hasPermaudit2W -and $hasExc) {
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasExc) {
     Write-Output ("Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $mapsize + $descsize + " +
       "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + $exc)")
     Write-Output "UEFI BOOT PASS"
@@ -227,8 +238,8 @@ if ($serialText -and $serialText.Contains($marker)) {
       "PAGING ok=1 present=$hasPaging, " +
       "PERM ok=1 present=$hasPerm, " +
       "GUARD ok=1 passed=7/7 present=$hasGuard, " +
-      "PERMAUDIT ok=1 present=$hasPermaudit, w=1 present=$hasPermauditW, " +
-      "PERMAUDIT2 ok=1 present=$hasPermaudit2, w=1 present=$hasPermaudit2W, " +
+      "PERMAUDIT ok=1 present=$hasPermaudit, w=1 present=$hasPermauditW, user/nx shape present=$hasPermauditUN, " +
+      "PERMAUDIT2 ok=1 present=$hasPermaudit2, w=1 present=$hasPermaudit2W, user/nx shape present=$hasPermaudit2UN, " +
       "EXC ok=1 vector=0 present=$hasExc; " +
       "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/frame-alloc/#DE path failed " +
       "-- see serial log)")
