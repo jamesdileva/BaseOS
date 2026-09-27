@@ -155,9 +155,10 @@ if ($serialText -and $serialText.Contains($marker)) {
   # the same line via regex (slice19 gate tightening; baseline OVMF is w=1).
   $permauditWPat = "PERMAUDIT ok=1 [^\r\n]* w=1"
   # S04 slice 20 (REVIEW #147 risk 1 multi-probe): second low-RAM probe on
-  # its own line. Gate `ok=1` only; `w` stays reporting-only until the
-  # baseline is measured on OVMF.
+  # its own line. Slice 21 gates `w=1` same-line (baseline measured w=1 on
+  # OVMF in slice 20); `user`/`nx` stay reporting-only by design.
   $permaudit2 = "PERMAUDIT2 ok=1"
+  $permaudit2WPat = "PERMAUDIT2 ok=1 [^\r\n]* w=1"
   $exc = "EXC ok=1 vector=0"
   # #59a value check (agent-b REVIEW #75 finding 1): presence of the
   # substrings alone would let map_size=999999999 or map_size=abc PASS.
@@ -196,8 +197,9 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasPermaudit = $serialText.Contains($permaudit)
   $hasPermauditW = [regex]::IsMatch($serialText, $permauditWPat)
   $hasPermaudit2 = $serialText.Contains($permaudit2)
+  $hasPermaudit2W = [regex]::IsMatch($serialText, $permaudit2WPat)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasPermaudit -and $hasPermauditW -and $hasPermaudit2 -and $hasExc) {
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasPermaudit -and $hasPermauditW -and $hasPermaudit2 -and $hasPermaudit2W -and $hasExc) {
     Write-Output ("Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $mapsize + $descsize + " +
       "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + $permaudit + $permaudit2 + $exc)")
     Write-Output "UEFI BOOT PASS"
@@ -213,7 +215,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "PAGING ok=1 present=$hasPaging, " +
       "PERM ok=1 present=$hasPerm, " +
       "PERMAUDIT ok=1 present=$hasPermaudit, w=1 present=$hasPermauditW, " +
-      "PERMAUDIT2 ok=1 present=$hasPermaudit2, " +
+      "PERMAUDIT2 ok=1 present=$hasPermaudit2, w=1 present=$hasPermaudit2W, " +
       "EXC ok=1 vector=0 present=$hasExc; " +
       "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/frame-alloc/#DE path failed " +
       "-- see serial log)")

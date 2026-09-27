@@ -2237,3 +2237,37 @@ Format per entry (per `implementation-guide.md` §31):
   partial (`user`/`nx` still reporting-only by design), #139 note 1
   (Reserved/MBZ). Next: guard-page e2e or `user`/`nx` baseline gating.
   #6 stays active.
+
+## S04 slice 21 -- PERMAUDIT2 W gate tightening (REVIEW #147 risk 4 follow-up)
+
+- **Decision:** Mirror the slice-19 `w=1` same-line regex gate onto the
+  second probe: `boot-uefi.ps1` now hard-requires
+  `PERMAUDIT2 ok=1 [^\r\n]* w=1` in addition to the `PERMAUDIT2 ok=1`
+  substring (both must hold for PASS; MISSING detail reports each).
+  Zero guest change (guest 77312 bytes unchanged); `user`/`nx` stay
+  reporting-only by design.
+- **Why:** Slice 20 left PERMAUDIT2 `w` reporting-only "until measured";
+  QEMU measured `w=1` on the low-RAM leaf, so the same walk-success-vs-bit
+  hole slice 19 closed on PERMAUDIT still applied to PERMAUDIT2 (a `w=0`
+  regression would PASS e2e).
+- **Alternatives:** Enforce `user=0`/`nx=0` too (rejected: permission policy
+  still open -- W is the slice-19 precedent, user/nx need a baseline-gating
+  decision first); in-guest fail-closed line (rejected: script gate first,
+  same as slice 19); fold into guard-page e2e (rejected: doubles QEMU
+  analysis; gate is zero-guest-change).
+- **Expected:** default 86; kernel 55; boot-uefi 14; fmt clean; clippy host
+  + UEFI clean; `boot-uefi.ps1` PASS with both `w=1` regexes; smoke PASS;
+  regex negative control `w=0` fails.
+- **Measured (2026-09-27, Win11):** default 86/86 (21+55+4+4+2);
+  kernel 55/55; boot-uefi 14/14;
+  `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings`
+  exit 0; `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -- -D warnings` exit 0; `boot-uefi.ps1` UEFI BOOT PASS exit 0
+  (guest 77312 bytes, serial 834 bytes: `PERMAUDIT ok=1 phys=0x80000000
+  user=0 nx=0 w=1` + `PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=0 w=1`,
+  `PAGING ok=1 cr3=0xf801000 phys=0x80000000`, budget ok=True);
+  regex control `w=1`->True, `w=0`-substituted->False;
+  `smoke.ps1 -RequireOvmf` SMOKE PASS.
+- **Final:** Both probes now gate `w=1` same-line. Remaining: #147 risk 4
+  residual (`user`/`nx` reporting-only), #139 note 1 (Reserved/MBZ).
+  Next: guard-page e2e or `user`/`nx` baseline gating. #6 stays active.
