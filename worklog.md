@@ -2418,3 +2418,53 @@ Format per entry (per `implementation-guide.md` §31):
   #139 note 1, #168 nit 4 accepted (synthetic-only coverage note, needs
   live `#PF` injection). Next: `user`/`nx` gating or live `#PF`
   injection. #6 stays active.
+
+## S04 slice 26 -- GUARD lock tightening (REVIEW #170 nit) + QEMU re-verify (2026-09-27)
+
+- **Decision:** (a) Tighten the slice-25 GUARD meta-lock in
+  `tools/qemu/test-boot-uefi-gates.ps1` per REVIEW #170 nit: replace the
+  single `-notlike '*GUARD ok=1*passed=7/7(\s|$)*'` with three conjuncts --
+  `-notlike '*GUARD ok=1 *'` (literal space boundary after `ok=1`),
+  `$g.Contains('[^\r\n]*passed=7/7')` (same-line pin, literal), and
+  `-notlike '*passed=7/7(\s|$)*'` (coverage + boundary). Zero guest change;
+  zero `boot-uefi.ps1` change (host-script-only). (b) QEMU re-verify the
+  unchanged guest before the next host-only run, closing the drift risk the
+  same way slice 12 did for S03.
+- **Why:** The slice-25 lock let `*` match zero chars, so a regression to
+  the boundary-less form (`GUARD ok=1passed=7/7`) still passed the lock line
+  -- only the G-ten live case caught it. The new lock fails the lock line
+  itself on a boundary-less regression (defense in depth with G-ten), and
+  the `Contains` keeps the same-line `[^\r\n]*passed` pin literal so a
+  softened lock cannot slip back. The re-verify was owed because slice 25
+  (gate-only) and slice 26 (gate-only) stacked two host-only skips on top
+  of the slice-24 QEMU PASS.
+- **Alternatives:** Leave the lock as-is with G-ten as the only boundary
+  guard (rejected: reviewer-named one-line hardening, lock should fail
+  loudly on its own); fold the re-verify into the next guest-touching
+  slice (rejected: that stacks a third skip; one QEMU run now restores the
+  non-interference baseline); commit a serial/log artifact (rejected:
+  repo keeps serial logs gitignored under `target/`; commit message +
+  MEMORY + this worklog row is the recorded proof, same as slice 12/24).
+- **Expected:** gate test 14/14 PASS; default 87, kernel 56, boot-uefi 15;
+  fmt clean; clippy host + UEFI clean; guest untouched; `boot-uefi.ps1`
+  PASS with `GUARD ok=1 passed=7/7` on the re-verify.
+- **Measured (2026-09-27, Win11):** `test-boot-uefi-gates.ps1` GATE TEST
+  PASS (14/14: 8 PERMAUDIT + 6 GUARD) exit 0 -- re-run this cycle on the
+  slice-26 tree, same result as the slice-26 commit gate; default
+  `cargo test` 87/87 (21+56+4+4+2), `-p baseos-kernel` 56/56,
+  `-p baseos-boot-uefi` 15/15, `cargo fmt --check` clean (re-run this
+  cycle). QEMU re-verify @7518b37 (2026-09-27, recorded in commit message
+  + MEMORY, no guest/script bytes changed between 59bb2a4 and 7518b37):
+  `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 856 bytes (same as the
+  slice-24 baseline), `GUARD ok=1 passed=7/7`, `PERM ok=1 passed=9/9`,
+  `PERMAUDIT ok=1 ... w=1` + `PERMAUDIT2 ok=1 ... w=1`, `EXC ok=1
+  vector=0`, gate-test 14/14 PASS alongside. Host-vs-guest parity:
+  host default 87 / kernel 56 / boot-uefi 15 and gate 14/14 identical to
+  the slice-24 baseline values; guest 856B + GUARD 7/7 + PERM 9/9 +
+  PERMAUDIT x2 + EXC identical to slice-24. `git status --short` clean
+  this cycle (sitrep 2-file flag stale -- third false alarm per #176).
+- **Final:** REVIEW #170 nit closed; QEMU/guest parity restored on the
+  current tree (@7518b37). Remaining: #147 risk 4 residual (`user`/`nx`
+  reporting-only -- agreed next, smaller blast radius than live `#PF`),
+  #139 note 1 (Reserved/MBZ), #168 nit 4 (live `#PF` injection). Next:
+  `user`/`nx` report-only closeout (#147r4). #6 stays active.
