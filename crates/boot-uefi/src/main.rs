@@ -35,7 +35,8 @@
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
 use baseos_kernel::kernel_entry;
 use baseos_kernel::page_table::{
-    cr3_decode, perm_selftest, table_base_in_boot_map, walk_full, walk_full_leaf_flags,
+    cr3_decode, guard_selftest, perm_selftest, table_base_in_boot_map, walk_full,
+    walk_full_leaf_flags,
 };
 use baseos_serial_marker::write_marker;
 #[cfg(not(test))]
@@ -693,6 +694,28 @@ fn write_perm_line<E>(
     write_str(emit, "\n")
 }
 
+/// Emit the one-line `GUARD` diagnostic after the `PERM` line:
+/// `GUARD ok=<0|1> passed=<n>/<total>` — `ok` is 1 only when the synthetic
+/// [`guard_selftest`] guard contract passes all 7 probes (adjacent mapped
+/// pages pass, every guard touch faults `Guard`, next unmapped page is
+/// `NotPresent`). Pure software model, no live-table mutation, so it runs
+/// deterministically post-EBS on any firmware map. Hard-required by
+/// `boot-uefi.ps1` (`GUARD ok=1`).
+fn write_guard_line<E>(
+    ok: bool,
+    passed: u32,
+    total: u32,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "GUARD ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " passed=")?;
+    write_u64_dec(emit, u64::from(passed))?;
+    write_str(emit, "/")?;
+    write_u64_dec(emit, u64::from(total))?;
+    write_str(emit, "\n")
+}
+
 /// Emit the one-line `PERMAUDIT` diagnostic after the `PERM` line:
 /// `PERMAUDIT ok=<0|1> phys=<0x...> user=<0|1> nx=<0|1> w=<0|1>` — live-table
 /// counterpart to the synthetic `PERM` matrix: `ok` is 1 only when
@@ -858,6 +881,11 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // hard-required PERM line before bring-up.
             let (perm_ok, perm_passed, perm_total) = perm_selftest();
             write_perm_line::<Infallible>(perm_ok, perm_passed, perm_total, &mut emit).unwrap();
+            // S04 slice 24: synthetic guard-page contract (adjacent mapped
+            // pages pass, every guard touch faults Guard) — deterministic
+            // post-EBS proof with a hard-required GUARD line before bring-up.
+            let (guard_ok, guard_passed, guard_total) = guard_selftest();
+            write_guard_line::<Infallible>(guard_ok, guard_passed, guard_total, &mut emit).unwrap();
             // S04 slice 15: live leaf USER/NX audit of the PAGING probe
             // address — reporting-only baseline before any enforcement.
             // S04 slice 20 (REVIEW #147 risk 1): second probe of low-RAM
@@ -1194,6 +1222,30 @@ mod tests {
         .unwrap();
         let line = core::str::from_utf8(&text).unwrap();
         assert_eq!(line, "PERM ok=0 passed=8/9\n");
+    }
+
+    /// S04 slice 24: `GUARD` line shape — ok carries passed/total, and the
+    /// e2e hard-require substring (`GUARD ok=1`) is byte-identical.
+    #[test]
+    fn write_guard_line_embeds_passed_total() {
+        let mut text = Vec::new();
+        write_guard_line::<core::convert::Infallible>(true, 7, 7, &mut |b| {
+            text.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(line, "GUARD ok=1 passed=7/7\n");
+        assert!(line.contains("GUARD ok=1"));
+
+        let mut text = Vec::new();
+        write_guard_line::<core::convert::Infallible>(false, 6, 7, &mut |b| {
+            text.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(line, "GUARD ok=0 passed=6/7\n");
     }
 
     /// S04 slice 15/18/19: `PERMAUDIT` line shape — live leaf flags;

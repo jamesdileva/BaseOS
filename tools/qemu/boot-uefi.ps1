@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S04 slice 15: live USER/NX audit + PERMAUDIT e2e) ==="
+Write-Output "=== BaseOS UEFI guest boot (S04 slice 24: guard-page e2e + GUARD line) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -149,6 +149,7 @@ if ($serialText -and $serialText.Contains($marker)) {
   $framealloc = "FRAMEALLOC ok=1"
   $paging = "PAGING ok=1"
   $perm = "PERM ok=1"
+  $guard = "GUARD ok=1"
   $permaudit = "PERMAUDIT ok=1"
   # REVIEW #153 gap (2): `ok` is walk-success, independent of `w`, so a w=0
   # regression still matched the substring above. Hard-require the W bit on
@@ -197,14 +198,15 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasFramealloc = $serialText.Contains($framealloc)
   $hasPaging = $serialText.Contains($paging)
   $hasPerm = $serialText.Contains($perm)
+  $hasGuard = $serialText.Contains($guard)
   $hasPermaudit = $serialText.Contains($permaudit)
   $hasPermauditW = [regex]::IsMatch($serialText, $permauditWPat)
   $hasPermaudit2 = $serialText.Contains($permaudit2)
   $hasPermaudit2W = [regex]::IsMatch($serialText, $permaudit2WPat)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasPermaudit -and $hasPermauditW -and $hasPermaudit2 -and $hasPermaudit2W -and $hasExc) {
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermaudit2 -and $hasPermaudit2W -and $hasExc) {
     Write-Output ("Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $mapsize + $descsize + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + $permaudit + $permaudit2 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + $guard + $permaudit + $permaudit2 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -217,6 +219,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "FRAMEALLOC ok=1 present=$hasFramealloc, " +
       "PAGING ok=1 present=$hasPaging, " +
       "PERM ok=1 present=$hasPerm, " +
+      "GUARD ok=1 present=$hasGuard, " +
       "PERMAUDIT ok=1 present=$hasPermaudit, w=1 present=$hasPermauditW, " +
       "PERMAUDIT2 ok=1 present=$hasPermaudit2, w=1 present=$hasPermaudit2W, " +
       "EXC ok=1 vector=0 present=$hasExc; " +

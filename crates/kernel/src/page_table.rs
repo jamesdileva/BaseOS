@@ -779,6 +779,55 @@ pub fn perm_selftest() -> (bool, u32, u32) {
     (passed == total, passed, total)
 }
 
+/// Synthetic guard-page self-test for the guest `GUARD` e2e line.
+///
+/// Builds a fixed 3-entry [`PageTable`] (mapped RW at `0x1000`, guard at
+/// `0x2000`, mapped RW at `0x3000`) and runs 7 [`PageTable::check`]
+/// probes: adjacent mapped pages pass on touch, every guard touch faults
+/// with exactly [`Fault::Guard`] (read/write/execute plus an intra-page
+/// offset), and the next unmapped page faults with exactly
+/// [`Fault::NotPresent`] (guard vs unmapped distinction). Pure /
+/// `no_std`-clean so host tests and the post-EBS guest share it; the
+/// guest maps `ok` to `GUARD ok=1` (hard-required by `boot-uefi.ps1`).
+/// Returns `(ok, passed, total)`.
+#[must_use]
+pub fn guard_selftest() -> (bool, u32, u32) {
+    let mut pt = PageTable::new();
+    let rw = PageFlags::PRESENT.union(PageFlags::WRITABLE);
+    let guard = PageFlags::PRESENT.union(PageFlags::GUARD);
+    // Fixed map; `map` cannot fail here (aligned, distinct, PRESENT/GUARD).
+    let _ = pt.map(0x1000, 0xA000, rw);
+    let _ = pt.map(0x2000, 0xB000, guard);
+    let _ = pt.map(0x3000, 0xC000, rw);
+    let mut passed: u32 = 0;
+    let total: u32 = 7;
+    // Adjacent mapped pages pass (guard does not leak to neighbours).
+    if pt.check(0x1000, AccessKind::Read, false).is_ok() {
+        passed += 1;
+    }
+    if pt.check(0x3000, AccessKind::Write, false).is_ok() {
+        passed += 1;
+    }
+    // Every guard touch faults with exactly Guard (all kinds + offset).
+    if pt.check(0x2000, AccessKind::Read, false) == Err(Fault::Guard) {
+        passed += 1;
+    }
+    if pt.check(0x2000, AccessKind::Write, false) == Err(Fault::Guard) {
+        passed += 1;
+    }
+    if pt.check(0x2000, AccessKind::Execute, false) == Err(Fault::Guard) {
+        passed += 1;
+    }
+    if pt.check(0x2ABC, AccessKind::Read, false) == Err(Fault::Guard) {
+        passed += 1;
+    }
+    // Next unmapped page is NotPresent, not Guard.
+    if pt.check(0x4000, AccessKind::Read, false) == Err(Fault::NotPresent) {
+        passed += 1;
+    }
+    (passed == total, passed, total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1469,6 +1518,13 @@ mod tests {
     fn perm_selftest_all_nine_probes_pass() {
         let (ok, passed, total) = perm_selftest();
         assert_eq!((passed, total), (9, 9));
+        assert!(ok);
+    }
+
+    #[test]
+    fn guard_selftest_adjacent_pass_guard_faults() {
+        let (ok, passed, total) = guard_selftest();
+        assert_eq!((passed, total), (7, 7));
         assert!(ok);
     }
 

@@ -2326,3 +2326,57 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** REVIEW #162 nit closed. Remaining: #147 risk 4 residual
   (`user`/`nx` reporting-only), #139 note 1 (Reserved/MBZ). Next:
   guard-page e2e or `user`/`nx` baseline gating. #6 stays active.
+
+## S04 slice 24 -- guard-page e2e (synthetic GUARD line + ps1 gate)
+
+- **Decision:** First guard-page e2e close-out, mirroring the slice-14 PERM
+  pattern (synthetic software model, no live-table mutation, no fault
+  handler): (a) `kernel/page_table.rs`: new pure `guard_selftest() ->
+  (ok, passed, total)` building a fixed 3-entry table (mapped RW `0x1000`,
+  guard `0x2000`, mapped RW `0x3000`) and running 7 `check` probes with
+  exact-fault pins (adjacent low-read + high-write pass, guard
+  read/write/execute + intra-page `0x2ABC` read fault exactly `Guard`,
+  next-unmapped `0x4000` read faults exactly `NotPresent`) plus
+  `guard_selftest_adjacent_pass_guard_faults` test; (b) `boot-uefi/main.rs`:
+  `write_guard_line` (`GUARD ok=<0|1> passed=<n>/<m>`) plus
+  `write_guard_line_embeds_passed_total` shape test, emitted post-EBS after
+  `PERM` before bring-up; (c) `boot-uefi.ps1` hard-requires `GUARD ok=1`
+  (missing = FAIL) with the banner bumped to slice 24.
+- **Why:** Agent-b #166 named guard-page e2e under #6 with the cheapest
+  disconfirm = map guard page + prove touch faults vs adjacent mapped page
+  passes, with QEMU log + exit code recorded. The software `Guard` priority
+  had host tests but no guest proof; a deterministic synthetic line is the
+  smallest end-to-end guard gate before real `#PF`-injection (IDT fault path
+  is S02-controlled-`#DE` only, far larger slice).
+- **Alternatives:** Real `#PF` fault injection via guard touch + handler
+  (rejected: needs live PTE mutation + IDT fault path, doubles single-cycle
+  risk; synthetic line proves the enforcement contract first); live
+  firmware-guard audit (rejected: OVMF exposes no guard pages -- nothing to
+  probe); fold into `user`/`nx` enforcement (rejected: separate policy
+  decision, keep one gate per slice).
+- **Expected:** default 87 (86 + 1); kernel 56 (55 + 1); boot-uefi 15
+  (14 + 1); fmt clean; clippy host + UEFI clean; gate test 8/8 PASS;
+  `boot-uefi.ps1` PASS with `GUARD ok=1 passed=7/7`; smoke PASS.
+- **Measured (2026-09-27, Win11):** default 87/87 (21+56+4+4+2);
+  kernel 56/56 (1 new guard-selftest); boot-uefi 15/15 (1 new GUARD-line);
+  `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings`
+  exit 0; `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -- -D warnings` exit 0; `test-boot-uefi-gates.ps1` GATE TEST PASS (8/8);
+  `boot-uefi.ps1` UEFI BOOT PASS exit 0 (guest 79360 bytes, serial 856
+  bytes = 834 + 22 for the GUARD line: marker FOUND,
+  `BOOTINFO valid=1 regions=98 usable=0xce86000`,
+  `FB present=1 base=0x80000000`, `MEMMAP ok=1 entries=98/98 truncated=0
+  map_size=4704 desc_size=48`, `GOP/EBS/KERNEL ok=1`, `FRAMEALLOC ok=1
+  free=52870 spans=8 faults=3 stitch=5`, `PAGING ok=1 cr3=0xf801000
+  phys=0x80000000`, `PERM ok=1 passed=9/9`, `GUARD ok=1 passed=7/7`,
+  `PERMAUDIT ok=1 phys=0x80000000 user=0 nx=0 w=1`,
+  `PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=0 w=1`, `EXC ok=1 vector=0`,
+  budget ok=True); `smoke.ps1 -RequireOvmf` SMOKE PASS. Note:
+  `free=52870`/`usable=0xce86000` vs slice-21 `52871`/`0xce87000` is 1-page
+  OVMF map variance (guest grew with the GUARD wiring; regions/map_size/
+  desc_size stable), not a regression signal.
+- **Final:** Guard-page contract proven end-to-end with `GUARD` hard gate
+  (synthetic; real `#PF` injection stays future work). Remaining: #147 risk
+  4 residual (`user`/`nx` reporting-only), #139 note 1 (Reserved/MBZ).
+  Next: `user`/`nx` baseline gating or live fault-injection slice. #6 stays
+  active.
