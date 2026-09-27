@@ -2380,3 +2380,41 @@ Format per entry (per `implementation-guide.md` §31):
   4 residual (`user`/`nx` reporting-only), #139 note 1 (Reserved/MBZ).
   Next: `user`/`nx` baseline gating or live fault-injection slice. #6 stays
   active.
+
+## S04 slice 25 -- guard-gate hardening (REVIEW #168 nits 1-3)
+
+- **Decision:** Harden the slice-24 `GUARD` e2e gate per agent-b REVIEW #168
+  (approve + 3 nits), mirroring the slice-22 PERMAUDIT W tightening
+  (#158 finding 1 / #162 nit): (a) `boot-uefi.ps1`: replace the
+  `Contains("GUARD ok=1")` substring with the same-line regex
+  `GUARD ok=1 [^\r\n]*passed=7/7(\s|$)` — literal space after `ok=1` stops
+  `ok=10`/`ok=1x` false-passing, pinning `passed=7/7` stops a future
+  coverage shrink (e.g. 6/6) passing on `ok=1` alone, `[^\r\n]*` keeps the
+  pin same-line; banner bumped to slice 25; (b)
+  `test-boot-uefi-gates.ps1`: extend the checked-in control from 8/8 to
+  14/14 with 6 GUARD cases (good passes; ok=10 / ok=1x / 6-7 / missing
+  passed / newline-split fail) plus a literal
+  `GUARD ok=1*passed=7/7(\s|$)` lock so the tightening cannot regress
+  silently.
+- **Why:** The slice-24 gate repeated the pre-#158 pattern: any future
+  `ok=10`-shaped line (or `ok=1` with reduced coverage) would false-pass,
+  and the new hard-require itself was unproven (gate test stayed 8/8).
+  Cheapest disconfirm is the negative gate test, same as slices 22-23.
+- **Alternatives:** Full `ok=1(\s|$)` + separate `passed` check (rejected:
+  two gates to keep in sync; one same-line regex pins both); pin only the
+  boundary without `passed=7/7` (rejected: leaves nit 2 open); re-run QEMU
+  guest (rejected for this slice: guest untouched, serial contract
+  byte-identical `GUARD ok=1 passed=7/7`, gate proof is host-only like
+  slices 22-23 — QEMU re-verify rides with the next guest-touching slice).
+- **Expected:** gate test 14/14 PASS; guest untouched; no Rust count
+  changes; fmt/clippy unchanged.
+- **Measured (2026-09-27, Win11):** `test-boot-uefi-gates.ps1` GATE TEST
+  PASS (14/14: 8 PERMAUDIT + 6 GUARD); guest untouched (`git status`
+  ps1-only); intermediate red verified during dev (first pattern draft
+  failed G-good double-space, second draft false-passed ok=10/ok=1x —
+  both caught by the new cases before the final literal-space form).
+- **Final:** All 3 #168 nits closed; slice-24 APPROVE stands with gate
+  hardened. Remaining: #147 risk 4 residual (`user`/`nx` reporting-only),
+  #139 note 1, #168 nit 4 accepted (synthetic-only coverage note, needs
+  live `#PF` injection). Next: `user`/`nx` gating or live `#PF`
+  injection. #6 stays active.

@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S04 slice 24: guard-page e2e + GUARD line) ==="
+Write-Output "=== BaseOS UEFI guest boot (S04 slice 25: guard-gate hardening + GUARD line) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -149,7 +149,14 @@ if ($serialText -and $serialText.Contains($marker)) {
   $framealloc = "FRAMEALLOC ok=1"
   $paging = "PAGING ok=1"
   $perm = "PERM ok=1"
-  $guard = "GUARD ok=1"
+  # S04 slice 25 (REVIEW #168 nits 1+2): GUARD gate is a same-line regex
+  # `GUARD ok=1 [^\r\n]*passed=7/7(\s|$)` — the literal space after `ok=1`
+  # stops `ok=10`/`ok=1x` false-passing via the `ok=1` substring (same class
+  # as #158 finding 1 / #162 nit for PERMAUDIT W), pinning `passed=7/7`
+  # stops a future coverage shrink (e.g. 6/6) passing on `ok=1` alone, and
+  # `[^\r\n]*` keeps the pin same-line so a newline-split `ok=1` / passed
+  # pair fails. See tools/qemu/test-boot-uefi-gates.ps1 for the control.
+  $guardPat = "GUARD ok=1 [^\r\n]*passed=7/7(\s|$)"
   $permaudit = "PERMAUDIT ok=1"
   # REVIEW #153 gap (2): `ok` is walk-success, independent of `w`, so a w=0
   # regression still matched the substring above. Hard-require the W bit on
@@ -198,7 +205,7 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasFramealloc = $serialText.Contains($framealloc)
   $hasPaging = $serialText.Contains($paging)
   $hasPerm = $serialText.Contains($perm)
-  $hasGuard = $serialText.Contains($guard)
+  $hasGuard = [regex]::IsMatch($serialText, $guardPat)
   $hasPermaudit = $serialText.Contains($permaudit)
   $hasPermauditW = [regex]::IsMatch($serialText, $permauditWPat)
   $hasPermaudit2 = $serialText.Contains($permaudit2)
@@ -206,7 +213,7 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasExc = $serialText.Contains($exc)
   if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermaudit2 -and $hasPermaudit2W -and $hasExc) {
     Write-Output ("Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $mapsize + $descsize + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + $guard + $permaudit + $permaudit2 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -219,7 +226,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "FRAMEALLOC ok=1 present=$hasFramealloc, " +
       "PAGING ok=1 present=$hasPaging, " +
       "PERM ok=1 present=$hasPerm, " +
-      "GUARD ok=1 present=$hasGuard, " +
+      "GUARD ok=1 passed=7/7 present=$hasGuard, " +
       "PERMAUDIT ok=1 present=$hasPermaudit, w=1 present=$hasPermauditW, " +
       "PERMAUDIT2 ok=1 present=$hasPermaudit2, w=1 present=$hasPermaudit2W, " +
       "EXC ok=1 vector=0 present=$hasExc; " +
