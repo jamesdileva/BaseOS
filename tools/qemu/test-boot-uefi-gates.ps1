@@ -8,6 +8,10 @@
   newline-split fails (same-line gate). Covers both PERMAUDIT and PERMAUDIT2.
   PERMAUDIT user/nx shape (slice 27 #147r4): good passes, user=2 fails,
   nx=2 fails, missing-user fails, newline-split fails (value-free, both probes).
+  Slice 29 (#184 nit1): tab-positive U1-tab/U2-tab (user=0<TAB>nx=0 passes)
+  pins the slice-28 [ \t] acceptance; VALUE/boundary policy documented once
+  in boot-uefi.ps1 (order phys/user/nx/w, value-free [01], [ \t] mid-line vs
+  (\s|$) line-terminal).
   GUARD (REVIEW #168 nits 1-3): ok=1 passed=7/7 passes; ok=10 / ok=1x fail
   (boundary tightening); passed=6/7 fails (coverage pin); missing passed
   fails; newline-split fails.
@@ -77,6 +81,7 @@ $cases = @(
   @("P2-ten", $w2, "PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=0 w=10`n", $false, "w=10 fails"),
   @("P2-split", $w2, "PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=0`n w=1`n", $false, "newline-split fails"),
   @("U1-good", $u1, "PERMAUDIT ok=1 phys=0x80000000 user=0 nx=0 w=1`n", $true, "user/nx shape passes"),
+  @("U1-tab", $u1, "PERMAUDIT ok=1 phys=0x80000000 user=0`t nx=0 w=1`n", $true, "tab separator passes"),
   @("U1-good-flip", $u1, "PERMAUDIT ok=1 phys=0x80000000 user=1 nx=1 w=1`n", $true, "flipped values still pass shape"),
   @("U1-baduser", $u1, "PERMAUDIT ok=1 phys=0x80000000 user=2 nx=0 w=1`n", $false, "user=2 fails"),
   @("U1-ten", $u1, "PERMAUDIT ok=1 phys=0x80000000 user=10 nx=0 w=1`n", $false, "user=10 fails"),
@@ -85,6 +90,7 @@ $cases = @(
   @("U1-badnx", $u1, "PERMAUDIT ok=1 phys=0x80000000 user=0 nx=2 w=1`n", $false, "nx=2 fails"),
   @("U1-split", $u1, "PERMAUDIT ok=1 phys=0x80000000 user=0`n nx=0 w=1`n", $false, "newline-split fails"),
   @("U2-good", $u2, "PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=0 w=1`n", $true, "user/nx shape passes"),
+  @("U2-tab", $u2, "PERMAUDIT2 ok=1 phys=0x1000 user=0`t nx=0 w=1`n", $true, "tab separator passes"),
   @("U2-good-flip", $u2, "PERMAUDIT2 ok=1 phys=0x1000 user=1 nx=1 w=1`n", $true, "flipped values still pass shape"),
   @("U2-baduser", $u2, "PERMAUDIT2 ok=1 phys=0x1000 user=2 nx=0 w=1`n", $false, "user=2 fails"),
   @("U2-ten", $u2, "PERMAUDIT2 ok=1 phys=0x1000 user=10 nx=0 w=1`n", $false, "user=10 fails"),
@@ -116,5 +122,5 @@ if ($failed -gt 0) {
   Write-Output "GATE TEST FAIL ($failed cases)"
   exit 1
 }
-Write-Output "GATE TEST PASS (30/30)"
+Write-Output "GATE TEST PASS (32/32)"
 exit 0

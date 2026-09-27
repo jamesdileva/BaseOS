@@ -2564,3 +2564,34 @@ Format per entry (per `implementation-guide.md` §31):
   Remaining: #139 note 1 (Reserved/MBZ), #168 nit 4 (live `#PF`
   injection), future user/nx VALUE policy (NX/SMEP enforcement slice).
   Next: live `#PF` injection or Reserved/MBZ audit. #6 stays active.
+
+## S04 slice 29 -- REVIEW #184 nits: tab-positive pin + VALUE/boundary policy
+
+- **Decision:** Close REVIEW #184 nits (1)+(2) host-only, zero guest
+  change: (a) `test-boot-uefi-gates.ps1` adds U1-tab/U2-tab
+  (`user=0<TAB>nx=0` passes, `` `t `` in PS double-quoted sample),
+  30/30 -> 32/32; (b) `boot-uefi.ps1` documents the VALUE/boundary
+  policy once above `permauditUNPat` (order phys/user/nx/w assumed,
+  values value-free `[01]`, `[ \t]` mid-line vs `(\s|$)` line-terminal
+  with the `\n` rationale); (c) accept nit (3): sitrep 2-file flag was
+  accurate at generation time (pre-commit dirty, post-commit clean),
+  not a false alarm -- stop counting it as one.
+- **Why:** Slice-28 widening to `[ \t]` had only rejection coverage
+  (split fails); without a tab acceptance case a regression to the
+  literal-space form still passed 30/30. The asymmetry note
+  (`user` `[ \t]` vs `nx` `(\s|$)`) needed one canonical statement so
+  future probes copy the right class per position.
+- **Alternatives:** Leave tab unpinned as reviewer-optional polish
+  (rejected: two-line control, pins the exact acceptance just added);
+  switch `nx` to `[ \t]` for symmetry (rejected: `nx` sits before
+  ` w=` or EOL so `(\s|$)` is the correct terminal class, consistent
+  with `w=1(\s|$)`);
+- **Expected:** gate test 32/32 PASS; guest untouched (host-only).
+- **Measured (2026-09-27, Win11):** `test-boot-uefi-gates.ps1` GATE TEST
+  PASS (32/32: 8 W + 18 user/nx-shape + 6 GUARD) exit 0; baseline
+  pre-edit re-verified 30/30 PASS. Guest untouched (`git status`
+  ps1-only two files + worklog).
+- **Final:** REVIEW #184 nits 1-3 closed; slice28 APPROVED @db56c93
+  stands. Remaining: #139 note 1 (Reserved/MBZ), #168 nit 4 (live
+  `#PF` injection). Next: live `#PF` injection or Reserved/MBZ audit.
+  #6 stays active.

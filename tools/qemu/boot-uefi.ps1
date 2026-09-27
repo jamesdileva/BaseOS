@@ -177,6 +177,15 @@ if ($serialText -and $serialText.Contains($marker)) {
   # `\n` and let a newline-split `user`/`nx` pair false-pass (caught by
   # the gate test this slice). `nx` keeps `(\s|$)` because it sits
   # before ` w=` or line-end, consistent with `w=1(\s|$)`.
+  # VALUE/boundary policy (REVIEW #184 nit2, one place): PERMAUDIT lines
+  # assume field order phys/user/nx/w. VALUES stay value-free ([01] shape,
+  # never pinned 0) so a future NX/SMEP policy flipping user/nx still
+  # passes shape. BOUNDARIES are trailing-class choices per position:
+  # mid-line `user` uses `[ \t]` (single same-line blank: space/tab,
+  # consumed once) because `(\s|$)` matches `\n` and false-passed the
+  # newline-split pair; line-terminal `nx`/`w` use `(\s|$)` (space or
+  # line-end) since a field or EOL always follows. Same rule mirrors to
+  # PERMAUDIT2.
   $permauditUNPat = "PERMAUDIT ok=1 [^\r\n]* user=[01][ \t][^\r\n]*nx=[01](\s|$)"
   # S04 slice 20 (REVIEW #147 risk 1 multi-probe): second low-RAM probe on
   # its own line. Slice 21 gates `w=1` same-line (baseline measured w=1 on
