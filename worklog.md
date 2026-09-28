@@ -2666,3 +2666,46 @@ Format per entry (per `implementation-guide.md` §31):
   remaining MBZ (address-size/PK/PAT) + guest `RMBZ` wiring + #168 nit 4
   (live `#PF`) still open. Next: guest `RMBZ` line or live `#PF`. #6
   stays active.
+
+## S04 slice 32 -- RMBZ audit shape: raw-leaf walker + violation counter (host-only + QEMU re-verify)
+
+- **Decision:** Second #139 note 1 step as one host-only slice in
+  `crates/kernel/src/page_table.rs`: new `walk_full_leaf_raw`
+  (`Ok((phys, raw_pte, level))`, level 2/1 for 1 GiB/2 MiB `PS` leaves,
+  0 for 4 KiB; same fail-closed errors as `walk_full_leaf_flags`) plus
+  `const rmbz_count_violations(leaves, nx_enabled)` counting
+  `pte_reserved_violation` hits over walked leaves (walk failures
+  contribute no leaf; guest reports walk `ok` separately). One test
+  `walk_full_leaf_raw_matches_flags_walk_and_feeds_rmbz` pins raw ==
+  flags-walk phys/bits, large-page level 2, NX on/off counts
+  (0 vs 1), two-leaf mixed audit, empty slice, and failure parity.
+  Guest untouched; `RMBZ` serial line + `EFER.NXE` pin ride with the
+  next guest-touching slice.
+- **Why:** The slice-31 helper classifies one PTE but the guest has no
+  shared shape to obtain `(raw, level)` from live tables; wiring the
+  serial line before the walker exists doubles single-cycle risk.
+  Raw walker + counter are provable on the host with zero QEMU risk.
+- **Alternatives:** Guest `RMBZ` line in the same commit (rejected:
+  needs `EFER.NXE` MSR read + serial/ps1/gate changes on top of the
+  walker; helper first, wiring next); reuse `walk_full_leaf_flags`
+  flags only (rejected: flags drop bit 63-vs-enabled distinction and
+  the leaf level the audit needs).
+- **Expected:** default 89 (88 + 1), kernel 58 (57 + 1), boot-uefi 15,
+  gate test 32/32; fmt/clippy clean; `boot-uefi.ps1` PASS unchanged
+  (guest bytes stable, host-only change).
+- **Measured (2026-09-28, Win11):** default `cargo test` 89/89
+  (21+58+4+4+2), `-p baseos-kernel` 58/58 (1 new),
+  `-p baseos-boot-uefi` 15/15, `cargo fmt --check` clean (one
+  auto-format on the level-0 return tuple),
+  `cargo clippy --all-targets -- -D warnings` exit 0,
+  `clippy -p baseos-boot-uefi --tests -- -D warnings` exit 0,
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -- -D warnings` exit 0; `test-boot-uefi-gates.ps1` GATE TEST PASS
+  (32/32); `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 856 bytes,
+  marker FOUND, map_size=4704/desc_size=48 budget ok, guest
+  `bootx64.efi` 79360 bytes (unchanged: host-only, kernel links into
+  guest but bytes stable).
+- **Final:** #139 note 1 audit shape complete host-side (classify +
+  walk-raw + count); remaining: guest `RMBZ` line with live `EFER.NXE`
+  + address-size/PK/PAT mode pins + #168 nit 4 (live `#PF`). Next:
+  guest `RMBZ` line. #6 stays active.

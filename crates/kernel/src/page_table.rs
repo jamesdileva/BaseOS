@@ -762,6 +762,88 @@ where
     Err(WalkerError::InvalidLevel)
 }
 
+/// Full 4-level walk returning the raw leaf PTE and its level alongside
+/// the physical address: `Ok((phys, raw_pte, level))` where `level` is
+/// 2/1 for `PS` large-page leaves (1 GiB / 2 MiB) and 0 for a 4 KiB PTE.
+/// Mirrors [`walk_full_leaf_flags`] entry-for-entry (same fail-closed
+/// errors) so the guest `RMBZ` audit reads exactly the bits the address
+/// walk used — the caller feeds `(raw_pte, level)` into
+/// [`pte_reserved_violation`] with the live `EFER.NXE` pin.
+///
+/// Pure / `no_std`-clean; host tests and the post-EBS guest share it.
+pub fn walk_full_leaf_raw<'a, F>(
+    cr3_base: u64,
+    virt: u64,
+    lookup: F,
+) -> Result<(u64, u64, u8), WalkerError>
+where
+    F: Fn(u64) -> Option<&'a [u64; 512]>,
+{
+    if cr3_base & PAGE_OFFSET_MASK != 0 {
+        return Err(WalkerError::MisalignedPhys);
+    }
+    let mut base = cr3_base;
+    for level in [3u8, 2, 1, 0] {
+        let table = lookup(base).ok_or(WalkerError::MissingTable)?;
+        if !is_canonical(virt) {
+            return Err(WalkerError::NonCanonical);
+        }
+        let Some(idx) = page_table_index(virt, level) else {
+            return Err(WalkerError::InvalidLevel);
+        };
+        let pte = table[idx as usize];
+        if pte & 1 == 0 {
+            return Err(WalkerError::NotPresent);
+        }
+        if pte & PTE_PS_BIT != 0 {
+            match level {
+                2 => {
+                    let leaf = pte & PTE_ADDR_MASK & !LARGE_1G_OFFSET_MASK;
+                    return Ok((leaf + (virt & LARGE_1G_OFFSET_MASK), pte, level));
+                }
+                1 => {
+                    let leaf = pte & PTE_ADDR_MASK & !LARGE_2M_OFFSET_MASK;
+                    return Ok((leaf + (virt & LARGE_2M_OFFSET_MASK), pte, level));
+                }
+                _ => return Err(WalkerError::NotPresent),
+            }
+        }
+        if level == 0 {
+            return Ok((
+                pte_decoded_phys(pte) + (virt & PAGE_OFFSET_MASK),
+                pte,
+                level,
+            ));
+        }
+        base = pte_decoded_phys(pte);
+    }
+    // Unreachable: the level-0 arm above always returns.
+    Err(WalkerError::InvalidLevel)
+}
+
+/// Count mode-independent reserved/MBZ violations over walked leaves
+/// (#139 note 1, guest `RMBZ` audit shape).
+///
+/// `leaves` holds one `(raw_pte, level)` per successfully walked probe
+/// (see [`walk_full_leaf_raw`]); `nx_enabled` is the live `EFER.NXE` pin.
+/// Returns the number of entries where [`pte_reserved_violation`] is true.
+/// Pure / `const`-compatible so host tests and the guest share the exact
+/// counting rule; walk failures contribute no leaf (the guest reports the
+/// walk `ok` separately, never a silent zero).
+#[must_use]
+pub const fn rmbz_count_violations(leaves: &[(u64, u8)], nx_enabled: bool) -> usize {
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i < leaves.len() {
+        let (pte, level) = leaves[i];
+        if pte_reserved_violation(pte, level, nx_enabled) {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
 /// Synthetic permission-fault self-test for the guest `PERM` e2e line.
 ///
 /// Builds a fixed 5-entry [`PageTable`] (kernel RO at `0x1000`, kernel RW
@@ -1877,5 +1959,70 @@ mod tests {
         assert!(!pte_reserved_violation(present_nx & !1, 0, false));
         // No such paging level counts as a violation.
         assert!(pte_reserved_violation(present_rw, 4, true));
+    }
+
+    #[test]
+    fn walk_full_leaf_raw_matches_flags_walk_and_feeds_rmbz() {
+        // Slice 32 (guest RMBZ audit shape): raw walker returns the exact
+        // leaf bits the flags walk decoded, plus the level the reserved
+        // audit needs. Walk failures surface the same errors (no leaf).
+        let virt: u64 = 0x1234;
+        let mut pml4 = [0u64; 512];
+        let mut pdpt = [0u64; 512];
+        let mut pd = [0u64; 512];
+        let mut pt = [0u64; 512];
+        pml4[page_table_index(virt, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap();
+        pdpt[page_table_index(virt, 2).unwrap() as usize] =
+            encode_table_entry(0x3000, K_RW).unwrap();
+        pd[page_table_index(virt, 1).unwrap() as usize] = encode_table_entry(0x4000, K_RW).unwrap();
+        let leaf = pte_encode(0x5000, K_RW) | (1 << 63);
+        pt[page_table_index(virt, 0).unwrap() as usize] = leaf;
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd),
+                0x4000 => Some(&pt),
+                _ => None,
+            }
+        };
+        let (phys_raw, raw, level) = walk_full_leaf_raw(0x1000, virt, lookup).unwrap();
+        assert_eq!(level, 0);
+        assert_eq!(raw, leaf);
+        let (phys_flags, flags) = walk_full_leaf_flags(0x1000, virt, lookup).unwrap();
+        assert_eq!(phys_raw, phys_flags);
+        assert_eq!(flags, pte_decoded_flags(raw));
+        // NX-enabled: legal leaf, zero violations; NX-disabled: one.
+        assert_eq!(rmbz_count_violations(&[(raw, level)], true), 0);
+        assert_eq!(rmbz_count_violations(&[(raw, level)], false), 1);
+        // Large-page leaf reports its level (2) with the same phys.
+        let virt_1g: u64 = 0x4000_1234;
+        let mut pml4_1g = [0u64; 512];
+        let mut pdpt_1g = [0u64; 512];
+        pml4_1g[page_table_index(virt_1g, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap();
+        pdpt_1g[page_table_index(virt_1g, 2).unwrap() as usize] =
+            encode_table_entry(0x4000_0000, K_RW).unwrap() | PTE_PS_BIT;
+        let lookup_1g = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4_1g),
+                0x2000 => Some(&pdpt_1g),
+                _ => None,
+            }
+        };
+        let (phys_1g, raw_1g, level_1g) = walk_full_leaf_raw(0x1000, virt_1g, lookup_1g).unwrap();
+        assert_eq!(level_1g, 2);
+        assert_eq!(phys_1g, walk_full(0x1000, virt_1g, lookup_1g).unwrap());
+        assert_eq!(rmbz_count_violations(&[(raw_1g, level_1g)], true), 0);
+        // Two-leaf audit: clean + NX-disabled-violating = 1.
+        assert_eq!(
+            rmbz_count_violations(&[(raw_1g, level_1g), (raw, level)], false),
+            1
+        );
+        assert_eq!(rmbz_count_violations(&[], true), 0);
+        // Walk failure parity: unmapped virt fails on both walkers.
+        assert!(walk_full_leaf_raw(0x1000, 0x9999_0000, lookup).is_err());
+        assert!(walk_full_leaf_flags(0x1000, 0x9999_0000, lookup).is_err());
     }
 }
