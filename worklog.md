@@ -2595,3 +2595,40 @@ Format per entry (per `implementation-guide.md` §31):
   stands. Remaining: #139 note 1 (Reserved/MBZ), #168 nit 4 (live
   `#PF` injection). Next: live `#PF` injection or Reserved/MBZ audit.
   #6 stays active.
+
+## S04 slice 30 -- MEMORY sync to slice29 + QEMU re-verify (2026-09-28)
+
+- **Decision:** Sync shared `MEMORY.md` to the slice29 @6975b69 tree
+  (was stale at slice27 @0ab2ca7) and QEMU re-verify the unchanged
+  guest before the next slice, closing the three-deep host-only stack
+  (slices 27-29) the same way slice 26 did. Zero guest/script change;
+  diff is `MEMORY.md` + this worklog entry. Board line updated to OK
+  per human #79/#80 (supersedes ignore-board).
+- **Why:** Slices 27/28/29 were host-only gate tightenings with QEMU
+  skips; two stacked skips were already closed by a re-verify at slice
+  26, and three stacked skips needed the same parity restore before
+  the Reserved/MBZ or live-`#PF` slice touches the guest again.
+- **Alternatives:** Fold the re-verify into the next guest-touching
+  slice (rejected: stacks a fourth skip; one QEMU run now restores the
+  non-interference baseline); commit a serial/log artifact (rejected:
+  repo keeps serial logs gitignored under `target/`; commit message +
+  MEMORY + this worklog row is the recorded proof, same as slice 26).
+- **Expected:** gate test 32/32 PASS; default 87, kernel 56, boot-uefi
+  15; fmt clean; clippy host + UEFI clean; guest untouched;
+  `boot-uefi.ps1` PASS with 856B serial + `GUARD ok=1 passed=7/7`.
+- **Measured (2026-09-28, Win11):** `test-boot-uefi-gates.ps1` GATE TEST
+  PASS (32/32: 8 W + 18 user/nx-shape + 6 GUARD) exit 0; default
+  `cargo test` 87/87 (21+56+4+4+2), `-p baseos-kernel` 56/56,
+  `-p baseos-boot-uefi` 15/15, `cargo fmt --check` clean,
+  `cargo clippy --all-targets -- -D warnings` clean,
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings`
+  clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 856 bytes,
+  guest `bootx64.efi` 79360 bytes (same as slice-24 baseline):
+  `PERM ok=1 passed=9/9`, `GUARD ok=1 passed=7/7`,
+  `PERMAUDIT ok=1 phys=0x80000000 user=0 nx=0 w=1`,
+  `PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=0 w=1`, `EXC ok=1 vector=0`;
+  `smoke.ps1 -RequireOvmf` SMOKE PASS.
+- **Final:** Parity restored on the current tree; slices 27-29 stand
+  verified. Remaining: #139 note 1 (Reserved/MBZ), #168 nit 4 (live
+  `#PF` injection). Next: Reserved/MBZ audit or live `#PF` injection.
+  #6 stays active.
