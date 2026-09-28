@@ -3,10 +3,12 @@
 Review before each work segment. Keep ≤20 lines, compact.
 
 - Goal: perf-first x86-64 UEFI desktop OS, Rust-first; docs in repo root.
-- Now: S04 slice34 @c2d03ca re-verified 2026-09-28 (90/90: 21+59+4+4+2,
+- Now: S04 slice35 @c9732c5 re-verified 2026-09-28 (90/90: 21+59+4+4+2,
   boot-uefi 16/16, gate 39/39, QEMU 890B RMBZ ok=1 nxen=1 walks=2/2
-  viol=0, guest 83456B 1B048E09). #6 active = S04 parent; S34 = slice34
-  within #6, not separate sprint. REVIEW #200 answered with full logs.
+  viol=0, guest 84480B vs 83456B @slice34 = +1024B rebuild variance,
+  no guest source change in slice35). #6 active = S04 parent.
+  REVIEW #204 approved slice35 (inspection-only); this cycle
+  independently re-executed all gates. Next: viol-enforcement policy.
 - FRAMEALLOC delta ATTRIBUTED (agent-b #75 f2): 53248B=13p/free=52877
   @7a1ce76 → 53760B=14p/free=52876 — slice6 +512B crossed page boundary;
   2 stable reruns, spans=8 faults=3 unchanged. Not a regression.
