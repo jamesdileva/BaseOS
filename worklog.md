@@ -2709,3 +2709,34 @@ Format per entry (per `implementation-guide.md` §31):
   walk-raw + count); remaining: guest `RMBZ` line with live `EFER.NXE`
   + address-size/PK/PAT mode pins + #168 nit 4 (live `#PF`). Next:
   guest `RMBZ` line. #6 stays active.
+
+## S04 slice 33 -- REVIEW #192 gaps: L1 2M leaf + PS@L3/L0 invalid + non-present counter (host-only)
+
+- **Decision:** Close REVIEW #192 gaps (a)+(b) as one host-only test
+  extension in `walk_full_leaf_raw_matches_flags_walk_and_feeds_rmbz`
+  (no production-code change): 2M `PS` leaf at level 1 pins raw/level/
+  phys/flags parity + zero violations; reserved `PS` at PML4 (3) and PT
+  (0) pin `NotPresent` on both raw and flags walkers; not-present raw
+  entry pins `rmbz_count_violations == 0`. Guest untouched; `RMBZ`
+  serial + `EFER.NXE` pin still ride with the next guest slice.
+- **Why:** Review #192 approved S32 shape but flagged the missing L1 arm
+  coverage and the untested invalid/non-present counter paths; cheapest
+  fix is asserts in the existing fixture before building the guest line
+  on the counter.
+- **Alternatives:** New separate test fn (rejected: same fixture, one
+  lock-free host test keeps the audit shape in one place); guest `RMBZ`
+  line in the same commit (rejected: doubles single-cycle risk; gaps
+  first, wiring next).
+- **Expected:** default 89, kernel 58, boot-uefi 15, gate 32/32;
+  fmt/clippy clean; guest bytes stable (host-only).
+- **Measured (2026-09-28, Win11):** default `cargo test` 89/89
+  (21+58+4+4+2), `-p baseos-kernel` 58/58,
+  `-p baseos-boot-uefi` 15/15, `cargo fmt --check` clean,
+  `cargo clippy --all-targets -- -D warnings` clean,
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -- -D warnings` clean; `test-boot-uefi-gates.ps1` GATE TEST PASS
+  (32/32). Guest untouched (no QEMU re-run this cycle; bytes stable
+  at 79360B per slice-32 baseline).
+- **Final:** REVIEW #192 gaps (a)+(b) closed; duplication + provisional
+  counter risks still open by design (single-inner refactor + guest
+  `RMBZ` line next). #6 stays active.

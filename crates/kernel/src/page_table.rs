@@ -2020,6 +2020,80 @@ mod tests {
             rmbz_count_violations(&[(raw_1g, level_1g), (raw, level)], false),
             1
         );
+        // Level-1 2M PS leaf reports level 1 with matching phys/flags.
+        let virt_2m: u64 = 0x20_1234;
+        let mut pml4_2m = [0u64; 512];
+        let mut pdpt_2m = [0u64; 512];
+        let mut pd_2m = [0u64; 512];
+        pml4_2m[page_table_index(virt_2m, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap();
+        pdpt_2m[page_table_index(virt_2m, 2).unwrap() as usize] =
+            encode_table_entry(0x3000, K_RW).unwrap();
+        pd_2m[page_table_index(virt_2m, 1).unwrap() as usize] =
+            encode_table_entry(0x20_0000, K_RW).unwrap() | PTE_PS_BIT;
+        let lookup_2m = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4_2m),
+                0x2000 => Some(&pdpt_2m),
+                0x3000 => Some(&pd_2m),
+                _ => None,
+            }
+        };
+        let (phys_2m, raw_2m, level_2m) = walk_full_leaf_raw(0x1000, virt_2m, lookup_2m).unwrap();
+        assert_eq!(level_2m, 1);
+        assert_eq!(phys_2m, walk_full(0x1000, virt_2m, lookup_2m).unwrap());
+        let (_, flags_2m) = walk_full_leaf_flags(0x1000, virt_2m, lookup_2m).unwrap();
+        assert_eq!(flags_2m, pte_decoded_flags(raw_2m));
+        assert_eq!(rmbz_count_violations(&[(raw_2m, level_2m)], true), 0);
+        // Reserved PS at PML4 (3) / PT (0) fails closed on both walkers.
+        let mut pml4_ps = [0u64; 512];
+        pml4_ps[page_table_index(virt, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap() | PTE_PS_BIT;
+        let lookup_ps3 = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4_ps),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            walk_full_leaf_raw(0x1000, virt, lookup_ps3),
+            Err(WalkerError::NotPresent)
+        );
+        assert_eq!(
+            walk_full_leaf_flags(0x1000, virt, lookup_ps3),
+            Err(WalkerError::NotPresent)
+        );
+        let mut pml4_l0 = [0u64; 512];
+        let mut pdpt_l0 = [0u64; 512];
+        let mut pd_l0 = [0u64; 512];
+        let mut pt_ps = [0u64; 512];
+        pml4_l0[page_table_index(virt, 3).unwrap() as usize] =
+            encode_table_entry(0x2000, K_RW).unwrap();
+        pdpt_l0[page_table_index(virt, 2).unwrap() as usize] =
+            encode_table_entry(0x3000, K_RW).unwrap();
+        pd_l0[page_table_index(virt, 1).unwrap() as usize] =
+            encode_table_entry(0x4000, K_RW).unwrap();
+        pt_ps[page_table_index(virt, 0).unwrap() as usize] =
+            encode_table_entry(0x5000, K_RW).unwrap() | PTE_PS_BIT;
+        let lookup_ps0 = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4_l0),
+                0x2000 => Some(&pdpt_l0),
+                0x3000 => Some(&pd_l0),
+                0x4000 => Some(&pt_ps),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            walk_full_leaf_raw(0x1000, virt, lookup_ps0),
+            Err(WalkerError::NotPresent)
+        );
+        assert_eq!(
+            walk_full_leaf_flags(0x1000, virt, lookup_ps0),
+            Err(WalkerError::NotPresent)
+        );
+        // Not-present raw entries never count toward the violation total.
+        assert_eq!(rmbz_count_violations(&[(raw & !1, level)], false), 0);
         assert_eq!(rmbz_count_violations(&[], true), 0);
         // Walk failure parity: unmapped virt fails on both walkers.
         assert!(walk_full_leaf_raw(0x1000, 0x9999_0000, lookup).is_err());
