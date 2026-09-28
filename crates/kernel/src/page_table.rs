@@ -821,7 +821,7 @@ pub const fn rmbz_count_violations(leaves: &[(u64, u8)], nx_enabled: bool) -> us
 /// loudly instead of reporting a nonzero count as success.
 ///
 /// Pure / `const`-compatible so host tests and the guest share the exact
-/// enforcement rule; the guest [`probe_rmbz`](../../../baseos-boot-uefi/src/main.rs)
+/// enforcement rule; the guest [`probe_rmbz`](../../boot-uefi/src/main.rs)
 /// path calls this (it cannot construct `ok` inline anymore).
 #[must_use]
 pub const fn rmbz_audit_ok(walks_ok: usize, walks_total: usize, violations: usize) -> bool {
