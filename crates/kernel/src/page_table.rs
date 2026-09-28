@@ -658,7 +658,16 @@ pub fn table_base_in_boot_map(info: &BootInfo, phys: u64) -> bool {
 /// non-capturing closure). The guest `CR3` slice reuses this shape with its
 /// `phys_to_table_ptr` fn pointer, keeping the per-level call a direct
 /// inlined call with no dynamic dispatch (REVIEW #133 caveat 2).
-pub fn walk_full<'a, F>(cr3_base: u64, virt: u64, lookup: F) -> Result<u64, WalkerError>
+/// Single inner 4-level walk shared by [`walk_full`],
+/// [`walk_full_leaf_flags`] and [`walk_full_leaf_raw`] (S04 slice 35:
+/// de-duplicates the triplicated canonical -> PRESENT -> PS-at-level loop).
+/// Returns `(phys, raw_pte, level)` at the leaf; thin wrappers project out
+/// the shape they need so address, flags and audit reads can never drift.
+fn walk_full_inner<'a, F>(
+    cr3_base: u64,
+    virt: u64,
+    lookup: F,
+) -> Result<(u64, u64, u8), WalkerError>
 where
     F: Fn(u64) -> Option<&'a [u64; 512]>,
 {
@@ -685,19 +694,39 @@ where
             match level {
                 2 => {
                     let leaf = pte & PTE_ADDR_MASK & !LARGE_1G_OFFSET_MASK;
-                    return Ok(leaf + (virt & LARGE_1G_OFFSET_MASK));
+                    return Ok((leaf + (virt & LARGE_1G_OFFSET_MASK), pte, level));
                 }
                 1 => {
                     let leaf = pte & PTE_ADDR_MASK & !LARGE_2M_OFFSET_MASK;
-                    return Ok(leaf + (virt & LARGE_2M_OFFSET_MASK));
+                    return Ok((leaf + (virt & LARGE_2M_OFFSET_MASK), pte, level));
                 }
                 // PML4 (3) / PT (0) never carry PS: reserved -> fail closed.
                 _ => return Err(WalkerError::NotPresent),
             }
         }
+        if level == 0 {
+            return Ok((
+                pte_decoded_phys(pte) + (virt & PAGE_OFFSET_MASK),
+                pte,
+                level,
+            ));
+        }
         base = pte_decoded_phys(pte);
     }
-    Ok(base + (virt & PAGE_OFFSET_MASK))
+    // Unreachable: the level-0 arm above always returns.
+    Err(WalkerError::InvalidLevel)
+}
+
+/// Full 4-level walk from a `CR3` base through a next-table lookup.
+///
+/// Thin wrapper over [`walk_full_inner`]: returns the 4 KiB page base plus
+/// `virt & PAGE_OFFSET_MASK`, or the large-page base plus offset at a `PS`
+/// leaf (see inner for fail-closed errors and large-page policy).
+pub fn walk_full<'a, F>(cr3_base: u64, virt: u64, lookup: F) -> Result<u64, WalkerError>
+where
+    F: Fn(u64) -> Option<&'a [u64; 512]>,
+{
+    walk_full_inner(cr3_base, virt, lookup).map(|(phys, _, _)| phys)
 }
 
 /// Full 4-level walk returning the leaf permission flags alongside the
@@ -721,45 +750,7 @@ pub fn walk_full_leaf_flags<'a, F>(
 where
     F: Fn(u64) -> Option<&'a [u64; 512]>,
 {
-    if cr3_base & PAGE_OFFSET_MASK != 0 {
-        return Err(WalkerError::MisalignedPhys);
-    }
-    let mut base = cr3_base;
-    for level in [3u8, 2, 1, 0] {
-        let table = lookup(base).ok_or(WalkerError::MissingTable)?;
-        if !is_canonical(virt) {
-            return Err(WalkerError::NonCanonical);
-        }
-        let Some(idx) = page_table_index(virt, level) else {
-            return Err(WalkerError::InvalidLevel);
-        };
-        let pte = table[idx as usize];
-        if pte & 1 == 0 {
-            return Err(WalkerError::NotPresent);
-        }
-        if pte & PTE_PS_BIT != 0 {
-            match level {
-                2 => {
-                    let leaf = pte & PTE_ADDR_MASK & !LARGE_1G_OFFSET_MASK;
-                    return Ok((leaf + (virt & LARGE_1G_OFFSET_MASK), pte_decoded_flags(pte)));
-                }
-                1 => {
-                    let leaf = pte & PTE_ADDR_MASK & !LARGE_2M_OFFSET_MASK;
-                    return Ok((leaf + (virt & LARGE_2M_OFFSET_MASK), pte_decoded_flags(pte)));
-                }
-                _ => return Err(WalkerError::NotPresent),
-            }
-        }
-        if level == 0 {
-            return Ok((
-                pte_decoded_phys(pte) + (virt & PAGE_OFFSET_MASK),
-                pte_decoded_flags(pte),
-            ));
-        }
-        base = pte_decoded_phys(pte);
-    }
-    // Unreachable: the level-0 arm above always returns.
-    Err(WalkerError::InvalidLevel)
+    walk_full_inner(cr3_base, virt, lookup).map(|(phys, raw, _)| (phys, pte_decoded_flags(raw)))
 }
 
 /// Full 4-level walk returning the raw leaf PTE and its level alongside
@@ -779,46 +770,7 @@ pub fn walk_full_leaf_raw<'a, F>(
 where
     F: Fn(u64) -> Option<&'a [u64; 512]>,
 {
-    if cr3_base & PAGE_OFFSET_MASK != 0 {
-        return Err(WalkerError::MisalignedPhys);
-    }
-    let mut base = cr3_base;
-    for level in [3u8, 2, 1, 0] {
-        let table = lookup(base).ok_or(WalkerError::MissingTable)?;
-        if !is_canonical(virt) {
-            return Err(WalkerError::NonCanonical);
-        }
-        let Some(idx) = page_table_index(virt, level) else {
-            return Err(WalkerError::InvalidLevel);
-        };
-        let pte = table[idx as usize];
-        if pte & 1 == 0 {
-            return Err(WalkerError::NotPresent);
-        }
-        if pte & PTE_PS_BIT != 0 {
-            match level {
-                2 => {
-                    let leaf = pte & PTE_ADDR_MASK & !LARGE_1G_OFFSET_MASK;
-                    return Ok((leaf + (virt & LARGE_1G_OFFSET_MASK), pte, level));
-                }
-                1 => {
-                    let leaf = pte & PTE_ADDR_MASK & !LARGE_2M_OFFSET_MASK;
-                    return Ok((leaf + (virt & LARGE_2M_OFFSET_MASK), pte, level));
-                }
-                _ => return Err(WalkerError::NotPresent),
-            }
-        }
-        if level == 0 {
-            return Ok((
-                pte_decoded_phys(pte) + (virt & PAGE_OFFSET_MASK),
-                pte,
-                level,
-            ));
-        }
-        base = pte_decoded_phys(pte);
-    }
-    // Unreachable: the level-0 arm above always returns.
-    Err(WalkerError::InvalidLevel)
+    walk_full_inner(cr3_base, virt, lookup)
 }
 
 /// EFER MSR number (AMD64 `EFER`, `0xC000_0080`): the guest reads this

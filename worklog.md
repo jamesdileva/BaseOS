@@ -2822,3 +2822,33 @@ Format per entry (per `implementation-guide.md` §31):
   Known limits stand: provisional counter (viol>0 reporting-only),
   duplication single-inner refactor, #168n4 live `#PF`, viol enforcement
   policy. #6 stays active.
+
+## S04 slice35 -- walker single-inner refactor (2026-09-28)
+
+- **Decision:** De-duplicate the triplicated 4-level walk loop in
+  `crates/kernel/src/page_table.rs` behind one private `walk_full_inner`
+  returning `(phys, raw_pte, level)`; `walk_full` / `walk_full_leaf_flags` /
+  `walk_full_leaf_raw` become thin projections (phys-only, phys+decoded
+  flags, raw triple). No public API, error, or serial/script change.
+- **Why:** REVIEW #202 keeps duplication single-inner refactor as an open
+  risk and #6 active; three copies of canonical -> PRESENT -> PS-at-level
+  can drift (address vs flags vs audit reads).
+- **Alternatives:** Keep triplication + parity tests (rejected: tests pin
+  drift after the fact, single source prevents it); merge into one public
+  API returning the triple (rejected: churns guest callers + e2e for no
+  behavior gain).
+- **Expected:** default 90, kernel 59, boot-uefi 16, gate 39/39, QEMU PASS
+  890B `RMBZ ok=1 nxen=1 walks=2/2 viol=0`, fmt/clippy clean both targets.
+- **Measured (2026-09-28, Win11):** `cargo test` 90/90 default
+  (21 boot-info + 59 kernel + 4 marker + 4 harness + 2 version);
+  `cargo test -p baseos-boot-uefi` 16/16;
+  `tools/qemu/test-boot-uefi-gates.ps1` GATE TEST PASS (39/39);
+  `cargo fmt --check` clean; `cargo clippy --all-targets -D warnings`
+  exit 0; `cargo clippy -p baseos-boot-uefi --target
+  x86_64-unknown-uefi -D warnings` exit 0;
+  `tools/qemu/boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 890 bytes
+  (marker FOUND, BOOTINFO/MEMMAP/FB/GOP/EBS/KERNEL/FRAMEALLOC/PAGING/PERM/
+  GUARD 7/7/PERMAUDIT/PERMAUDIT2/RMBZ ok=1 viol/EXC all ok).
+- **Final:** Duplication risk closed with zero behavior change. Open:
+  provisional counter (viol reporting-only), #168n4 live #PF, viol
+  enforcement policy. #6 stays active until enforcement + b-repro.
