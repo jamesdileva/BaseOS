@@ -821,6 +821,23 @@ where
     Err(WalkerError::InvalidLevel)
 }
 
+/// EFER MSR number (AMD64 `EFER`, `0xC000_0080`): the guest reads this
+/// live post-EBS so the `RMBZ` audit uses the real `NXE` pin, not an
+/// assumed value (#139 note 1: `NO_EXEC`/bit 63 is MBZ while `NXE=0`).
+pub const EFER_MSR: u32 = 0xC000_0080;
+/// `NXE` (No-Execute Enable) bit in `EFER` (bit 11).
+pub const EFER_NXE_BIT: u64 = 1 << 11;
+
+/// True when `EFER.NXE` is set in a raw `EFER` value read via `rdmsr`.
+///
+/// Pure / `const`-compatible so host tests and the guest share the exact
+/// decode rule; the guest feeds the live `read_efer()` value, host tests
+/// feed synthetic values.
+#[must_use]
+pub const fn efer_nxe_enabled(efer: u64) -> bool {
+    efer & EFER_NXE_BIT != 0
+}
+
 /// Count mode-independent reserved/MBZ violations over walked leaves
 /// (#139 note 1, guest `RMBZ` audit shape).
 ///
@@ -1959,6 +1976,17 @@ mod tests {
         assert!(!pte_reserved_violation(present_nx & !1, 0, false));
         // No such paging level counts as a violation.
         assert!(pte_reserved_violation(present_rw, 4, true));
+    }
+
+    #[test]
+    fn efer_nxe_decode_pins_live_bit() {
+        // #139 note 1 (slice 34): the guest RMBZ line feeds live EFER
+        // through this decode — pin the bit position host-side.
+        assert!(efer_nxe_enabled(EFER_NXE_BIT));
+        assert!(!efer_nxe_enabled(0));
+        assert!(!efer_nxe_enabled(!EFER_NXE_BIT));
+        assert!(efer_nxe_enabled(u64::MAX));
+        assert_eq!(EFER_MSR, 0xC000_0080);
     }
 
     #[test]

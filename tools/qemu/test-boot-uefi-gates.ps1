@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Checked-in regex control for boot-uefi.ps1 gates (S04 slices 22+25+27+28).
+  Checked-in regex control for boot-uefi.ps1 gates (S04 slices 22+25+27+28+34).
   Reads the live W + user/nx-shape patterns + GUARD pattern from boot-uefi.ps1
   (no duplication) and asserts:
   PERMAUDIT/W: w=1 passes, w=0 fails, w=10 fails (REVIEW #158 finding 1),
@@ -15,6 +15,9 @@
   GUARD (REVIEW #168 nits 1-3): ok=1 passed=7/7 passes; ok=10 / ok=1x fail
   (boundary tightening); passed=6/7 fails (coverage pin); missing passed
   fails; newline-split fails.
+  RMBZ (S04 slice 34, #139 note 1): ok=1 viol=0 passes; viol count
+  value-free (viol=10 passes); ok=10 / ok=1x fail; missing viol fails;
+  newline-split fails.
   Exits 0 on PASS, 1 on FAIL.
 #>
 $ErrorActionPreference = "Stop"
@@ -37,6 +40,7 @@ $w2 = Get-Pat "permaudit2WPat"
 $u1 = Get-Pat "permauditUNPat"
 $u2 = Get-Pat "permaudit2UNPat"
 $g = Get-Pat "guardPat"
+$r = Get-Pat "rmbzPat"
 
 # Finding-1 lock: both patterns must carry the literal `w=1(\s|$)` tightening
 # so w=10 cannot match via the w=1 substring. Match the literal suffix
@@ -67,6 +71,14 @@ foreach ($p in @($u1, $u2)) {
 # to the boundary-less form still passed the lock line (caught only by G-ten).
 if (($g -notlike '*GUARD ok=1 *') -or (-not $g.Contains('[^\r\n]*passed=7/7')) -or ($g -notlike '*passed=7/7(\s|$)*')) {
   Write-Output "GATE TEST FAIL (GUARD pattern missing ok=1/passed=7/7 tightening: $g)"
+  exit 1
+}
+# S04 slice 34 (#139 note 1 RMBZ gate): pattern must carry the literal
+# space after `ok=1` (boundary, mirrors GUARD), same-line `[^\r\n]*viol`,
+# and a `viol=` pin with a `(\s|$)` boundary so ok=10 / missing-viol /
+# newline-split pairs fail while any viol COUNT passes (value-free).
+if (($r -notlike '*RMBZ ok=1 *') -or (-not $r.Contains('[^\r\n]*viol=')) -or ($r -notlike '*viol=\d+(\s|$)*')) {
+  Write-Output "GATE TEST FAIL (RMBZ pattern missing ok=1/viol tightening: $r)"
   exit 1
 }
 
@@ -103,7 +115,13 @@ $cases = @(
   @("G-onex", $g, "GUARD ok=1x passed=7/7`n", $false, "ok=1x fails"),
   @("G-six", $g, "GUARD ok=1 passed=6/7`n", $false, "6/7 fails"),
   @("G-nopass", $g, "GUARD ok=1`n", $false, "missing passed fails"),
-  @("G-split", $g, "GUARD ok=1`n passed=7/7`n", $false, "newline-split fails")
+  @("G-split", $g, "GUARD ok=1`n passed=7/7`n", $false, "newline-split fails"),
+  @("R-good", $r, "RMBZ ok=1 nxen=1 walks=2/2 viol=0`n", $true, "ok=1 viol passes"),
+  @("R-viol10", $r, "RMBZ ok=1 nxen=1 walks=2/2 viol=10`n", $true, "viol count value-free"),
+  @("R-ten", $r, "RMBZ ok=10 nxen=1 walks=2/2 viol=0`n", $false, "ok=10 fails"),
+  @("R-onex", $r, "RMBZ ok=1x nxen=1 walks=2/2 viol=0`n", $false, "ok=1x fails"),
+  @("R-noviol", $r, "RMBZ ok=1 nxen=1 walks=2/2`n", $false, "missing viol fails"),
+  @("R-split", $r, "RMBZ ok=1 nxen=1 walks=2/2`n viol=0`n", $false, "newline-split fails")
 )
 
 $failed = 0
@@ -122,5 +140,5 @@ if ($failed -gt 0) {
   Write-Output "GATE TEST FAIL ($failed cases)"
   exit 1
 }
-Write-Output "GATE TEST PASS (32/32)"
+Write-Output "GATE TEST PASS (39/39)"
 exit 0

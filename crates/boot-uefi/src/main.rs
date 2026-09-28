@@ -17,7 +17,7 @@
 //! `x86_64-unknown-uefi`, boots OVMF, and asserts the marker plus the
 //! `BOOTINFO valid=1`, `MEMMAP ok=1`, `FB present=1`, `GOP ok=1`,
 //! `EBS ok=1`, `KERNEL ok=1`, `FRAMEALLOC ok=1`, `PAGING ok=1`, `PERM ok=1`,
-//! `PERMAUDIT ok=1`, `PERMAUDIT2 ok=1`,
+//! `PERMAUDIT ok=1`, `PERMAUDIT2 ok=1`, `RMBZ ok=1`,
 //! summary lines in the serial capture. The `MEMMAP` line also carries
 //! `map_size`/`desc_size` for the 16 KiB + 4 KiB budget baseline (#59a).
 
@@ -35,8 +35,8 @@
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
 use baseos_kernel::kernel_entry;
 use baseos_kernel::page_table::{
-    cr3_decode, guard_selftest, perm_selftest, table_base_in_boot_map, walk_full,
-    walk_full_leaf_flags,
+    cr3_decode, efer_nxe_enabled, guard_selftest, perm_selftest, rmbz_count_violations,
+    table_base_in_boot_map, walk_full, walk_full_leaf_flags, walk_full_leaf_raw, EFER_MSR,
 };
 use baseos_serial_marker::write_marker;
 #[cfg(not(test))]
@@ -825,6 +825,102 @@ unsafe fn probe_live_flags_for(info: &BootInfo, probe_virt: u64) -> (bool, u64, 
     }
 }
 
+/// Read the live `EFER` (Extended Feature Enable Register) on the boot CPU.
+///
+/// # Safety
+/// Pure register read via `rdmsr` (`EFER_MSR`); valid on x86-64 at CPL0
+/// (the UEFI guest runs with privilege). Bit 11 (`NXE`) gates whether
+/// `NO_EXEC`/bit 63 in a PTE is legal or MBZ (#139 note 1).
+unsafe fn read_efer() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    asm!(
+        "rdmsr",
+        in("ecx") EFER_MSR,
+        out("eax") lo,
+        out("edx") hi,
+        options(nomem, nostack, preserves_flags),
+    );
+    (u64::from(hi) << 32) | u64::from(lo)
+}
+
+/// Emit the one-line `RMBZ` diagnostic after the `PERMAUDIT2` line:
+/// `RMBZ ok=<0|1> nxen=<0|1> walks=<ok>/<total> viol=<n>` — live
+/// reserved/MBZ audit (#139 note 1): `ok` is 1 only when every probe walk
+/// succeeded (walk failures are reported via `walks`, never a silent
+/// zero); `nxen` is the live `EFER.NXE` pin; `viol` counts leaves where
+/// [`pte_reserved_violation`](baseos_kernel::page_table::pte_reserved_violation)
+/// fires (PS at level 3/0, NX-bit while `NXE=0`).
+/// Reporting-only this slice (no policy gate): the first job is to
+/// baseline the firmware violation count on OVMF before any enforcement
+/// slice decides what must fail. Hard-required by `boot-uefi.ps1`
+/// (`RMBZ ok=1` with same-line `viol=` shape, mirroring the GUARD gate).
+fn write_rmbz_line<E>(
+    ok: bool,
+    nx_enabled: bool,
+    walks_ok: usize,
+    walks_total: usize,
+    violations: usize,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "RMBZ ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " nxen=")?;
+    write_u64_dec(emit, u64::from(nx_enabled))?;
+    write_str(emit, " walks=")?;
+    write_u64_dec(emit, walks_ok as u64)?;
+    write_str(emit, "/")?;
+    write_u64_dec(emit, walks_total as u64)?;
+    write_str(emit, " viol=")?;
+    write_u64_dec(emit, violations as u64)?;
+    write_str(emit, "\n")
+}
+
+/// Probe live reserved/MBZ violations post-`ExitBootServices`: read the
+/// live `EFER.NXE` pin, walk both audit probes (framebuffer base when GOP
+/// filled it, else low `0x1000`, plus low-RAM `0x1000` — deduplicated when
+/// equal) through [`walk_full_leaf_raw`] with the identity-map lookup,
+/// and count [`rmbz_count_violations`](baseos_kernel::page_table::rmbz_count_violations)
+/// over the successfully walked leaves.
+///
+/// Returns `(ok, nx_enabled, walks_ok, walks_total, violations)`: `ok` is
+/// true only when every probe walked (`walks_ok == walks_total > 0`);
+/// walk failures contribute no leaf (the counter rule), so a failed walk
+/// lowers `ok` via `walks` instead of masking `viol` to 0. Never panics.
+///
+/// # Safety
+/// Post-EBS only, on the boot thread: reads `CR3`/`EFER` and dereferences
+/// firmware page tables through [`phys_to_table_ptr`] (identity-mapped).
+unsafe fn probe_rmbz(info: &BootInfo) -> (bool, bool, usize, usize, usize) {
+    let nx_enabled = efer_nxe_enabled(read_efer());
+    let fb_probe = info.framebuffer_opt().map(|fb| fb.base).unwrap_or(0x1000);
+    let probes: [u64; 2] = [fb_probe, 0x1000];
+    let total = if fb_probe == 0x1000 { 1 } else { 2 };
+    let cr3 = cr3_decode(read_cr3());
+    let mut leaves: [(u64, u8); 2] = [(0, 0); 2];
+    let mut ok_count = 0usize;
+    let mut leaf_count = 0usize;
+    let mut i = 0usize;
+    while i < total {
+        if let Ok((_phys, raw, level)) =
+            walk_full_leaf_raw(cr3, probes[i], |base| phys_to_table_ptr(info, base))
+        {
+            leaves[leaf_count] = (raw, level);
+            leaf_count += 1;
+            ok_count += 1;
+        }
+        i += 1;
+    }
+    let violations = rmbz_count_violations(&leaves[..leaf_count], nx_enabled);
+    (
+        ok_count == total && total > 0,
+        nx_enabled,
+        ok_count,
+        total,
+        violations,
+    )
+}
+
 /// UEFI entry point: marker, memory-map + framebuffer fill, summary,
 /// `ExitBootServices`, kernel handoff + CPU bring-up, park.
 ///
@@ -904,6 +1000,20 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
                 audit2_user,
                 audit2_nx,
                 audit2_w,
+                &mut emit,
+            )
+            .unwrap();
+            // S04 slice 34 (#139 note 1): live reserved/MBZ audit over the
+            // same two probes via the raw-leaf walker with the live
+            // EFER.NXE pin — reporting-only baseline before enforcement.
+            let (rmbz_ok, rmbz_nxen, rmbz_walks_ok, rmbz_walks_total, rmbz_viol) =
+                probe_rmbz(&info);
+            write_rmbz_line::<Infallible>(
+                rmbz_ok,
+                rmbz_nxen,
+                rmbz_walks_ok,
+                rmbz_walks_total,
+                rmbz_viol,
                 &mut emit,
             )
             .unwrap();
@@ -1314,6 +1424,33 @@ mod tests {
         assert_eq!(line, "PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=1 w=1\n");
         assert!(line.contains("PERMAUDIT2 ok=1"));
         assert!(line.contains(" w=1"));
+    }
+
+    /// S04 slice 34 (#139 note 1): `RMBZ` line shape — ok carries
+    /// walks/total plus the live NXE pin and violation count; failure
+    /// carries walks shortfall (never a silent viol=0 mask), and the e2e
+    /// hard-require substring (`RMBZ ok=1`) is byte-identical.
+    #[test]
+    fn write_rmbz_line_embeds_nxen_walks_viol() {
+        let mut text = Vec::new();
+        write_rmbz_line::<core::convert::Infallible>(true, true, 2, 2, 0, &mut |b| {
+            text.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(line, "RMBZ ok=1 nxen=1 walks=2/2 viol=0\n");
+        assert!(line.contains("RMBZ ok=1"));
+        assert!(line.contains(" viol=0"));
+
+        let mut text = Vec::new();
+        write_rmbz_line::<core::convert::Infallible>(false, false, 1, 2, 1, &mut |b| {
+            text.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(line, "RMBZ ok=0 nxen=0 walks=1/2 viol=1\n");
     }
 
     /// agent-b #5 nit, GOP half: structural GOP failures (null protocol,

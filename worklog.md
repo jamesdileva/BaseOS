@@ -2740,3 +2740,48 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** REVIEW #192 gaps (a)+(b) closed; duplication + provisional
   counter risks still open by design (single-inner refactor + guest
   `RMBZ` line next). #6 stays active.
+
+## S04 slice 34 -- guest RMBZ line with live EFER.NXE (end-to-end)
+
+- **Decision:** Land the guest `RMBZ` line (#139 note 1) as one
+  end-to-end slice: (a) kernel `EFER_MSR` + `EFER_NXE_BIT` +
+  `efer_nxe_enabled` const decode + host test; (b) guest `read_efer`
+  (`rdmsr` on `EFER_MSR`), `probe_rmbz` (live NXE pin + both audit
+  probes — FB-or-`0x1000` and low-RAM `0x1000`, deduped — through
+  `walk_full_leaf_raw`, violations via `rmbz_count_violations` over
+  successful leaves only), `write_rmbz_line`
+  (`RMBZ ok=<0|1> nxen=<0|1> walks=<ok>/<total> viol=<n>`) emitted
+  after `PERMAUDIT2`, before bring-up; (c) `boot-uefi.ps1`
+  hard-requires `RMBZ ok=1 [^\r\n]*viol=\d+(\s|$)` (GUARD-style:
+  literal space after `ok=1` stops `ok=10`/`ok=1x`, same-line pin
+  stops newline-split, `viol` value-free — baseline first); (d) gate
+  test grows 32 → 39 (pattern lock + good/value-free/ok=10/ok=1x/
+  missing-viol/split cases).
+- **Why:** Slices 32–33 built the audit shape host-only; the verification
+  gap was the live pin (`EFER.NXE` assumed) and no guest proof. The
+  first job is a reporting-only baseline (no policy gate on `viol`)
+  before any enforcement slice.
+- **Alternatives:** Assume `nx_enabled=true` (rejected: hides the
+  NX-disabled MBZ case the audit exists for; `rdmsr` is one
+  instruction at CPL0); gate `viol=0` now (rejected: baseline first —
+  enforcement needs the measured OVMF count, which this slice
+  establishes as 0); reuse flags walker (rejected in slice 32: flags
+  drop the raw bits/level the audit needs).
+- **Expected:** default 90 (89 + 1 efer test), kernel 59 (58 + 1),
+  boot-uefi 16 (15 + 1 line-shape test), gate 39/39; fmt/clippy clean
+  both targets; `boot-uefi.ps1` PASS with `RMBZ ok=1`.
+- **Measured (2026-09-28, Win11):** default `cargo test` 90/90
+  (21+59+4+4+2), `-p baseos-kernel` 59/59,
+  `-p baseos-boot-uefi` 16/16, `cargo fmt --check` clean,
+  `cargo clippy --all-targets -- -D warnings` clean,
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -- -D warnings` clean; `test-boot-uefi-gates.ps1` GATE TEST PASS
+  (39/39); `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 890 bytes:
+  marker FOUND, map_size=4704/desc_size=48 budget ok, regions=98,
+  `RMBZ ok=1 nxen=1 walks=2/2 viol=0`, guest `bootx64.efi` 83456
+  bytes (was 79360: +4096, one page of added walker/EFER code).
+- **Final:** Guest `RMBZ` line proven end-to-end with live `EFER.NXE=1`
+  and zero violations on OVMF (baseline pinned). Still open by design:
+  duplication single-inner refactor, provisional counter
+  addr-size/PK/PAT, #168n4 live `#PF`, enforcement policy on `viol`.
+  #6 stays active.

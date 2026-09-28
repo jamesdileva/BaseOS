@@ -195,6 +195,15 @@ if ($serialText -and $serialText.Contains($marker)) {
   $permaudit2WPat = "PERMAUDIT2 ok=1 [^\r\n]* w=1(\s|$)"
   # Slice 27 mirror for the low-RAM probe (same shape gate, same rationale).
   $permaudit2UNPat = "PERMAUDIT2 ok=1 [^\r\n]* user=[01][ \t][^\r\n]*nx=[01](\s|$)"
+  # S04 slice 34 (#139 note 1 RMBZ audit): `RMBZ ok=1 [^\r\n]*viol=\d+(\s|$)`
+  # mirrors the GUARD gate — the literal space after `ok=1` stops
+  # `ok=10`/`ok=1x` false-passing, same-line `[^\r\n]*` stops a
+  # newline-split `ok=1` / viol pair, and `viol=\d+(\s|$)` pins the
+  # violation count field so a dropped/truncated field fails e2e.
+  # `viol` stays value-free (no pinned count): the first job is to
+  # baseline the firmware count on OVMF before any enforcement slice.
+  # `nxen`/`walks` ride along reporting-only (not gated) this slice.
+  $rmbzPat = "RMBZ ok=1 [^\r\n]*viol=\d+(\s|$)"
   $exc = "EXC ok=1 vector=0"
   # #59a value check (agent-b REVIEW #75 finding 1): presence of the
   # substrings alone would let map_size=999999999 or map_size=abc PASS.
@@ -237,10 +246,11 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasPermaudit2 = $serialText.Contains($permaudit2)
   $hasPermaudit2W = [regex]::IsMatch($serialText, $permaudit2WPat)
   $hasPermaudit2UN = [regex]::IsMatch($serialText, $permaudit2UNPat)
+  $hasRmbz = [regex]::IsMatch($serialText, $rmbzPat)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasExc) {
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasExc) {
     Write-Output ("Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $mapsize + $descsize + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -256,6 +266,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "GUARD ok=1 passed=7/7 present=$hasGuard, " +
       "PERMAUDIT ok=1 present=$hasPermaudit, w=1 present=$hasPermauditW, user/nx shape present=$hasPermauditUN, " +
       "PERMAUDIT2 ok=1 present=$hasPermaudit2, w=1 present=$hasPermaudit2W, user/nx shape present=$hasPermaudit2UN, " +
+      "RMBZ ok=1 viol-shape present=$hasRmbz, " +
       "EXC ok=1 vector=0 present=$hasExc; " +
       "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/frame-alloc/#DE path failed " +
       "-- see serial log)")
