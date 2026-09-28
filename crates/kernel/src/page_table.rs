@@ -444,6 +444,36 @@ pub const fn cr3_decode(cr3: u64) -> u64 {
     cr3 & PTE_ADDR_MASK
 }
 
+/// Mode-independent reserved/MBZ audit for one raw PTE (#139 note 1, slice 31).
+///
+/// Returns true when `pte` carries a reserved bit that faults independent of
+/// `MAXPHYADDR`/PK/PAT mode pins: `PS` (bit 7) at PML4 (level 3) or PT
+/// (level 0), or `NO_EXEC` (bit 63) while `nx_enabled` is false (EFER.NXE=0
+/// makes bit 63 MBZ). `level > 3` counts as a violation (no such paging
+/// level). A cleared-`PRESENT` entry never counts: hardware ignores reserved
+/// bits on not-present entries.
+///
+/// Out of scope (still need CPUID `MAXPHYADDR` + CR4/EFER mode pins before
+/// the guest can enforce them): address-size bits above the physical limit,
+/// protection-key bits, large-page PAT/MBZ combos, `CR3` low-12 controls.
+/// The guest `RMBZ` line (future slice) will call this per leaf walked.
+#[must_use]
+pub const fn pte_reserved_violation(pte: u64, level: u8, nx_enabled: bool) -> bool {
+    if level > 3 {
+        return true;
+    }
+    if pte & 1 == 0 {
+        return false;
+    }
+    if pte & PTE_PS_BIT != 0 && (level == 3 || level == 0) {
+        return true;
+    }
+    if !nx_enabled && pte & (1 << 63) != 0 {
+        return true;
+    }
+    false
+}
+
 /// True when `virt` is canonical: bits 48..=63 sign-extend bit 47
 /// (Intel SDM Vol. 3: non-canonical linear addresses raise `#GP(0)`,
 /// not `#PF`). `const`-compatible so the guest walker can gate on it
@@ -1822,5 +1852,30 @@ mod tests {
             assert_eq!(flags_2m.contains(PageFlags::USER), want_u);
             assert_eq!(flags_2m.contains(PageFlags::NO_EXEC), want_nx);
         }
+    }
+
+    #[test]
+    fn pte_reserved_violation_pins_ps_and_nx_disabled() {
+        // #139 note 1 (slice 31): mode-independent subset only.
+        let present_rw = pte_encode(0xA000, K_RW);
+        let present_nx = present_rw | (1 << 63);
+        // 4 KiB leaf, NX enabled: NX bit is legal.
+        assert!(!pte_reserved_violation(present_nx, 0, true));
+        // Same entry with NX disabled (EFER.NXE=0): bit 63 is MBZ.
+        assert!(pte_reserved_violation(present_nx, 0, false));
+        // NX clear is fine either way.
+        assert!(!pte_reserved_violation(present_rw, 0, false));
+        assert!(!pte_reserved_violation(present_rw, 1, true));
+        // PS at PML4 (3) / PT (0) is reserved; at PDPT (2) / PD (1) a leaf.
+        let ps = present_rw | PTE_PS_BIT;
+        assert!(pte_reserved_violation(ps, 3, true));
+        assert!(pte_reserved_violation(ps, 0, true));
+        assert!(!pte_reserved_violation(ps, 2, true));
+        assert!(!pte_reserved_violation(ps, 1, true));
+        // Not-present entries never count (reserved bits ignored).
+        assert!(!pte_reserved_violation(ps & !1, 3, false));
+        assert!(!pte_reserved_violation(present_nx & !1, 0, false));
+        // No such paging level counts as a violation.
+        assert!(pte_reserved_violation(present_rw, 4, true));
     }
 }

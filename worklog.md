@@ -2632,3 +2632,37 @@ Format per entry (per `implementation-guide.md` §31):
   verified. Remaining: #139 note 1 (Reserved/MBZ), #168 nit 4 (live
   `#PF` injection). Next: Reserved/MBZ audit or live `#PF` injection.
   #6 stays active.
+
+## S04 slice 31 -- Reserved/MBZ host audit subset (PS@L3/L0 + NX-disabled bit63)
+
+- **Decision:** Open the #139 note 1 Reserved/MBZ audit with the
+  mode-independent subset as one host-only slice: new `const`
+  `pte_reserved_violation(pte, level, nx_enabled)` in
+  `crates/kernel/src/page_table.rs` returning true for `PS` at PML4 (3)
+  / PT (0), `NO_EXEC` while `nx_enabled=false`, and `level > 3`;
+  cleared-`PRESENT` never counts. One test
+  `pte_reserved_violation_pins_ps_and_nx_disabled` pins all arms.
+  Docs mark the remainder out of scope (address-size/PK/PAT need
+  CPUID/CR4/EFER pins). No guest wiring, no ps1 change; guest `RMBZ`
+  line rides with the next guest-touching slice.
+- **Why:** Full MBZ rejection is mode-dependent with no guest `CR3` mode
+  pin on record; the PS/NX-disabled subset is provable on the host with
+  zero QEMU risk and gives the future guest audit a shared helper.
+- **Alternatives:** Full reserved-bit rejection now (rejected:
+  needs MAXPHYADDR + mode pins, unprovable here); guest `RMBZ` line in
+  the same commit (rejected: doubles single-cycle risk; helper first,
+  wiring next).
+- **Expected:** default 88 (87 + 1), kernel 57 (56 + 1), boot-uefi 15,
+  gate test 32/32; fmt clean; clippy host + UEFI clean.
+- **Measured (2026-09-28, Win11):** default `cargo test` 88/88
+  (21+57+4+4+2), `-p baseos-kernel` 57/57 (1 new),
+  `-p baseos-boot-uefi` 15/15, `cargo fmt --check` clean,
+  `cargo clippy --all-targets -- -D warnings` clean,
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings`
+  clean; `test-boot-uefi-gates.ps1` GATE TEST PASS (32/32).
+  Guest bytes change pending (kernel crate links into the guest);
+  QEMU re-verify rides with the guest-wiring slice.
+- **Final:** #139 note 1 partially closed (mode-independent subset);
+  remaining MBZ (address-size/PK/PAT) + guest `RMBZ` wiring + #168 nit 4
+  (live `#PF`) still open. Next: guest `RMBZ` line or live `#PF`. #6
+  stays active.
