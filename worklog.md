@@ -2852,3 +2852,69 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Duplication risk closed with zero behavior change. Open:
   provisional counter (viol reporting-only), #168n4 live #PF, viol
   enforcement policy. #6 stays active until enforcement + b-repro.
+
+## S04 slice 36 -- viol-enforcement policy: fail-closed (guest + script value gate)
+
+- **Decision:** Fail-closed over reporting-only counter. (a)
+  `kernel/page_table.rs`: new `const rmbz_audit_ok(walks_ok, walks_total,
+  viol)` (true only on full walks AND `viol == 0`) plus
+  `rmbz_audit_ok_fails_closed_on_viol_or_short_walks` test (2/2/0 and 1/1/0
+  pass; 2/2/1, 2/2/10, 1/1/1, 1/2/0, 0/2/0, 0/0/0 fail). (b)
+  `boot-uefi/main.rs`: `probe_rmbz` builds `ok` via `rmbz_audit_ok` (was
+  `ok_count == total` inline); docs flip reporting-only baseline to
+  fail-closed. Line shape unchanged (`RMBZ ok=<0|1> nxen walks viol`).
+  (c) `boot-uefi.ps1`: `rmbzPat` tightens from value-free
+  `viol=\d+(\s|$)` to `viol=0(\s|$)` (banner slice 36). (d)
+  `test-boot-uefi-gates.ps1`: lock pins `viol=0` value; cases 39 -> 41
+  (R-viol10 flips True->False, new R-viol1 False, new R-ok0viol1 False).
+- **Why:** Agent-b #207 blocks #6-done on exactly this policy plus host
+  tests for the enforced path and a QEMU viol!=0 negative control; REVIEW
+  #206 names the provisional counter (reporting-only, no fail-closed
+  behavior) as remaining risk (2). Baseline is measured (`nxen=1
+  walks=2/2 viol=0` on OVMF since slice 34), so gating zero cannot fail
+  for the wrong reason the way a premature user/nx value gate could.
+- **Alternatives:** Keep reporting-only counter + script shape gate
+  (rejected: a viol>0 boot still prints `ok=1` and PASSES e2e — the exact
+  hole #207 names); guest-only `ok` enforcement with value-free script
+  (rejected: a buggy `ok=1 viol=1` line would still PASS; defense in depth
+  needs both pins, same precedent as the W `w=1` guest-report + script
+  value gate in slices 18/19/21/22); script-only `viol=0` with guest
+  reporting-only (rejected: leaves `ok=1 viol=1` printable as success on
+  serial — the line must read `ok=0` when it fails).
+- **Expected:** default 91 (90 + 1), kernel 60 (59 + 1), boot-uefi 16,
+  gate 41/41; fmt clean; clippy host + UEFI clean; `boot-uefi.ps1` PASS
+  890B with `RMBZ ok=1 nxen=1 walks=2/2 viol=0`; synthetic viol>0 lines
+  FAIL the gate.
+- **Measured (2026-09-28, Win11):** default `cargo test` 91/91
+  (21+60+4+4+2), `-p baseos-kernel` 60/60 (1 new),
+  `-p baseos-boot-uefi` 16/16, `cargo fmt --check` clean,
+  `cargo clippy --all-targets -D warnings` clean,
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -D warnings`
+  clean; `test-boot-uefi-gates.ps1` GATE TEST PASS (41/41: 8 W + 18
+  user/nx-shape + 6 GUARD + 8 RMBZ + P1/P2 overlap counted in file order);
+  `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 890 bytes, guest
+  `bootx64.efi` 84480 bytes SHA256
+  388BA13BE24FD0CB7B3A9E1C8D31B786CBD02E698FEF0792D1C9270CBDE06188
+  (rebuild x2 same hash — deterministic this tree):
+  `BOOTINFO valid=1 regions=98 usable=0xce85000`,
+  `FB present=1 base=0x80000000`, `MEMMAP ok=1 entries=98/98 truncated=0
+  map_size=4704 desc_size=48`, `GOP/EBS/KERNEL ok=1`, `FRAMEALLOC ok=1
+  free=52869 spans=8 faults=3 stitch=5`, `PAGING ok=1 cr3=0xf801000
+  phys=0x80000000`, `PERM ok=1 passed=9/9`, `GUARD ok=1 passed=7/7`,
+  `PERMAUDIT ok=1 phys=0x80000000 user=0 nx=0 w=1`,
+  `PERMAUDIT2 ok=1 phys=0x1000 user=0 nx=0 w=1`,
+  `RMBZ ok=1 nxen=1 walks=2/2 viol=0`, `EXC ok=1 vector=0`;
+  negative control via the checked-in gate (live `rmbzPat`):
+  `viol=1`->False, `viol=10`->False, `ok=0 viol=1`->False,
+  `viol=0`->True. Note: guest stayed 84480B despite added
+  `rmbz_audit_ok` call (one `const` inline, page-rounded image) — size
+  parity with slice 35, not a silent-revert signal (`git diff` shows the
+  probe + pattern + test changes; hash differs from slice-34 1B048E09).
+  REVIEW #206 risk (1) variance note: the +1024B slice-34->35 jump is
+  still unattributed, but this tree rebuilds deterministically (x2 same
+  SHA); a `cargo clean` double-rebuild with `rustc -Vv` capture rides
+  with the next slice if agent-b still requires it.
+- **Final:** Viol-enforcement policy landed fail-closed on both layers
+  with host + gate + QEMU proof (#207 satisfied on the a-side). Open:
+  #168n4 live #PF, clean-rebuild hash proof if still required. #6 ready
+  for agent-b re-verify (recommend done on concurrence).

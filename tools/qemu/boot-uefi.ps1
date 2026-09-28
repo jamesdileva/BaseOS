@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S04 slice 28: permaudit user boundary + GUARD line) ==="
+Write-Output "=== BaseOS UEFI guest boot (S04 slice 36: RMBZ viol=0 fail-closed) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -195,15 +195,17 @@ if ($serialText -and $serialText.Contains($marker)) {
   $permaudit2WPat = "PERMAUDIT2 ok=1 [^\r\n]* w=1(\s|$)"
   # Slice 27 mirror for the low-RAM probe (same shape gate, same rationale).
   $permaudit2UNPat = "PERMAUDIT2 ok=1 [^\r\n]* user=[01][ \t][^\r\n]*nx=[01](\s|$)"
-  # S04 slice 34 (#139 note 1 RMBZ audit): `RMBZ ok=1 [^\r\n]*viol=\d+(\s|$)`
-  # mirrors the GUARD gate — the literal space after `ok=1` stops
-  # `ok=10`/`ok=1x` false-passing, same-line `[^\r\n]*` stops a
-  # newline-split `ok=1` / viol pair, and `viol=\d+(\s|$)` pins the
-  # violation count field so a dropped/truncated field fails e2e.
-  # `viol` stays value-free (no pinned count): the first job is to
-  # baseline the firmware count on OVMF before any enforcement slice.
+  # S04 slice 36 viol-enforcement policy (fail-closed, #139 note 1 RMBZ):
+  # `RMBZ ok=1 [^\r\n]*viol=0(\s|$)` mirrors the GUARD + W gates — the
+  # literal space after `ok=1` stops `ok=10`/`ok=1x` false-passing,
+  # same-line `[^\r\n]*` stops a newline-split `ok=1` / viol pair, and
+  # `viol=0(\s|$)` pins the count at zero so any viol>0 fails e2e.
+  # Value gate (not value-free): reserved violations must always be zero,
+  # unlike user/nx which stay shape-only for the future NX/SMEP flip.
+  # Defense in depth with the guest: probe_rmbz forces ok=0 on viol>0 via
+  # rmbz_audit_ok, so a viol>0 boot fails both the ok=1 and viol=0 pins.
   # `nxen`/`walks` ride along reporting-only (not gated) this slice.
-  $rmbzPat = "RMBZ ok=1 [^\r\n]*viol=\d+(\s|$)"
+  $rmbzPat = "RMBZ ok=1 [^\r\n]*viol=0(\s|$)"
   $exc = "EXC ok=1 vector=0"
   # #59a value check (agent-b REVIEW #75 finding 1): presence of the
   # substrings alone would let map_size=999999999 or map_size=abc PASS.

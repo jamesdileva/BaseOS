@@ -35,8 +35,9 @@
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
 use baseos_kernel::kernel_entry;
 use baseos_kernel::page_table::{
-    cr3_decode, efer_nxe_enabled, guard_selftest, perm_selftest, rmbz_count_violations,
-    table_base_in_boot_map, walk_full, walk_full_leaf_flags, walk_full_leaf_raw, EFER_MSR,
+    cr3_decode, efer_nxe_enabled, guard_selftest, perm_selftest, rmbz_audit_ok,
+    rmbz_count_violations, table_base_in_boot_map, walk_full, walk_full_leaf_flags,
+    walk_full_leaf_raw, EFER_MSR,
 };
 use baseos_serial_marker::write_marker;
 #[cfg(not(test))]
@@ -852,9 +853,10 @@ unsafe fn read_efer() -> u64 {
 /// [`pte_reserved_violation`](baseos_kernel::page_table::pte_reserved_violation)
 /// fires (PS at level 3/0, NX-bit while `NXE=0`).
 /// Reporting-only this slice (no policy gate): the first job is to
-/// baseline the firmware violation count on OVMF before any enforcement
-/// slice decides what must fail. Hard-required by `boot-uefi.ps1`
-/// (`RMBZ ok=1` with same-line `viol=` shape, mirroring the GUARD gate).
+/// Fail-closed since slice 36 (viol-enforcement policy): `ok` is driven
+/// by [`rmbz_audit_ok`](baseos_kernel::page_table::rmbz_audit_ok), so any
+/// `viol > 0` forces `ok=0`. Hard-required by `boot-uefi.ps1`
+/// (`RMBZ ok=1` with same-line `viol=0`, mirroring the GUARD gate).
 fn write_rmbz_line<E>(
     ok: bool,
     nx_enabled: bool,
@@ -884,9 +886,10 @@ fn write_rmbz_line<E>(
 /// over the successfully walked leaves.
 ///
 /// Returns `(ok, nx_enabled, walks_ok, walks_total, violations)`: `ok` is
-/// true only when every probe walked (`walks_ok == walks_total > 0`);
-/// walk failures contribute no leaf (the counter rule), so a failed walk
-/// lowers `ok` via `walks` instead of masking `viol` to 0. Never panics.
+/// [`rmbz_audit_ok`] (walks complete AND `viol == 0`); walk failures
+/// contribute no leaf (the counter rule), so a failed walk lowers `ok`
+/// via `walks` instead of masking `viol` to 0, and any violation lowers
+/// `ok` fail-closed. Never panics.
 ///
 /// # Safety
 /// Post-EBS only, on the boot thread: reads `CR3`/`EFER` and dereferences
@@ -913,7 +916,7 @@ unsafe fn probe_rmbz(info: &BootInfo) -> (bool, bool, usize, usize, usize) {
     }
     let violations = rmbz_count_violations(&leaves[..leaf_count], nx_enabled);
     (
-        ok_count == total && total > 0,
+        rmbz_audit_ok(ok_count, total, violations),
         nx_enabled,
         ok_count,
         total,
@@ -1005,7 +1008,7 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             .unwrap();
             // S04 slice 34 (#139 note 1): live reserved/MBZ audit over the
             // same two probes via the raw-leaf walker with the live
-            // EFER.NXE pin — reporting-only baseline before enforcement.
+            // EFER.NXE pin — fail-closed since slice 36 (viol > 0 => ok=0).
             let (rmbz_ok, rmbz_nxen, rmbz_walks_ok, rmbz_walks_total, rmbz_viol) =
                 probe_rmbz(&info);
             write_rmbz_line::<Infallible>(

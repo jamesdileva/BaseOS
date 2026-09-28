@@ -813,6 +813,21 @@ pub const fn rmbz_count_violations(leaves: &[(u64, u8)], nx_enabled: bool) -> us
     n
 }
 
+/// Fail-closed `RMBZ` audit verdict (S04 slice 36 viol-enforcement policy).
+///
+/// `true` only when every probe walked (`walks_ok == walks_total > 0`) AND
+/// the violation count is zero. Any `viol > 0` forces `false`, so the guest
+/// `RMBZ ok=` line and the `boot-uefi.ps1` `ok=1` + `viol=0` gates fail
+/// loudly instead of reporting a nonzero count as success.
+///
+/// Pure / `const`-compatible so host tests and the guest share the exact
+/// enforcement rule; the guest [`probe_rmbz`](../../../baseos-boot-uefi/src/main.rs)
+/// path calls this (it cannot construct `ok` inline anymore).
+#[must_use]
+pub const fn rmbz_audit_ok(walks_ok: usize, walks_total: usize, violations: usize) -> bool {
+    walks_ok == walks_total && walks_total > 0 && violations == 0
+}
+
 /// Synthetic permission-fault self-test for the guest `PERM` e2e line.
 ///
 /// Builds a fixed 5-entry [`PageTable`] (kernel RO at `0x1000`, kernel RW
@@ -2078,5 +2093,21 @@ mod tests {
         // Walk failure parity: unmapped virt fails on both walkers.
         assert!(walk_full_leaf_raw(0x1000, 0x9999_0000, lookup).is_err());
         assert!(walk_full_leaf_flags(0x1000, 0x9999_0000, lookup).is_err());
+    }
+
+    #[test]
+    fn rmbz_audit_ok_fails_closed_on_viol_or_short_walks() {
+        // Slice 36 viol-enforcement policy: ok only on full walks + viol=0.
+        assert!(rmbz_audit_ok(2, 2, 0));
+        assert!(rmbz_audit_ok(1, 1, 0));
+        // Any violation fails closed even with full walks (enforced path).
+        assert!(!rmbz_audit_ok(2, 2, 1));
+        assert!(!rmbz_audit_ok(2, 2, 10));
+        assert!(!rmbz_audit_ok(1, 1, 1));
+        // Short walks fail closed even with viol=0 (existing walk rule).
+        assert!(!rmbz_audit_ok(1, 2, 0));
+        assert!(!rmbz_audit_ok(0, 2, 0));
+        // Degenerate empty audit never reports ok.
+        assert!(!rmbz_audit_ok(0, 0, 0));
     }
 }

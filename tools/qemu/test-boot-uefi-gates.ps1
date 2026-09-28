@@ -15,9 +15,9 @@
   GUARD (REVIEW #168 nits 1-3): ok=1 passed=7/7 passes; ok=10 / ok=1x fail
   (boundary tightening); passed=6/7 fails (coverage pin); missing passed
   fails; newline-split fails.
-  RMBZ (S04 slice 34, #139 note 1): ok=1 viol=0 passes; viol count
-  value-free (viol=10 passes); ok=10 / ok=1x fail; missing viol fails;
-  newline-split fails.
+  RMBZ (S04 slice 36 viol-enforcement, #139 note 1): ok=1 viol=0 passes;
+  viol=10 / viol=1 / ok=0-viol=1 fail (fail-closed value gate);
+  ok=10 / ok=1x fail; missing viol fails; newline-split fails.
   Exits 0 on PASS, 1 on FAIL.
 #>
 $ErrorActionPreference = "Stop"
@@ -73,11 +73,11 @@ if (($g -notlike '*GUARD ok=1 *') -or (-not $g.Contains('[^\r\n]*passed=7/7')) -
   Write-Output "GATE TEST FAIL (GUARD pattern missing ok=1/passed=7/7 tightening: $g)"
   exit 1
 }
-# S04 slice 34 (#139 note 1 RMBZ gate): pattern must carry the literal
-# space after `ok=1` (boundary, mirrors GUARD), same-line `[^\r\n]*viol`,
-# and a `viol=` pin with a `(\s|$)` boundary so ok=10 / missing-viol /
-# newline-split pairs fail while any viol COUNT passes (value-free).
-if (($r -notlike '*RMBZ ok=1 *') -or (-not $r.Contains('[^\r\n]*viol=')) -or ($r -notlike '*viol=\d+(\s|$)*')) {
+# S04 slice 36 viol-enforcement (fail-closed, #139 note 1 RMBZ gate):
+# pattern must carry the literal space after `ok=1` (boundary, mirrors
+# GUARD), same-line `[^\r\n]*viol=0`, and a `viol=0(\s|$)` value pin so
+# ok=10 / viol>0 / missing-viol / newline-split pairs fail.
+if (($r -notlike '*RMBZ ok=1 *') -or (-not $r.Contains('[^\r\n]*viol=0')) -or ($r -notlike '*viol=0(\s|$)*')) {
   Write-Output "GATE TEST FAIL (RMBZ pattern missing ok=1/viol tightening: $r)"
   exit 1
 }
@@ -116,10 +116,12 @@ $cases = @(
   @("G-six", $g, "GUARD ok=1 passed=6/7`n", $false, "6/7 fails"),
   @("G-nopass", $g, "GUARD ok=1`n", $false, "missing passed fails"),
   @("G-split", $g, "GUARD ok=1`n passed=7/7`n", $false, "newline-split fails"),
-  @("R-good", $r, "RMBZ ok=1 nxen=1 walks=2/2 viol=0`n", $true, "ok=1 viol passes"),
-  @("R-viol10", $r, "RMBZ ok=1 nxen=1 walks=2/2 viol=10`n", $true, "viol count value-free"),
+  @("R-good", $r, "RMBZ ok=1 nxen=1 walks=2/2 viol=0`n", $true, "ok=1 viol=0 passes"),
+  @("R-viol10", $r, "RMBZ ok=1 nxen=1 walks=2/2 viol=10`n", $false, "viol=10 fails fail-closed"),
+  @("R-viol1", $r, "RMBZ ok=1 nxen=1 walks=2/2 viol=1`n", $false, "viol=1 fails fail-closed"),
   @("R-ten", $r, "RMBZ ok=10 nxen=1 walks=2/2 viol=0`n", $false, "ok=10 fails"),
   @("R-onex", $r, "RMBZ ok=1x nxen=1 walks=2/2 viol=0`n", $false, "ok=1x fails"),
+  @("R-ok0viol1", $r, "RMBZ ok=0 nxen=1 walks=2/2 viol=1`n", $false, "ok=0 viol=1 fails"),
   @("R-noviol", $r, "RMBZ ok=1 nxen=1 walks=2/2`n", $false, "missing viol fails"),
   @("R-split", $r, "RMBZ ok=1 nxen=1 walks=2/2`n viol=0`n", $false, "newline-split fails")
 )
@@ -140,5 +142,5 @@ if ($failed -gt 0) {
   Write-Output "GATE TEST FAIL ($failed cases)"
   exit 1
 }
-Write-Output "GATE TEST PASS (39/39)"
+Write-Output "GATE TEST PASS (41/41)"
 exit 0
