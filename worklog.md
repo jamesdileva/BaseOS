@@ -2785,3 +2785,40 @@ Format per entry (per `implementation-guide.md` §31):
   duplication single-inner refactor, provisional counter
   addr-size/PK/PAT, #168n4 live `#PF`, enforcement policy on `viol`.
   #6 stays active.
+
+## S04 slice 34 re-verify -- REVIEW #196 independent reproduction (2026-09-28)
+
+- **Decision:** Independently reproduce slices 33/34 on the current tree
+  (@b8339b2) per agent-b REVIEW #196 (claims, not approvals): full host
+  gates + QEMU boot + serial RMBZ dump + negative regex control. No code
+  change; diff is this worklog entry only.
+- **Why:** REVIEW #196 held S33/S34 unapproved with build/test SKIPPED
+  this cycle and named the cheapest disconfirm: exact commands + hashes
+  for 90/90 + 39/39, serial dump showing the RMBZ line, and a forced-viol
+  run proving the guard fires.
+- **Alternatives:** New feature slice (refactor or enforcement) without
+  re-verify (rejected: reviewer explicitly blocks close until reproduced);
+  commit a serial/log artifact (rejected: logs stay gitignored under
+  `target/`; hashes + this row are the proof).
+- **Expected:** default 90, kernel 59, boot-uefi 16, gate 39/39, QEMU PASS
+  890B with `RMBZ ok=1 nxen=1 walks=2/2 viol=0`, negative control green.
+- **Measured (2026-09-28, Win11, @b8339b2):** `cargo test` 90/90 default
+  (21 boot-info + 59 kernel + 4 marker + 4 harness + 2 version);
+  `cargo test -p baseos-boot-uefi` 16/16;
+  `tools/qemu/test-boot-uefi-gates.ps1` GATE TEST PASS (39/39);
+  `cargo fmt --check` clean; `cargo clippy --all-targets -D warnings`
+  exit 0; `cargo clippy -p baseos-boot-uefi --target
+  x86_64-unknown-uefi -D warnings` exit 0;
+  `tools/qemu/boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 890 bytes,
+  guest `bootx64.efi` 83456 bytes SHA256
+  1B048E096D9A798A348F12B8B494B94D3701A50632F445D5D1BBA80AA03E346A,
+  serial tail `RMBZ ok=1 nxen=1 walks=2/2 viol=0` + `EXC ok=1 vector=0`,
+  budget map_size=4704/desc_size=48 ok=True; negative control on the live
+  `rmbzPat`/`guardPat` from `boot-uefi.ps1`: good viol=0 True, viol=1
+  True (reporting-only by design), ok=0 False, missing-viol False,
+  GUARD 7/7 True, 6/7 False -- NEGATIVE TEST PASS.
+- **Final:** REVIEW #196 disconfirm delivered on the current tree; S33/S34
+  measurement claims reproduce byte-for-byte (890B, 83456B, viol=0).
+  Known limits stand: provisional counter (viol>0 reporting-only),
+  duplication single-inner refactor, #168n4 live `#PF`, viol enforcement
+  policy. #6 stays active.
