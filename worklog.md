@@ -3041,3 +3041,53 @@ Format per entry (per `implementation-guide.md` §31):
   no-regression; trigger + `PF ok=1 ... addr=...` e2e assert is the next
   (final) #168 slice. #6 stays active pending live-injection proof and
   b-side double-rebuild + gates + boot verify.
+
+## S04 #168n6 -- live #PF probe chained to #DE + PF e2e gate (2026-09-29)
+
+- **Decision:** Close the sole functional open (#168n5 wired-not-fired) as
+  one guest-touching slice in `crates/kernel/src/lib.rs` + `boot-uefi.ps1`:
+  (a) new `PF_PROBE_ADDR = 0x0000_5000_0000_0000` (canonical low-half,
+  4 KiB-aligned, 80 TiB -- far above firmware RAM/FB, below the
+  non-canonical hole) with a `black_box` host test (keeps
+  `clippy -D warnings` `assertions_on_constants` clean); (b)
+  `bring_up_cpu_and_prove_exception` volatile-reads the probe (unmapped
+  guard -> not-present `#PF`) instead of the bare `div0`; (c)
+  `exception_handler_pf_rust` emits `PF ok=1 vector=14 code=... addr=...`
+  then chains via an intentional `div0` into the `#DE` handler (emits
+  `EXC ok=1 vector=0`, parks) -- no `iretq` ever runs, so the CPU-pushed
+  `#PF` error code is abandoned by construction (REVIEW #229 risk 2
+  closed by doc: future returning handler MUST `add rsp,8` before
+  `iretq`); stub docs updated accordingly; (d) `boot-uefi.ps1` hard-requires
+  new same-line `$pfPat`
+  (`PF ok=1 vector=14 ... code=0x[hex] ... addr=0x[hex]`, mirrors
+  RMBZ/GUARD boundary style) alongside the unchanged EXC gate.
+- **Why:** REVIEW #229 concurred #6 stays active and named exactly this as
+  the cheapest disconfirm: trigger live `#PF` via unmapped guard touch,
+  assert `PF ok=1 vector=14/code/addr` in the QEMU log, then halt. Chaining
+  (rather than replacing `#DE`) keeps every existing gate green while the
+  PF line proves `IDT14` gate + error-code-from-`[RSP]` + `CR2`-to-`R8` +
+  Win64 align/shadow wiring end-to-end (REVIEW #229 risk 3: host ABI tests
+  alone never proved the guest path).
+- **Alternatives:** Replace `#DE` with `#PF` only (rejected: breaks the S02
+  controlled-`#DE` proof and the EXC hard-require for one line of serial
+  savings); return-via-`iretq` from the PF handler then `div0` in bring-up
+  (rejected: requires error-code pop + `iretq` frame surgery this cycle --
+  chain-via-fault proves both vectors with zero return-path risk); host-only
+  probe-addr test without QEMU (rejected: reviewer explicitly required the
+  live QEMU line).
+- **Expected:** default `cargo test` 95 (94 + 1 probe test), kernel 64/64,
+  boot-uefi 16/16, gate-test 41/41 unchanged, fmt + clippy host/uefi clean,
+  `boot-uefi.ps1` PASS with BOTH `PF ok=1 vector=14 code=... addr=...` and
+  `EXC ok=1 vector=0`, guest size unchanged (probe touch + chain only).
+- **Measured (2026-09-29, Win11, rustc 1.98.0):** default 95/95
+  (21+64+4+4+2), `-p baseos-boot-uefi` 16/16, gate-test 41/41 PASS,
+  `fmt --check` clean, `clippy --all-targets -D warnings` clean (host) and
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -D warnings`
+  clean; `boot-uefi.ps1` UEFI BOOT PASS on two consecutive runs, serial 937
+  bytes both (894 + 43 PF line), guest `bootx64.efi` 86016 bytes (unchanged),
+  tail `PF ok=1 vector=14 code=0x0 addr=0x500000000000` + `EXC ok=1
+  vector=0` (code 0x0 = not-present supervisor read, CR2 == probe, as
+  designed; map_size=4704 desc_size=48 budget ok).
+- **Final:** Live `#PF` fired and proven end-to-end with chained `#DE`;
+  #168 trigger open closed on the A-side. #6 stays active pending b-side
+  double-rebuild + gates + boot verify (owed).

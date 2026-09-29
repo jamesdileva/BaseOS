@@ -82,6 +82,13 @@ const VECTOR_DE: usize = 0;
 /// this slice only pins the error-code contract host-side (guest IDT still
 /// `#DE`-only, so QEMU behavior is unchanged).
 pub const VECTOR_PF: usize = 14;
+/// Live-`#PF` probe address for the S04 `#168n6` slice: a canonical low-half
+/// address far above any firmware-mapped RAM (`0x0000_5000_0000_0000` =
+/// 80 TiB) so a volatile read deterministically faults not-present
+/// (supervisor read, `P=0`) on OVMF. 4 KiB-aligned, below the
+/// non-canonical hole (`0x0000800000000000`), above the framebuffer
+/// (`0x80000000`) and low RAM — host-tested below.
+pub const PF_PROBE_ADDR: u64 = 0x0000_5000_0000_0000;
 /// Number of architecturally-defined exception vectors (0..=31) the IDT
 /// covers; hardware IRQs (32+) stay masked (`cli`) this slice.
 const EXCEPTION_VECTORS: usize = 32;
@@ -326,18 +333,23 @@ extern "C" fn exception_handler_rust(vector: u64) -> ! {
 }
 
 /// Rust body of the `#PF` stub: prove the fault was *caught* (serial
-/// line) then park — a controlled failure, not a triple-fault reset.
+/// line) then chain into an intentional `#DE` so the single e2e boot proves
+/// BOTH vectors (`PF ok=1 ...` then `EXC ok=1 vector=0`) before parking.
 ///
 /// Never returns; `vector` is 14, `code` is the raw CPU-pushed error code
-/// ([`PfError`] decodes bits 0-4), `cr2` is the faulting address. Live
-/// `#PF` injection (sole open #168n4) triggers this vector in a later
-/// slice; this slice only wires the gate + stub so QEMU behavior is
-/// unchanged (`#DE` still the proven exception).
+/// ([`PfError`] decodes bits 0-4), `cr2` is the faulting address. The chain
+/// (`xor eax,eax; div eax`) re-faults through the `#DE` gate whose handler
+/// parks — no `iretq` ever executes, so the CPU-pushed `#PF` error code is
+/// never popped (REVIEW #229 risk 2: safe exactly because nothing returns;
+/// a future returning handler MUST `add rsp,8` before `iretq` or the return
+/// frame misaligns).
 #[no_mangle]
 pub extern "C" fn exception_handler_pf_rust(vector: u64, code: u64, cr2: u64) -> ! {
     // SAFETY: same COM1-exclusive contract as `exception_handler_rust`.
     unsafe {
         write_pf_line(true, vector, code, cr2);
+        // Chain: intentional #DE so e2e keeps its EXC hard-require.
+        core::arch::asm!("xor eax, eax", "xor edx, edx", "div eax", options(nostack),);
         loop {
             core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
         }
@@ -439,7 +451,11 @@ macro_rules! de_isr_stub_asm {
 
 /// Shared `#PF` ISR stub source. `#PF` pushes a 64-bit error code, so the
 /// fault frame on entry is `[error code][RIP][CS][RFLAGS...]` — the stub
-/// must NOT `pop` before the call (the handler parks, `iret` never runs).
+/// reads the code from `[RSP]` with NO pop, and no `iretq` ever runs (both
+/// handlers park via `hlt`; the `#PF` body chains via a fresh `#DE` fault,
+/// not a return). Hence the error-code slot is abandoned, not misaligned
+/// (REVIEW #229 risk 2 closed by construction; documented for any future
+/// returning handler: `add rsp,8` before `iretq`).
 /// Microsoft x64 ABI: `RCX` = vector (14), `RDX` = error code (from
 /// `[RSP]`), `R8` = `CR2` (faulting address), 32-byte shadow space, `RSP`
 /// 16-byte aligned before `call`. Host tests assert these instructions.
@@ -505,9 +521,9 @@ unsafe fn load_gdt() {
 /// Same guest-only contract as [`load_gdt`]: `IDT` static must outlive the
 /// CPU, gates target [`baseos_isr_div0`] / [`baseos_isr_pf`] (code segment
 /// [`KERNEL_CODE_SEL`]), and `cli` is already in effect so unhandled
-/// vectors cannot fire this slice. Host builds are a no-op; e2e proves the
-/// `#DE` gate by catching the intentional `#DE` (`#PF` wired but never
-/// triggered this slice, so QEMU behavior is unchanged).
+/// vectors cannot fire this slice. Host builds are a no-op; e2e proves
+/// BOTH gates (`PF ok=1` via the live probe touch, then `EXC ok=1` via
+/// the chained `#DE`).
 #[cfg(not(test))]
 unsafe fn load_idt() {
     let de_handler = baseos_isr_div0 as *const () as u64;
@@ -530,10 +546,11 @@ extern "C" {
     fn baseos_isr_pf();
 }
 
-/// Guest-only CPU bring-up + controlled `#DE` proof: load GDT, load IDT,
-/// execute `xor eax,eax; xor edx,edx; div eax` (divide-by-zero). The `#DE`
-/// gate jumps to [`exception_handler_rust`], which emits
-/// `EXC ok=1 vector=0` and parks — never returns.
+/// Guest-only CPU bring-up + live `#PF` proof: load GDT, load IDT, then
+/// volatile-read [`PF_PROBE_ADDR`] (unmapped guard → not-present `#PF`).
+/// The `#PF` gate jumps to [`exception_handler_pf_rust`], which emits
+/// `PF ok=1 vector=14 code=... addr=...` and chains into an intentional
+/// `#DE` so `EXC ok=1 vector=0` still fires before parking — never returns.
 ///
 /// # Safety
 /// Must run post-`ExitBootServices` on the boot CPU with interrupts
@@ -543,10 +560,15 @@ extern "C" {
 pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
     load_gdt();
     load_idt();
-    // Intentional #DE: EAX=0 divisor. If the IDT gate is wrong this
-    // triple-faults and the e2e script fails loudly (missing EXC line).
-    core::arch::asm!("xor eax, eax", "xor edx, edx", "div eax", options(nostack),);
-    // Unreachable when #DE fires; park if the trap somehow returns.
+    // Live #PF (#168n6, sole functional open): touch the unmapped guard.
+    // If either IDT gate is wrong this triple-faults and e2e fails loudly
+    // (missing PF/EXC lines). Volatile so the read is never optimized out.
+    core::arch::asm!(
+        "mov rax, [{addr}]",
+        addr = in(reg) PF_PROBE_ADDR as *const u64,
+        options(nostack),
+    );
+    // Unreachable when #PF fires; park if the trap somehow returns.
     loop {
         core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
     }
@@ -745,8 +767,8 @@ mod tests {
     fn idt_pf_gate_round_trips_handler_address() {
         // Same encoding contract as the `#DE` gate, for vector 14: split
         // offset fields reassemble, present interrupt gate, kernel code
-        // selector. Guest `load_idt` wires both gates; `#PF` stays
-        // untriggered this slice so e2e still proves `#DE` only.
+        // selector. Guest `load_idt` wires both gates; e2e proves `#PF`
+        // live (probe touch) chained into `#DE`.
         let handler = 0x0000_0000_CAFE_F00D_u64;
         let e = IdtEntry::from_handler(handler, KERNEL_CODE_SEL);
         assert_eq!(e.handler_offset(), handler);
@@ -800,5 +822,25 @@ mod tests {
         assert!(!upper_only.is_user());
         assert!(!upper_only.is_reserved());
         assert!(!upper_only.is_instr_fetch());
+    }
+
+    #[test]
+    fn pf_probe_addr_is_canonical_unmapped_guard() {
+        // #168n6 live-#PF guard: canonical low-half, 4 KiB-aligned, far
+        // above firmware RAM/FB (0x80000000) and below the non-canonical
+        // hole (0x0000800000000000) so OVMF faults not-present (P=0).
+        // `black_box` keeps the range asserts runtime (not const-evaluable)
+        // so `clippy -D warnings` (`assertions_on_constants`) stays clean.
+        assert_eq!(PF_PROBE_ADDR, 0x0000_5000_0000_0000);
+        let probe = core::hint::black_box(PF_PROBE_ADDR);
+        assert_eq!(probe & 0xFFF, 0, "probe must be page-aligned");
+        assert!(
+            probe < 0x0000_8000_0000_0000,
+            "probe must stay canonical low-half"
+        );
+        assert!(
+            probe > 0x1_0000_0000,
+            "probe must sit above any firmware-mapped RAM"
+        );
     }
 }

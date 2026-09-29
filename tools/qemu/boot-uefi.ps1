@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S04 slice 36: RMBZ viol=0 fail-closed) ==="
+Write-Output "=== BaseOS UEFI guest boot (S04 #168n6: live PF probe chained to DE) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -207,6 +207,13 @@ if ($serialText -and $serialText.Contains($marker)) {
   # `nxen`/`walks` ride along reporting-only (not gated) this slice.
   $rmbzPat = "RMBZ ok=1 [^\r\n]*viol=0(\s|$)"
   $exc = "EXC ok=1 vector=0"
+  # S04 #168n6 live-#PF (REVIEW #229 cheapest disconfirm): the guest touches
+  # the unmapped PF_PROBE_ADDR guard, so the PF stub must emit
+  # `PF ok=1 vector=14 code=0x... addr=0x...` before chaining into #DE.
+  # Same-line regex mirrors the RMBZ/GUARD gates: literal space after ok=1
+  # stops ok=10 false-passing, [^\r\n]* keeps code/addr same-line, hex pins
+  # stop dropped fields, (\s|$) terminates the addr field.
+  $pfPat = "PF ok=1 vector=14 [^\r\n]*code=0x[0-9a-f]+[^\r\n]*addr=0x[0-9a-f]+(\s|$)"
   # #59a value check (agent-b REVIEW #75 finding 1): presence of the
   # substrings alone would let map_size=999999999 or map_size=abc PASS.
   # Regex-capture the actual values off the MEMMAP ok=1 line and enforce
@@ -249,10 +256,11 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasPermaudit2W = [regex]::IsMatch($serialText, $permaudit2WPat)
   $hasPermaudit2UN = [regex]::IsMatch($serialText, $permaudit2UNPat)
   $hasRmbz = [regex]::IsMatch($serialText, $rmbzPat)
+  $hasPf = [regex]::IsMatch($serialText, $pfPat)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasExc) {
-    Write-Output ("Boot summary: FOUND ($bootinfo + $memmap + $notrunc + $mapsize + $descsize + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + $exc)")
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasPf -and $hasExc) {
+    Write-Output ("Boot summary: FOUND (" + $bootinfo + " + " + $memmap + " + " + $notrunc + " + " + $mapsize + " + " + $descsize + " + " +
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + PF ok=1 vector=14 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -269,8 +277,9 @@ if ($serialText -and $serialText.Contains($marker)) {
       "PERMAUDIT ok=1 present=$hasPermaudit, w=1 present=$hasPermauditW, user/nx shape present=$hasPermauditUN, " +
       "PERMAUDIT2 ok=1 present=$hasPermaudit2, w=1 present=$hasPermaudit2W, user/nx shape present=$hasPermaudit2UN, " +
       "RMBZ ok=1 viol-shape present=$hasRmbz, " +
+      "PF ok=1 vector=14-shape present=$hasPf, " +
       "EXC ok=1 vector=0 present=$hasExc; " +
-      "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/frame-alloc/#DE path failed " +
+      "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/frame-alloc/#PF/#DE path failed " +
       "-- see serial log)")
     Write-Output "UEFI BOOT FAIL"
     exit 1
