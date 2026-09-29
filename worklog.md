@@ -2961,3 +2961,45 @@ Format per entry (per `implementation-guide.md` §31):
   corrected to cache-stable only (clean proof still open, size is the
   signal). Open: #168n4 live #PF (sole functional open), clean-rebuild
   hash proof if required. #6 stays active pending b-side re-verify.
+
+## S04 slice36 correction-2 -- clean double-rebuild hash proof (2026-09-29)
+
+- **Decision:** Close REVIEW #217 determinism risk with a measured
+  `cargo clean` double-rebuild hash proof, no code change: two
+  consecutive `cargo clean` + `cargo build --target
+  x86_64-unknown-uefi -p baseos-boot-uefi` links on the unchanged
+  `@a71e6a7` tree, hashing
+  `target/x86_64-unknown-uefi/debug/bootx64.efi` each time.
+- **Why:** REVIEW #217 accepted the +1024B codegen causal claim but held
+  determinism and b-side gates unverified; the slice-36 "x2 same hash"
+  was a cached rebuild, and the fresh `@5436054` hash (`E9E80769...`
+  vs recorded `388BA13B...`) already showed size-stable / hash-unstable
+  output. Cheapest close is the clean double-rebuild datum.
+- **Alternatives:** Claim determinism from cached rebuilds (rejected:
+  disproven); normalize the PE timestamp with a post-link step
+  (rejected: scope growth, reproducibility DoD is satisfied by
+  size-as-signal + documented hash instability until a real need).
+- **Expected:** Both clean links yield 84480B with differing SHA256;
+  gates stay green: default 91, kernel 60, boot-uefi 16, gate 41/41;
+  fmt/clippy `-D warnings` clean; `boot-uefi.ps1` PASS 890B viol=0.
+- **Measured (2026-09-29, Win11, @a71e6a7, rustc 1.98.0 88d9e12ae
+  LLVM 22.1.8):** default `cargo test` 91/91 (21+60+4+4+2),
+  `-p baseos-boot-uefi` 16/16, gate TEST PASS 41/41;
+  `cargo fmt --check` clean; `clippy --all-targets -D warnings` clean
+  (host) and `clippy -p baseos-boot-uefi --target
+  x86_64-unknown-uefi -D warnings` clean; `boot-uefi.ps1` UEFI BOOT
+  PASS, serial 890 bytes, staged ESP 84480B SHA
+  `E9E8076983F4237124FC2E7C588C06FC1BE91A84CBDE3B199DC9A12DBD84B70D`,
+  tail `RMBZ ok=1 nxen=1 walks=2/2 viol=0` + `EXC ok=1 vector=0`;
+  clean link 1: 84480B SHA
+  `23AF9FA38C93C586A975D6EF4DCC2EEF3F05E7F9B34F1A53F9D93181B6594394`;
+  clean link 2: 84480B SHA
+  `3BCE0EA17A2D39E243D44FFF4588B8727A4C44E2165225A878F465503ADCFA86`.
+  Four hashes at one size (commit `388BA13B...`, incremental
+  `E9E80769...`, cleans `23AF9FA3...`/`3BCE0EA1...`) = PE link
+  non-determinism (likely timestamp); size 84480B is the stable
+  codegen signal.
+- **Final:** Determinism risk closed as documented hash-instability
+  with size-stable proof; no code impact. Open: #168n4 live #PF (sole
+  functional open). #6 ready for agent-b re-verify / done on
+  concurrence.
