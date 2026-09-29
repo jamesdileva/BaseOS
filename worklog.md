@@ -2918,3 +2918,46 @@ Format per entry (per `implementation-guide.md` §31):
   with host + gate + QEMU proof (#207 satisfied on the a-side). Open:
   #168n4 live #PF, clean-rebuild hash proof if still required. #6 ready
   for agent-b re-verify (recommend done on concurrence).
+
+## S04 slice36 correction -- +1024B attribution fix + hash non-determinism note (2026-09-29)
+
+- **Decision:** Correct the slice-34->35 +1024B label and the slice-36
+  determinism claim with measured data, no code change: (a) causal diff
+  `b8339b2..c9732c5` is code-only `crates/kernel/src/page_table.rs`
+  35+/83- (commit `c9732c5` totals 65+/83- with its 30-line worklog row;
+  `c2d03ca`/`cdda266` in range are MEMORY/worklog-only), so the
+  83456B->84480B (+1024B, one page-rounded image step) is refactor
+  codegen, not rebuild variance -- the prior "rebuild variance" label in
+  slice-35/MEMORY and the "still unattributed" note in slice-36 are
+  superseded; (b) record `rustc -Vv`: 1.98.0 (88d9e12ae 2026-08-18)
+  x86_64-pc-windows-msvc, LLVM 22.1.8, cargo 1.98.0; (c) record hash
+  non-determinism on the unchanged `@5436054` tree: fresh
+  `boot-uefi.ps1` build yields 84480B SHA
+  `E9E8076983F4237124FC2E7C588C06FC1BE91A84CBDE3B199DC9A12DBD84B70D`
+  vs slice-36 recorded `388BA13B...` at the same 84480B size; immediate
+  rebuild without clean keeps `E9E807...` (cached, no relink), so the
+  slice-36 "rebuild x2 same hash -- deterministic" was a cached-rebuild
+  observation, not a clean double-rebuild proof (likely PE timestamp
+  embedded per link; `cargo clean` double-rebuild still owed if hash
+  determinism is required -- size remains the stable codegen signal).
+- **Why:** Agent-b REVIEW #215 held the causal claim trusted-not-verified
+  (b-side SKIPPED) and required a worklog correction plus `rustc -Vv`
+  and clean double-rebuild hash to close rebuild-variance vs codegen;
+  this delivers the correction + toolchain pin + fresh-build datum.
+- **Alternatives:** Claim hash determinism from the cached rebuild
+  (rejected: disproven by the fresh-build hash mismatch at identical
+  size); re-attribute +1024B to OVMF variance (rejected: image bytes
+  changed with code only, serial 890B/MEMMAP/FB stable).
+- **Expected:** default 91, kernel 60, boot-uefi 16, gate 41/41;
+  fmt/clippy clean; `boot-uefi.ps1` PASS 890B `RMBZ ok=1 viol=0`.
+- **Measured (2026-09-29, Win11, @5436054):** default `cargo test`
+  91/91 (21+60+4+4+2), `-p baseos-kernel` 60/60,
+  `-p baseos-boot-uefi` 16/16, gate TEST PASS 41/41;
+  `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 890 bytes, guest
+  84480 bytes SHA `E9E80769...D84B70D` (vs `388BA13B...` at commit),
+  serial tail `RMBZ ok=1 nxen=1 walks=2/2 viol=0` + `EXC ok=1 vector=0`;
+  second boot without clean keeps `E9E807...` (cache-stable).
+- **Final:** +1024B closed as refactor codegen; hash determinism
+  corrected to cache-stable only (clean proof still open, size is the
+  signal). Open: #168n4 live #PF (sole functional open), clean-rebuild
+  hash proof if required. #6 stays active pending b-side re-verify.
