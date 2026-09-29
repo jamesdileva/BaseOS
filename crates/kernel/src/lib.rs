@@ -76,9 +76,66 @@ const GDT_DATA: u64 = 0x00CF_9200_0000_FFFF;
 /// Exception vector for `#DE` (divide error). First IDT slot; no error
 /// code pushed by the CPU.
 const VECTOR_DE: usize = 0;
+/// Exception vector for `#PF` (page fault, Intel SDM Vol 3 §6.15). The CPU
+/// pushes a 64-bit error code plus `CR2` holds the faulting address. Live
+/// `#PF` injection (sole open #168n4) wires this vector in a later slice;
+/// this slice only pins the error-code contract host-side (guest IDT still
+/// `#DE`-only, so QEMU behavior is unchanged).
+pub const VECTOR_PF: usize = 14;
 /// Number of architecturally-defined exception vectors (0..=31) the IDT
 /// covers; hardware IRQs (32+) stay masked (`cli`) this slice.
 const EXCEPTION_VECTORS: usize = 32;
+
+/// `#PF` error-code decode (Intel SDM Vol 3 Fig 6-8: P/W-U-RSV-I bits 0-4).
+/// Pure `core`-only helper so the future guest `#PF` stub and host tests
+/// share one contract; guest wiring (IDT gate 14 + `CR2` read + serial line)
+/// rides with the live-injection slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PfError(u64);
+
+impl PfError {
+    /// Rebuild from the CPU-pushed error code (low 5 bits defined).
+    #[must_use]
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// Raw bits.
+    #[must_use]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// P=1: protection violation (present page); P=0: non-present page.
+    #[must_use]
+    pub const fn is_present(self) -> bool {
+        self.0 & 1 != 0
+    }
+
+    /// W/R=1: faulting access was a write.
+    #[must_use]
+    pub const fn is_write(self) -> bool {
+        self.0 & (1 << 1) != 0
+    }
+
+    /// U/S=1: faulting access was from user mode (CPL 3).
+    #[must_use]
+    pub const fn is_user(self) -> bool {
+        self.0 & (1 << 2) != 0
+    }
+
+    /// RSVD=1: fault caused by a reserved-bit violation.
+    #[must_use]
+    pub const fn is_reserved(self) -> bool {
+        self.0 & (1 << 3) != 0
+    }
+
+    /// I/D=1: faulting access was an instruction fetch.
+    #[must_use]
+    pub const fn is_instr_fetch(self) -> bool {
+        self.0 & (1 << 4) != 0
+    }
+}
 
 /// Minimal long-mode GDT: null, kernel code (`0x08`), kernel data (`0x10`).
 /// Static so `lgdt` keeps a stable base after the function returns.
@@ -517,5 +574,32 @@ mod tests {
             !stub.contains("rdi"),
             "RDI is not the Win64 argument register: {stub}"
         );
+    }
+
+    #[test]
+    fn pf_error_decode_matches_sdm_bits() {
+        // #168n4 scoping: pin the P/W-U/RSV/I contract before the guest
+        // wires IDT vector 14 (error code + CR2). Bit layout Intel SDM
+        // Vol 3 Fig 6-8.
+        assert_eq!(VECTOR_PF, 14);
+        let not_present_read = PfError::from_bits(0b00000);
+        assert!(!not_present_read.is_present());
+        assert!(!not_present_read.is_write());
+        assert!(!not_present_read.is_user());
+        assert!(!not_present_read.is_reserved());
+        assert!(!not_present_read.is_instr_fetch());
+        let prot_write_user = PfError::from_bits(0b00111);
+        assert!(prot_write_user.is_present());
+        assert!(prot_write_user.is_write());
+        assert!(prot_write_user.is_user());
+        assert!(!prot_write_user.is_reserved());
+        assert!(!prot_write_user.is_instr_fetch());
+        let rsvd_instr = PfError::from_bits(0b11000);
+        assert!(!rsvd_instr.is_present());
+        assert!(!rsvd_instr.is_write());
+        assert!(!rsvd_instr.is_user());
+        assert!(rsvd_instr.is_reserved());
+        assert!(rsvd_instr.is_instr_fetch());
+        assert_eq!(PfError::from_bits(0b10110).bits(), 0b10110);
     }
 }
