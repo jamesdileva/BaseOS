@@ -3191,3 +3191,53 @@ Format per entry (per `implementation-guide.md` §31):
   `uart::outb`/`inb`); both REVIEW #236 nits closed on this tree. #8 stays
   active: next is CPU/table safe wrappers (GDT/IDT/CR3/EFER) + boot-uefi
   UART unify.
+
+## S05 slice 3 — kernel CPU/table boundary + gate/probe safe wrappers (2026-09-29)
+
+- **Decision:** Second safe-wrapper slice of #8: (a) new
+  `crates/kernel/src/cpu.rs` — moved `Gdt`/`GDT`,
+  `DescriptorTablePointer`, `IdtEntry`, `Idt`/`IDT`, extern stub decls, and
+  the privileged `load_gdt`/`load_idt` bodies out of `lib.rs` (unsafe
+  confined to the two load bodies, as with `uart.rs`); `lib.rs`
+  `bring_up_cpu_and_prove_exception` now calls `cpu::load_gdt` /
+  `cpu::load_idt`, descriptor consts stay in `lib.rs` as the single owner
+  (`cpu` imports them), and the `IdtEntry` re-export is test-only (guest
+  names `cpu::` directly); (b) two safe `pub(crate)` wrappers alongside:
+  `gate_for(handler)` pins `KERNEL_CODE_SEL` so callers cannot wire a gate
+  into the null/data segment (consumed by `load_idt`), and
+  `probe_addr_valid(addr)` pins the live-`#PF` guard contract
+  (canonical low-half, 4 KiB-aligned, above firmware RAM) as a pure
+  `const fn` — guest intentionally does not call it (no panic path
+  post-EBS; `dead_code` in guest builds is documented, host tests are the
+  gate); (c) two host tests (`gate_for_pins_kernel_code_selector`,
+  `probe_addr_valid_matches_guard_contract`); (d) inventory §D1/D2 point
+  at `cpu.rs` per the re-baseline policy, header notes the slice-3 delta,
+  follow-ups narrowed to CR3/EFER wrappers + boot-uefi UART unify.
+- **Why:** S05 verification needs the CPU/table unsafe concentrated behind
+  documented wrappers with safe callers unable to pick a wrong segment or
+  probe address; the pure move plus the two wrappers is the smallest
+  end-to-end-green segment (CR3/EFER + UART unify ride next cycle).
+- **Alternatives:** Move `bring_up_cpu_and_prove_exception` and the ISR
+  stubs/handlers into `cpu.rs` too (rejected: handlers depend on `uart`
+  and the stub macros feed host ABI tests in `lib.rs` — moving them doubles
+  the diff for no new boundary); `debug_assert!(probe_addr_valid(..))` in
+  the guest bring-up (rejected: adds a panic path post-EBS; host gate +
+  e2e probe fire is the proof); shared `crates/hal` for boot-uefi UART
+  now (rejected: same scope argument as slice 2 — unify next).
+- **Expected:** default 99 (21+68+4+4+2), boot-uefi 17/17, fmt/clippy clean
+  both targets, `boot-uefi.ps1` PASS with PF+EXC lines (pure move — guest
+  size expected stable, record either way).
+- **Measured (2026-09-29, Win11, rustc 1.98.0):** default 99/99
+  (21+68+4+4+2 — kernel 68/68 incl. the 2 new cpu tests),
+  `-p baseos-boot-uefi` 17/17 (anchor asserts green),
+  `cargo fmt --check` clean (after one auto-format),
+  `cargo clippy --all-targets -D warnings` clean (host) and
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 937
+  bytes (marker FOUND, BOOTINFO/MEMMAP/FB/GOP/EBS/KERNEL/FRAMEALLOC/PAGING/
+  PERM/GUARD/PERMAUDIT[x2]/RMBZ ok, `PF ok=1 vector=14` + `EXC ok=1
+  vector=0`), guest `bootx64.efi` 85504 bytes (byte-identical to slice 2 —
+  pure move confirmed, serial contract unchanged).
+- **Final:** Kernel CPU/table unsafe is concentrated in `cpu.rs` with safe
+  gate/probe wrappers beside it. #8 stays active: next is CR3/EFER safe
+  wrappers + boot-uefi UART unify.

@@ -1,4 +1,4 @@
-# Unsafe inventory — S05 slice 1 baseline @bfc4790, slice 2 delta noted
+# Unsafe inventory — S05 slice 1 baseline @bfc4790, slice 2 + slice 3 deltas noted
 
 Scope: exhaustive over `crates/` for `unsafe`, `asm!`/`global_asm!`,
 raw-pointer ops (`read_unaligned`, `from_raw_parts`, `addr_of[_mut]`,
@@ -7,8 +7,9 @@ in the S05 slice-1 worklog row (guest + test hits listed, no sampling).
 
 Result: `unsafe` blocks are concentrated in exactly 2 files —
 `crates/boot-uefi/src/main.rs` (guest boundary) and
-`crates/kernel/src/lib.rs` + `crates/kernel/src/uart.rs` (CPU/exception
-boundary, slice 2 split).
+`crates/kernel/src/lib.rs` + `crates/kernel/src/uart.rs` (slice 2 split)
++ `crates/kernel/src/cpu.rs` (slice 3 split: GDT/IDT tables + loads;
+CPU/exception boundary)
 `crates/kernel/src/page_table.rs`, `crates/kernel/src/frame_alloc.rs`,
 `crates/boot-info`, `crates/serial-marker`, `crates/version` contain
 **zero** `unsafe` blocks (only doc prose and the safe
@@ -21,7 +22,10 @@ wrappers move code, so they are NOT the gate — the host shape-pin tests
 (`s05_unsafe_inventory_pins_*`, now with per-row `| A1 |`…`| D10 |`
 anchors) are. Each slice that moves an inventoried site notes the new
 path here and re-baselines only that site's lines; full line re-baseline
-rides with the slice that closes S05.
+rides with the slice that closes S05. Slice 3 moved D1/D2 (+ tables) from
+`kernel/lib.rs` to `kernel/cpu.rs` with zero guest behavior change
+(guest `bootx64.efi` byte-identical 85504B); safe `gate_for` /
+`probe_addr_valid` added alongside.
 
 ## A. Port I/O — COM1 UART (no safe equivalent on a `no_std` guest)
 
@@ -56,8 +60,8 @@ rides with the slice that closes S05.
 
 | # | Site | Why unsafe | Invariant / caller contract | Proof |
 |---|---|---|---|---|
-| D1 | kernel `load_gdt` (494): `addr_of!(GDT)`, `lgdt`, far-return CS reload | Privileged descriptor load + segment switch | Post-EBS boot CPU; static outlives use; selectors `0x08`/`0x10` | Survival into `#DE` e2e |
-| D2 | kernel `load_idt` (528): `addr_of_mut!(IDT)` gate writes (530/533), `addr_of!(IDT)`, `lidt` | Privileged table load; raw static mutation | `cli` in effect; gates target `baseos_isr_div0`/`baseos_isr_pf` with `KERNEL_CODE_SEL` | `PF`+`EXC` lines e2e |
+| D1 | kernel `cpu::load_gdt` (slice 3 @this-slice, was lib.rs 494 @bfc4790): `addr_of!(GDT)`, `lgdt`, far-return CS reload | Privileged descriptor load + segment switch | Post-EBS boot CPU; static outlives use; selectors `0x08`/`0x10` | Survival into `#DE` e2e |
+| D2 | kernel `cpu::load_idt` (slice 3 @this-slice, was lib.rs 528 @bfc4790): `addr_of_mut!(IDT)` gate writes, `addr_of!(IDT)`, `lidt` — gates built via safe [`gate_for`] (pins `KERNEL_CODE_SEL`) | Privileged table load; raw static mutation | `cli` in effect; gates target `baseos_isr_div0`/`baseos_isr_pf` with `KERNEL_CODE_SEL` | `PF`+`EXC` lines e2e |
 | D3 | `global_asm!` stubs (481/483) + `extern "C"` fwd decls (544) | Hand-written entry code (Win64 ABI: vector in `RCX`, shadow space, align) | Host ABI-pin tests share the macro source | Stub-ABI tests; live fire e2e |
 | D4 | `exception_handler_rust` body (327) / `exception_handler_pf_rust` body (349): `hlt`, chained `div eax` (352) | `hlt`/fault-chain are CPU instructions | COM1-exclusive exception context; never returns so the pushed `#PF` error code needs no pop (`add rsp,8` owed only if a future handler returns) | `PF ok=1` then `EXC ok=1` chained e2e |
 | D5 | `bring_up_cpu_and_prove_exception` guest (560): `load_gdt/load_idt` + volatile probe read (566) + `hlt` (573) | Crosses to the exception world; touches unmapped guard | Post-EBS, `cli`, COM1 ready; probe = `PF_PROBE_ADDR` canonical guard | `PF`+`EXC` e2e |
@@ -87,5 +91,8 @@ the guest but with heap `Vec` fakes, so no firmware/hardware is touched.
   `VECTOR_DE` 0 / `VECTOR_PF` 14 / `EXCEPTION_VECTORS` 32,
   `PF_PROBE_ADDR` 0x500000000000, COM1 `0x3F8`/`+5`/`0x20`.
 
-Follow-ups (not this slice): safe wrappers for port I/O, CPU/table APIs,
-per-site invariant docs beyond this table.
+Follow-ups (not this slice): CR3/EFER (`read_cr3`, `read_efer`, guest
+probes D7/D9) safe wrappers; boot-uefi UART unify with `kernel::uart`
+(pre-EBS `uart_init` stays guest-side); per-site invariant docs beyond
+this table. Done: port-I/O safe wrappers (slice 2), CPU gate/probe safe
+wrappers `gate_for` / `probe_addr_valid` (slice 3).

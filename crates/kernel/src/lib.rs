@@ -22,6 +22,10 @@ extern crate std;
 
 use baseos_boot_info::{write_str, write_u64_dec, write_u64_hex, BootInfo};
 
+/// Safe CPU/table boundary: privileged `lgdt`/`lidt` confined to
+/// `cpu::load_gdt`/`load_idt`; safe callers use `cpu::gate_for` and
+/// `cpu::probe_addr_valid` without an `unsafe` block.
+pub mod cpu;
 pub mod frame_alloc;
 pub mod page_table;
 /// Safe COM1 port-I/O boundary: raw `in`/`out` confined to private
@@ -29,6 +33,12 @@ pub mod page_table;
 /// the `write_*` line helpers without an `unsafe` block.
 pub mod uart;
 
+/// Re-exported for host tests so they keep one owner for the gate encoding
+/// contract (`cpu::IdtEntry` is the canonical path; this alias avoids
+/// churning every `super::*` test import). Test-only: guest code names
+/// `cpu::` directly.
+#[cfg(test)]
+pub(crate) use cpu::IdtEntry;
 use uart::{write_exc_line, write_pf_line};
 
 /// Enter the kernel with the boot handoff: validate [`BootInfo`] and emit
@@ -155,98 +165,11 @@ impl PfError {
     }
 }
 
-/// Minimal long-mode GDT: null, kernel code (`0x08`), kernel data (`0x10`).
-/// Static so `lgdt` keeps a stable base after the function returns.
-/// Guest-only (`cfg(not(test))`) — host tests cover the descriptor constants
-/// without constructing the table.
-#[cfg(not(test))]
-#[repr(C, align(16))]
-struct Gdt {
-    entries: [u64; 3],
-}
-
-#[cfg(not(test))]
-static mut GDT: Gdt = Gdt {
-    entries: [GDT_NULL, GDT_CODE, GDT_DATA],
-};
-
-/// Packed `lgdt` operand: 16-bit limit + 64-bit base (Intel SDM format).
-#[cfg(not(test))]
-#[repr(C, packed)]
-struct DescriptorTablePointer {
-    limit: u16,
-    base: u64,
-}
-
-/// One 16-byte x86-64 IDT gate descriptor.
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct IdtEntry {
-    offset_low: u16,
-    selector: u16,
-    ist: u8,
-    type_attr: u8,
-    offset_mid: u16,
-    offset_high: u32,
-    reserved: u32,
-}
-
-impl IdtEntry {
-    /// Absent gate (type_attr present-bit clear): a vector that hits this
-    /// slot raises `#GP` instead of jumping to garbage.
-    const fn missing() -> Self {
-        Self {
-            offset_low: 0,
-            selector: 0,
-            ist: 0,
-            type_attr: 0,
-            offset_mid: 0,
-            offset_high: 0,
-            reserved: 0,
-        }
-    }
-
-    /// Interrupt gate (type `0xE`, DPL 0, present) targeting `handler`
-    /// with code selector `selector` (IST 0 — same stack this slice).
-    const fn from_handler(handler: u64, selector: u16) -> Self {
-        Self {
-            offset_low: handler as u16,
-            selector,
-            ist: 0,
-            type_attr: 0x8E,
-            offset_mid: (handler >> 16) as u16,
-            offset_high: (handler >> 32) as u32,
-            reserved: 0,
-        }
-    }
-
-    /// Reassemble the 64-bit handler offset from the split gate fields
-    /// (host-testable encoding round-trip; guest `lidt` consumes raw bytes).
-    #[cfg(test)]
-    fn handler_offset(&self) -> u64 {
-        u64::from(self.offset_low)
-            | (u64::from(self.offset_mid) << 16)
-            | (u64::from(self.offset_high) << 32)
-    }
-}
-
-/// IDT covering the 32 exception vectors; `#DE` + `#PF` are wired this
-/// slice (others stay [`IdtEntry::missing`] and would `#GP` if hit — with
-/// `cli` and single-threaded bring-up only `#DE` is expected; `#PF` is
-/// wired-but-untriggered until the live-injection slice).
-/// Guest-only IDT storage; host tests exercise [`IdtEntry`] encoding
-/// without instantiating the full table.
-#[cfg(not(test))]
-#[repr(C, align(16))]
-struct Idt {
-    entries: [IdtEntry; EXCEPTION_VECTORS],
-}
-
-#[cfg(not(test))]
-static mut IDT: Idt = Idt {
-    entries: [IdtEntry::missing(); EXCEPTION_VECTORS],
-};
-
+/// CPU/table boundary moved to [`cpu`] (S05 slice 3): `Gdt`/`GDT`,
+/// `DescriptorTablePointer`, `IdtEntry`, `Idt`/`IDT`, and the privileged
+/// `load_gdt`/`load_idt` bodies live there; `bring_up_cpu_and_prove_exception`
+/// calls them. See `cpu.rs`.
+///
 /// Port-I/O boundary moved to [`uart`] (S05 slice 2): raw `in`/`out`
 /// (`outb`/`inb`) are private unsafe bodies there; `com1_write_byte` and the
 /// `write_*` line helpers are safe wrappers. See `uart.rs`.
@@ -347,70 +270,6 @@ core::arch::global_asm!(de_isr_stub_asm!());
 #[cfg(not(test))]
 core::arch::global_asm!(pf_isr_stub_asm!());
 
-/// Load the S02 GDT and reload visible segment registers + CS.
-///
-/// # Safety
-/// Guest-only post-`ExitBootServices` path: `GDT` is a stable static, the
-/// far-return reloads CS to [`KERNEL_CODE_SEL`], and data selectors point
-/// at [`KERNEL_DATA_SEL`]. Host builds are a no-op (no `lgdt` on the test
-/// harness); the OVMF e2e path proves the descriptors by surviving past
-/// load into the intentional `#DE`.
-#[cfg(not(test))]
-unsafe fn load_gdt() {
-    let ptr = DescriptorTablePointer {
-        limit: (core::mem::size_of::<Gdt>() - 1) as u16,
-        base: core::ptr::addr_of!(GDT) as u64,
-    };
-    core::arch::asm!("lgdt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags));
-    core::arch::asm!(
-        "mov ss, {data:x}",
-        "mov ds, {data:x}",
-        "mov es, {data:x}",
-        "xor eax, eax",
-        "mov fs, ax",
-        "mov gs, ax",
-        "push {code}",
-        "lea rax, [rip + 771f]",
-        "push rax",
-        "retfq",
-        "771:",
-        data = in(reg) KERNEL_DATA_SEL,
-        code = in(reg) u64::from(KERNEL_CODE_SEL),
-        options(preserves_flags),
-    );
-}
-
-/// Populate `#DE` (vector 0) + `#PF` (vector 14) and `lidt` the table.
-///
-/// # Safety
-/// Same guest-only contract as [`load_gdt`]: `IDT` static must outlive the
-/// CPU, gates target [`baseos_isr_div0`] / [`baseos_isr_pf`] (code segment
-/// [`KERNEL_CODE_SEL`]), and `cli` is already in effect so unhandled
-/// vectors cannot fire this slice. Host builds are a no-op; e2e proves
-/// BOTH gates (`PF ok=1` via the live probe touch, then `EXC ok=1` via
-/// the chained `#DE`).
-#[cfg(not(test))]
-unsafe fn load_idt() {
-    let de_handler = baseos_isr_div0 as *const () as u64;
-    (*core::ptr::addr_of_mut!(IDT)).entries[VECTOR_DE] =
-        IdtEntry::from_handler(de_handler, KERNEL_CODE_SEL);
-    let pf_handler = baseos_isr_pf as *const () as u64;
-    (*core::ptr::addr_of_mut!(IDT)).entries[VECTOR_PF] =
-        IdtEntry::from_handler(pf_handler, KERNEL_CODE_SEL);
-    let ptr = DescriptorTablePointer {
-        limit: (core::mem::size_of::<Idt>() - 1) as u16,
-        base: core::ptr::addr_of!(IDT) as u64,
-    };
-    core::arch::asm!("lidt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags));
-}
-
-// Forward-declared asm stubs (defined in `global_asm!` above).
-#[cfg(not(test))]
-extern "C" {
-    fn baseos_isr_div0();
-    fn baseos_isr_pf();
-}
-
 /// Guest-only CPU bring-up + live `#PF` proof: load GDT, load IDT, then
 /// volatile-read [`PF_PROBE_ADDR`] (unmapped guard → not-present `#PF`).
 /// The `#PF` gate jumps to [`exception_handler_pf_rust`], which emits
@@ -423,8 +282,8 @@ extern "C" {
 /// and COM1 initialized. Host `cargo test` builds compile this out.
 #[cfg(not(test))]
 pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
-    load_gdt();
-    load_idt();
+    cpu::load_gdt();
+    cpu::load_idt();
     // Live #PF (#168n6, sole functional open): touch the unmapped guard.
     // If either IDT gate is wrong this triple-faults and e2e fails loudly
     // (missing PF/EXC lines). Volatile so the read is never optimized out.
