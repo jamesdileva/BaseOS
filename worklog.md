@@ -3091,3 +3091,54 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Live `#PF` fired and proven end-to-end with chained `#DE`;
   #168 trigger open closed on the A-side. #6 stays active pending b-side
   double-rebuild + gates + boot verify (owed).
+
+## S05 slice 1 -- unsafe inventory + boundary shape pins (2026-09-29)
+
+- **Decision:** Open S05 (#8) with the inventory half as one committable
+  slice: (a) new `docs/unsafe-inventory.md` (exhaustive, not sampled --
+  two `Select-String` sweeps over `crates/` for `unsafe`/`asm!`/
+  `global_asm!`/`read_unaligned`/`from_raw_parts`/`addr_of`/`transmute`
+  recorded below): `unsafe` is concentrated in exactly 2 files
+  (`boot-uefi/main.rs` guest boundary, `kernel/lib.rs` CPU/exception
+  boundary); `page_table.rs`, `frame_alloc.rs`, `boot-info`,
+  `serial-marker`, `version` contain zero `unsafe`. Per-site table rows
+  (A port I/O, B table/slot loads + raw offsets, C map buffers, D CPU
+  regs/tables/traps, E test-only fixtures) each give why-unsafe,
+  invariant/caller contract, and proof; (b) two host shape-pin tests
+  (`boot-uefi s05_unsafe_inventory_pins_boundary_shape`,
+  `kernel s05_unsafe_inventory_pins_cpu_boundary_shape`) asserting the doc
+  names every site (`include_str!`) plus the boundary constants
+  (96/56/64/320/232, GOP 24/8/16/24/32, 36, 16384, 4, 4096, STRUCTURAL_FAIL,
+  0x08/0x10, vectors 0/14/32, probe 0x500000000000, COM1 0x3F8/+5/0x20).
+  No guest/script change.
+- **Why:** S05 verification needs the unsafe inventory first, and REVIEW
+  #234 explicitly requires exhaustive (grep `unsafe` + `asm` + raw ptr)
+  plus the cheapest disconfirm (`rg -n unsafe crates/` + boundary audit)
+  before #8 leaves `proposed`; the doc + pins are that disconfirm in
+  committed form. Safe wrappers (port I/O, CPU/table APIs) ride next.
+- **Alternatives:** Sample-based inventory of "interesting" sites
+  (rejected: reviewer explicitly forbade it -- a missed `transmute` or
+  `from_raw_parts` is the failure mode); safe-wrapper API in the same
+  commit (rejected: doubles single-cycle risk; inventory must be pinned
+  before wrappers move code); runtime unsafe-counting via proc macro
+  (rejected: `include_str!` + constant asserts pin doc-vs-code drift with
+  zero new deps).
+- **Expected:** default `cargo test` 96 (95 + 1 kernel pin; boot-uefi pin
+  lives outside default-members), `-p baseos-boot-uefi` 17 (16 + 1),
+  gate-test 41/41, fmt/clippy `-D warnings` clean both targets,
+  `boot-uefi.ps1` PASS byte-identical to @bfc4790 (937B, 86016B).
+- **Measured (2026-09-29, Win11, rustc 1.98.0):** default 96/96
+  (21+65+4+4+2), `-p baseos-kernel` 65/65,
+  `-p baseos-boot-uefi` 17/17 (both new pins green),
+  `test-boot-uefi-gates.ps1` GATE TEST PASS (41/41),
+  `cargo fmt --check` clean,
+  `cargo clippy --all-targets -D warnings` clean (host) and
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 937
+  bytes, guest `bootx64.efi` 86016 bytes (both byte-identical to @bfc4790;
+  map_size=4704 desc_size=48 budget ok, `PF ok=1 vector=14 code=0x0` +
+  `EXC ok=1 vector=0`). Sweep datum: 158 hits across the 7 scanned files
+  (guest fns + test fixtures); zero outside the 2 boundary files.
+- **Final:** Inventory landed exhaustive with shape pins; #8 ready for
+  agent-b review (proposed -> active this cycle; done on concurrence).
+  Next: safe wrappers for port I/O, CPU/table APIs, invariant docs.

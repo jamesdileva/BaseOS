@@ -1858,4 +1858,53 @@ mod tests {
         // map_size > 16 KiB), not a generic raw error.
         assert!(REQUIRED_MAP_SIZE.load(Ordering::Relaxed) > MEMMAP_BUF_LEN);
     }
+
+    #[test]
+    fn s05_unsafe_inventory_pins_boundary_shape() {
+        // S05 slice 1: `docs/unsafe-inventory.md` is the exhaustive unsafe
+        // inventory (sweeps recorded in the worklog row). This test pins the
+        // doc against the boundary shape so a dropped site or a changed
+        // constant fails here, not in review.
+        const DOC: &str = include_str!("../../../docs/unsafe-inventory.md");
+        for site in [
+            "outb",
+            "inb",
+            "uart_init",
+            "com1_write_byte",
+            "com1_emit",
+            "load_boot_services",
+            "load_get_memory_map",
+            "load_allocate_pool",
+            "load_locate_protocol",
+            "load_exit_boot_services",
+            "fill_boot_info",
+            "refresh_map_key",
+            "exit_boot_services",
+            "fill_framebuffer",
+            "read_cr3",
+            "read_efer",
+            "phys_to_table_ptr",
+            "probe_paging",
+            "probe_live_flags",
+            "probe_rmbz",
+            "efi_main",
+        ] {
+            assert!(DOC.contains(site), "inventory must document {site}");
+        }
+        assert_eq!(SYSTEM_TABLE_BOOT_SERVICES_OFF, 96);
+        assert_eq!(BOOT_SERVICES_GET_MEMORY_MAP_OFF, 56);
+        assert_eq!(BOOT_SERVICES_ALLOCATE_POOL_OFF, 64);
+        assert_eq!(BOOT_SERVICES_LOCATE_PROTOCOL_OFF, 320);
+        assert_eq!(BOOT_SERVICES_EXIT_BOOT_SERVICES_OFF, 232);
+        assert_eq!(GOP_MODE_OFF, 24);
+        assert_eq!(GOP_MODE_INFO_OFF, 8);
+        assert_eq!(GOP_MODE_SIZE_OF_INFO_OFF, 16);
+        assert_eq!(GOP_MODE_FB_BASE_OFF, 24);
+        assert_eq!(GOP_MODE_FB_SIZE_OFF, 32);
+        assert_eq!(GOP_INFO_MIN, 36);
+        assert_eq!(MEMMAP_BUF_LEN, 16384);
+        assert_eq!(GET_MAP_MAX_ATTEMPTS, 4);
+        assert_eq!(GET_MAP_POOL_SLACK, 4096);
+        assert_eq!(STRUCTURAL_FAIL, usize::MAX);
+    }
 }

@@ -843,4 +843,35 @@ mod tests {
             "probe must sit above any firmware-mapped RAM"
         );
     }
+
+    #[test]
+    fn s05_unsafe_inventory_pins_cpu_boundary_shape() {
+        // S05 slice 1: `docs/unsafe-inventory.md` sections A/D list every
+        // kernel unsafe site. This test pins the doc against the CPU
+        // boundary shape so a dropped site or a changed constant fails here.
+        const DOC: &str = include_str!("../../../docs/unsafe-inventory.md");
+        for site in [
+            "outb",
+            "inb",
+            "com1_write_byte",
+            "write_exc_line",
+            "write_pf_line",
+            "load_gdt",
+            "load_idt",
+            "bring_up_cpu_and_prove_exception",
+            "baseos_isr_div0",
+            "baseos_isr_pf",
+        ] {
+            assert!(DOC.contains(site), "inventory must document {site}");
+        }
+        assert_eq!(KERNEL_CODE_SEL, 0x08);
+        assert_eq!(KERNEL_DATA_SEL, 0x10);
+        assert_eq!(VECTOR_DE, 0);
+        assert_eq!(VECTOR_PF, 14);
+        assert_eq!(EXCEPTION_VECTORS, 32);
+        assert_eq!(PF_PROBE_ADDR, 0x0000_5000_0000_0000);
+        assert_eq!(COM1_PORT, 0x3F8);
+        assert_eq!(COM1_LSR, COM1_PORT + 5);
+        assert_eq!(LSR_THR_EMPTY, 0x20);
+    }
 }
