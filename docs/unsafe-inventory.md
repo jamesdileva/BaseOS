@@ -66,9 +66,9 @@ rides with the slice that closes S05. Slice 3 moved D1/D2 (+ tables) from
 | D4 | `exception_handler_rust` body (327) / `exception_handler_pf_rust` body (349): `hlt`, chained `div eax` (352) | `hlt`/fault-chain are CPU instructions | COM1-exclusive exception context; never returns so the pushed `#PF` error code needs no pop (`add rsp,8` owed only if a future handler returns) | `PF ok=1` then `EXC ok=1` chained e2e |
 | D5 | `bring_up_cpu_and_prove_exception` guest (560): `load_gdt/load_idt` + volatile probe read (566) + `hlt` (573) | Crosses to the exception world; touches unmapped guard | Post-EBS, `cli`, COM1 ready; probe = `PF_PROBE_ADDR` canonical guard | `PF`+`EXC` e2e |
 | D6 | `bring_up_cpu_and_prove_exception` host stub (584, `cfg(test)`) | Same signature without hardware | Spin-only; never touches hardware | Never invoked by tests |
-| D7 | guest `read_cr3` (609, `mov {}, cr3`) | Privileged register read (valid at CPL0) | x86-64 boot CPU | `PAGING` e2e |
-| D8 | guest `read_efer` (835, `rdmsr` on `EFER_MSR`) | `rdmsr` is privileged | CPL0 guest; `ECX` = `EFER_MSR`, NXE = bit 11 | `RMBZ nxen=1` e2e |
-| D9 | guest probes `probe_paging` (664), `probe_live_flags[_for]` (800/813), `probe_rmbz` (897) | Read `CR3`/`EFER` + deref firmware tables | Post-EBS boot thread; identity-map lookup via C3 | `PAGING`/`PERMAUDIT[x]`/`RMBZ` e2e |
+| D7 | kernel `cpu::read_cr3` (slice 6 @this-slice, was boot-uefi 609): `mov {}, cr3` | Privileged register read (valid at CPL0) | Post-EBS boot CPU, single-threaded boot path | `PAGING` e2e |
+| D8 | kernel `cpu::read_efer` (slice 6 @this-slice, was boot-uefi 835): `rdmsr` on `EFER_MSR` | `rdmsr` is privileged | CPL0 guest; `ECX` = `EFER_MSR`, NXE = bit 11 | `RMBZ nxen=1` e2e |
+| D9 | guest probes `probe_paging` (664), `probe_live_flags[_for]` (800/813), `probe_rmbz` (897) via `kernel::cpu::read_cr3/read_efer` (slice 6: reads moved to `cpu`, probes stay guest-side) | Read `CR3`/`EFER` + deref firmware tables | Post-EBS boot thread; identity-map lookup via C3 | `PAGING`/`PERMAUDIT[x]`/`RMBZ` e2e |
 | D10 | guest `panic` handler (1045, `hlt` 1046) + EBS-fail park (1028, `hlt`) | Must never return into firmware | Guest-only (`cfg(not(test))`) | Fail-loud e2e (missing lines = FAIL) |
 
 ## E. Test-only `unsafe` (host `#[cfg(test)]`, fake tables — sound by fixture)
@@ -91,11 +91,12 @@ the guest but with heap `Vec` fakes, so no firmware/hardware is touched.
   `VECTOR_DE` 0 / `VECTOR_PF` 14 / `EXCEPTION_VECTORS` 32,
   `PF_PROBE_ADDR` 0x500000000000, COM1 `0x3F8`/`+5`/`0x20`.
 
-Follow-ups (not this slice): CR3/EFER register reads (`read_cr3`,
-`read_efer`, guest probes D7/D9) move into `cpu`; boot-uefi UART unify with
+Follow-ups (not this slice): boot-uefi UART unify with
 `kernel::uart` (pre-EBS `uart_init` stays guest-side); per-site invariant
 docs beyond this table. Done: port-I/O safe wrappers (slice 2), CPU
 gate/probe safe wrappers `gate_for` / `probe_addr_valid` (slice 3),
 selector-pin enforcement + agreement test (slice 4), single-source probe
 guard + pure CR3/EFER decode wrappers `cr3_pml4_base` / `efer_nxe_enabled`
-(slice 5, host-only — live reads stay D7/D8).
+(slice 5, host-only — live reads stay D7/D8), live register reads
+`read_cr3` / `read_efer` moved into `cpu` (slice 6, this slice — probes
+call `kernel::cpu::read_*`; UART unify next).

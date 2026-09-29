@@ -3319,3 +3319,41 @@ Format per entry (per `implementation-guide.md` §31):
   R3 still owed (agent-b independent QEMU re-run before S05 close). #8
   stays active: next is register-read move (`read_cr3`/`read_efer` into
   `cpu`) + boot-uefi UART unify.
+
+## S05 slice 6 — register-read move (`read_cr3`/`read_efer` into `cpu`)
+
+- **Decision:** Move the two live privileged reads beside their decode
+  wrappers: new `pub unsafe fn cpu::read_cr3` (`mov {}, cr3`) and
+  `pub unsafe fn cpu::read_efer` (`rdmsr` on `page_table::EFER_MSR`),
+  ex-boot-uefi D7/D8; `boot-uefi` deletes its local copies and imports
+  `baseos_kernel::cpu::{read_cr3, read_efer}` for `probe_paging` /
+  `probe_live_flags_for` / `probe_rmbz` (probes stay guest-side); new host
+  test pins both as `unsafe fn` type (callers need an `unsafe` block, never
+  called on host). Inventory D7/D8/D9 rows re-baselined to the new path.
+  UART unify explicitly deferred to the next slice.
+- **Why:** Inventory follow-up named this as the next boundary growth after
+  the slice-5 decode wrappers: one module now owns each read + decode pair
+  (`read_cr3`+`cr3_pml4_base`, `read_efer`+`efer_nxe_enabled`), so the guest
+  probes cannot drift from the host-tested rules. Smallest guest-touching
+  segment: no probe logic changed, only the call path.
+- **Alternatives:** Move UART unify in the same commit (rejected: doubles
+  single-cycle risk — port-I/O unify rewires every serial line, deserves its
+  own QEMU re-proof); keep reads guest-side with agreement tests (rejected:
+  agreement detects drift but does not prevent it — the #242 lesson).
+- **Expected:** default 104 (21+73+4+4+2, +1 new unsafe-shape pin),
+  boot-uefi 17/17, fmt clean, all three clippy gates clean,
+  `boot-uefi.ps1` PASS with guest behavior identical.
+- **Measured (2026-09-29, Win11, rustc 1.98.0):** default 104/104
+  (21+73+4+4+2 — kernel 73/73 incl. 1 new:
+  `live_register_reads_are_unsafe_fn`), `-p baseos-boot-uefi` 17/17,
+  `cargo fmt --check` clean, `cargo clippy --all-targets -D warnings`
+  clean (host), `cargo clippy -p baseos-boot-uefi --tests -D warnings`
+  clean, `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 937
+  bytes (PF ok=1 vector=14 + EXC ok=1), guest `bootx64.efi` 85504 bytes
+  (byte-identical to slice 5 — move is zero-cost codegen).
+- **Final:** D7/D8 moved; read + decode pairs co-located in `cpu`.
+  REVIEW #244 (agent-b slice-5 ACCEPT + R3 independent PASS) closes the
+  slice-5 R3 debt. #8 stays active: next is boot-uefi UART unify
+  (`com1_write_byte` via `kernel::uart`, pre-EBS `uart_init` stays
+  guest-side).

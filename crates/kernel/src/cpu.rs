@@ -10,6 +10,9 @@
 //! low-half, 4 KiB-aligned, above firmware-mapped RAM) without touching
 //! hardware. Slice 5 adds [`cr3_pml4_base`] / [`efer_nxe_enabled`] pure
 //! decode wrappers over `page_table` so probe code shares one rule.
+//! Slice 6 moves the live register reads ([`read_cr3`] / [`read_efer`],
+//! ex-boot-uefi D7/D8) beside the decode wrappers so one module owns the
+//! read + decode pair; `boot-uefi` probes call them via `crate::cpu::read_*`.
 //! Caller contract for the unsafe loads (documented, not
 //! compiler-enforced): post-`ExitBootServices` boot CPU, `cli` in effect,
 //! statics outlive use.
@@ -146,8 +149,8 @@ pub(crate) const fn probe_addr_valid(addr: u64) -> bool {
 /// Safe pure wrapper over [`crate::page_table::cr3_decode`] so guest probe
 /// code (`probe_paging`, `probe_live_flags_for`, `probe_rmbz` in
 /// `boot-uefi`) and host tests share one decode rule beside the other
-/// `cpu` wrappers. No hardware touched; the live `read_cr3` (`mov {}, cr3`)
-/// stays guest-side in `boot-uefi` (D7) until the register-read move slice.
+/// `cpu` wrappers. No hardware touched; the live [`read_cr3`] (`mov {}, cr3`)
+/// lives beside it in this module (S05 slice 6 register-read move).
 /// Guest intentionally does not call this yet (wiring rides with the
 /// register-read move); the host tests are the gate, so `dead_code` in
 /// guest builds is expected.
@@ -161,14 +164,55 @@ pub(crate) const fn cr3_pml4_base(cr3: u64) -> u64 {
 ///
 /// Safe pure wrapper over [`crate::page_table::efer_nxe_enabled`] (bit 11)
 /// so the `RMBZ nxen=` verdict and host tests share one decode rule.
-/// No hardware touched; the live `read_efer` (`rdmsr` on `EFER_MSR`) stays
-/// guest-side in `boot-uefi` (D8) until the register-read move slice.
+/// No hardware touched; the live [`read_efer`] (`rdmsr` on `EFER_MSR`)
+/// lives beside it in this module (S05 slice 6 register-read move).
 /// Guest intentionally does not call this yet; the host tests are the gate,
 /// so `dead_code` in guest builds is expected.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) const fn efer_nxe_enabled(efer: u64) -> bool {
     super::page_table::efer_nxe_enabled(efer)
+}
+
+/// Read the live `CR3` (PML4 base + flags) on the boot CPU (S05 slice 6).
+///
+/// Moved from `boot-uefi` (D7) so the privileged register read lives
+/// behind the `cpu` boundary with the decode rule ([`cr3_pml4_base`]).
+/// Pure register read; valid on x86-64 at CPL0 (the guest runs with
+/// privilege post-`ExitBootServices`).
+///
+/// # Safety
+/// Boot CPU only, post-`ExitBootServices` on the single-threaded
+/// boot/exception path. Host `cargo test` never calls this (would fault
+/// outside the guest); host coverage is the `unsafe fn` shape pin below.
+pub unsafe fn read_cr3() -> u64 {
+    let value: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags));
+    value
+}
+
+/// Read the live `EFER` (Extended Feature Enable Register) on the boot CPU
+/// (S05 slice 6).
+///
+/// Moved from `boot-uefi` (D8) so the `rdmsr` read lives behind the `cpu`
+/// boundary with the decode rule ([`efer_nxe_enabled`]). Bit 11 (`NXE`)
+/// gates whether `NO_EXEC`/bit 63 in a PTE is legal or MBZ (#139 note 1).
+///
+/// # Safety
+/// Same contract as [`read_cr3`]: CPL0 guest, boot thread post-`EBS`;
+/// `ECX` is pinned to [`crate::page_table::EFER_MSR`]. Host tests never
+/// call this; host coverage is the `unsafe fn` shape pin below.
+pub unsafe fn read_efer() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    core::arch::asm!(
+        "rdmsr",
+        in("ecx") super::page_table::EFER_MSR,
+        out("eax") lo,
+        out("edx") hi,
+        options(nomem, nostack, preserves_flags),
+    );
+    (u64::from(hi) << 32) | u64::from(lo)
 }
 
 // Forward-declared asm stubs (defined in `global_asm!` in the parent).
@@ -300,5 +344,17 @@ mod tests {
         let nxe: fn(u64) -> bool = efer_nxe_enabled;
         let probe: fn(u64) -> bool = probe_addr_valid;
         let _ = (cr3_base, nxe, probe);
+    }
+
+    #[test]
+    fn live_register_reads_are_unsafe_fn() {
+        // S05 slice 6: the moved `read_cr3` / `read_efer` must stay
+        // `unsafe fn` (privileged `mov {}, cr3` / `rdmsr`) — bind to the
+        // `unsafe fn` type to prove callers need an `unsafe` block. A
+        // safe-ified signature would fail to coerce here. Never called
+        // (would fault outside the guest).
+        let cr3: unsafe fn() -> u64 = read_cr3;
+        let efer: unsafe fn() -> u64 = read_efer;
+        let _ = (cr3, efer);
     }
 }

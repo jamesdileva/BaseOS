@@ -33,11 +33,12 @@
 #![allow(unsafe_code)]
 
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
+use baseos_kernel::cpu::{read_cr3, read_efer};
 use baseos_kernel::kernel_entry;
 use baseos_kernel::page_table::{
     cr3_decode, efer_nxe_enabled, guard_selftest, perm_selftest, rmbz_audit_ok,
     rmbz_count_violations, table_base_in_boot_map, walk_full, walk_full_leaf_flags,
-    walk_full_leaf_raw, EFER_MSR,
+    walk_full_leaf_raw,
 };
 use baseos_serial_marker::write_marker;
 #[cfg(not(test))]
@@ -602,16 +603,6 @@ fn write_ebs_line(ok: bool, status: usize) {
     let _ = write_str(&mut emit, "\n");
 }
 
-/// Read the live `CR3` (PML4 base + flags) on the boot CPU.
-///
-/// # Safety
-/// Pure register read; valid on x86-64 at any privilege level.
-unsafe fn read_cr3() -> u64 {
-    let value: u64;
-    asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags));
-    value
-}
-
 /// Map a physical table base to the next `&[u64; 512]` via the OVMF
 /// identity map (firmware identity-maps RAM, so phys == virt here).
 ///
@@ -824,25 +815,6 @@ unsafe fn probe_live_flags_for(info: &BootInfo, probe_virt: u64) -> (bool, u64, 
         ),
         Err(_) => (false, STRUCTURAL_FAIL as u64, false, false, false),
     }
-}
-
-/// Read the live `EFER` (Extended Feature Enable Register) on the boot CPU.
-///
-/// # Safety
-/// Pure register read via `rdmsr` (`EFER_MSR`); valid on x86-64 at CPL0
-/// (the UEFI guest runs with privilege). Bit 11 (`NXE`) gates whether
-/// `NO_EXEC`/bit 63 in a PTE is legal or MBZ (#139 note 1).
-unsafe fn read_efer() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    asm!(
-        "rdmsr",
-        in("ecx") EFER_MSR,
-        out("eax") lo,
-        out("edx") hi,
-        options(nomem, nostack, preserves_flags),
-    );
-    (u64::from(hi) << 32) | u64::from(lo)
 }
 
 /// Emit the one-line `RMBZ` diagnostic after the `PERMAUDIT2` line:
