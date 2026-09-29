@@ -3003,3 +3003,41 @@ Format per entry (per `implementation-guide.md` §31):
   with size-stable proof; no code impact. Open: #168n4 live #PF (sole
   functional open). #6 ready for agent-b re-verify / done on
   concurrence.
+
+## S04 #168n5 -- IDT14 gate + PF stub wired, untriggered (2026-09-29)
+
+- **Decision:** Wire `#PF` (vector 14) alongside `#DE` without triggering
+  it: new `exception_handler_pf_rust(vector, code, cr2)` emitting
+  `PF ok=1 vector=14 code=0x... addr=0x...` on COM1 then parking, new
+  `pf_isr_stub_asm!` (error code from `[RSP]` with no pop, `CR2` to `R8`,
+  vector 14 to `RCX`, Win64 align + shadow space), `load_idt` populates
+  both gates, two host tests (stub ABI pins + gate encoding round-trip).
+  `bring_up_cpu_and_prove_exception` still proves `#DE`, so e2e asserts
+  are untouched.
+- **Why:** Sole open #168n4 is the live `#PF` guest line (IDT14 + `CR2` +
+  serial). The smallest safe segment is wire-but-don't-fire: proves the
+  gate/stub/ABI contract host-side plus a QEMU no-regression boot, while
+  the trigger + e2e assert rides with the next slice (a mis-wired live
+  fault triple-faults, so it must not share a commit with anything else).
+- **Alternatives:** Trigger a live `#PF` in the same commit (rejected:
+  doubles single-cycle risk — Touch unmapped/non-canonical fault address
+  selection plus handler proof in one cycle; wire-first keeps this commit
+  behavior-identical); host-only without guest wiring (rejected: the gate
+  registration itself is the untested part, and QEMU proves it costs
+  nothing).
+- **Expected:** default `cargo test` 94 (2 new kernel), kernel 63/63,
+  boot-uefi 16/16, fmt + clippy host/uefi clean, `boot-uefi.ps1` PASS
+  with `EXC ok=1 vector=0` and no `PF` line, guest grows (~+1.5 KiB stub
+  + handler + line writers).
+- **Measured (2026-09-29, Win11, rustc 1.98.0):** default 94/94
+  (21+63+4+4+2), `-p baseos-boot-uefi` 16/16, `fmt --check` clean,
+  `clippy --all-targets -D warnings` clean (host) and
+  `clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -D warnings`
+  clean; `boot-uefi.ps1` UEFI BOOT PASS, serial 894 bytes, guest
+  `bootx64.efi` 86016 bytes (+1536 vs 84480: PF stub + handler + hex/dec
+  writers + second IDT gate), tail `RMBZ ok=1 viol=0` + `EXC ok=1
+  vector=0` (no PF line, as designed — `#PF` never fires this slice).
+- **Final:** `#PF` gate + stub + serial contract wired and proven
+  no-regression; trigger + `PF ok=1 ... addr=...` e2e assert is the next
+  (final) #168 slice. #6 stays active pending live-injection proof and
+  b-side double-rebuild + gates + boot verify.

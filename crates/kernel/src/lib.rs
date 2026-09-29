@@ -215,9 +215,10 @@ impl IdtEntry {
     }
 }
 
-/// IDT covering the 32 exception vectors; only `#DE` is wired this slice
-/// (others stay [`IdtEntry::missing`] and would `#GP` if hit — with `cli`
-/// and single-threaded bring-up only `#DE` is expected).
+/// IDT covering the 32 exception vectors; `#DE` + `#PF` are wired this
+/// slice (others stay [`IdtEntry::missing`] and would `#GP` if hit — with
+/// `cli` and single-threaded bring-up only `#DE` is expected; `#PF` is
+/// wired-but-untriggered until the live-injection slice).
 /// Guest-only IDT storage; host tests exercise [`IdtEntry`] encoding
 /// without instantiating the full table.
 #[cfg(not(test))]
@@ -324,6 +325,100 @@ extern "C" fn exception_handler_rust(vector: u64) -> ! {
     }
 }
 
+/// Rust body of the `#PF` stub: prove the fault was *caught* (serial
+/// line) then park — a controlled failure, not a triple-fault reset.
+///
+/// Never returns; `vector` is 14, `code` is the raw CPU-pushed error code
+/// ([`PfError`] decodes bits 0-4), `cr2` is the faulting address. Live
+/// `#PF` injection (sole open #168n4) triggers this vector in a later
+/// slice; this slice only wires the gate + stub so QEMU behavior is
+/// unchanged (`#DE` still the proven exception).
+#[no_mangle]
+pub extern "C" fn exception_handler_pf_rust(vector: u64, code: u64, cr2: u64) -> ! {
+    // SAFETY: same COM1-exclusive contract as `exception_handler_rust`.
+    unsafe {
+        write_pf_line(true, vector, code, cr2);
+        loop {
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// Emit `PF ok=<0|1> vector=<n> code=<0x...> addr=<0x...>\n` directly on
+/// COM1 (interrupt context cannot use the caller-supplied sink).
+///
+/// # Safety
+/// Requires COM1 initialized; single-threaded exception context owns the
+/// UART exclusively.
+unsafe fn write_pf_line(ok: bool, vector: u64, code: u64, cr2: u64) {
+    for b in b"PF ok=" {
+        com1_write_byte(*b);
+    }
+    com1_write_byte(if ok { b'1' } else { b'0' });
+    for b in b" vector=" {
+        com1_write_byte(*b);
+    }
+    write_dec_u64(vector);
+    for b in b" code=" {
+        com1_write_byte(*b);
+    }
+    write_hex_u64(code);
+    for b in b" addr=" {
+        com1_write_byte(*b);
+    }
+    write_hex_u64(cr2);
+    com1_write_byte(b'\n');
+}
+
+/// Decimal writer for the COM1 interrupt path (no `core::fmt`, no
+/// allocation; mirrors `write_exc_line`).
+///
+/// # Safety
+/// COM1 initialized; exception context only.
+unsafe fn write_dec_u64(mut v: u64) {
+    let mut buf = [0u8; 20];
+    let mut n = 0;
+    if v == 0 {
+        com1_write_byte(b'0');
+        return;
+    }
+    while v > 0 {
+        buf[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    for i in (0..n).rev() {
+        com1_write_byte(buf[i]);
+    }
+}
+
+/// Hex writer for the COM1 interrupt path (`0x` + lowercase digits).
+///
+/// # Safety
+/// COM1 initialized; exception context only.
+unsafe fn write_hex_u64(v: u64) {
+    for b in b"0x" {
+        com1_write_byte(*b);
+    }
+    let mut started = false;
+    let mut i = 15;
+    loop {
+        let digit = ((v >> (i * 4)) & 0xF) as u8;
+        if digit != 0 || started || i == 0 {
+            started = true;
+            com1_write_byte(if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + digit - 10
+            });
+        }
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+}
+
 /// Shared `#DE` ISR stub source (AT&T). `x86_64-unknown-uefi` uses the
 /// Microsoft x64 ABI: the first `extern "C"` argument is in `RCX` (not
 /// `RDI`), the call site must reserve 32 bytes of shadow space, and `RSP`
@@ -342,10 +437,34 @@ macro_rules! de_isr_stub_asm {
     };
 }
 
+/// Shared `#PF` ISR stub source. `#PF` pushes a 64-bit error code, so the
+/// fault frame on entry is `[error code][RIP][CS][RFLAGS...]` — the stub
+/// must NOT `pop` before the call (the handler parks, `iret` never runs).
+/// Microsoft x64 ABI: `RCX` = vector (14), `RDX` = error code (from
+/// `[RSP]`), `R8` = `CR2` (faulting address), 32-byte shadow space, `RSP`
+/// 16-byte aligned before `call`. Host tests assert these instructions.
+macro_rules! pf_isr_stub_asm {
+    () => {
+        r#"
+    .global baseos_isr_pf
+    baseos_isr_pf:
+        mov rdx, [rsp]
+        mov rax, cr2
+        mov r8, rax
+        mov ecx, 14
+        and rsp, -16
+        sub rsp, 32
+        call exception_handler_pf_rust
+    "#
+    };
+}
+
 // Guest-only asm: never linked into host `cargo test` builds (the host
 // harness links std and must not emit `lidt`/`lgdt`/`div` traps).
 #[cfg(not(test))]
 core::arch::global_asm!(de_isr_stub_asm!());
+#[cfg(not(test))]
+core::arch::global_asm!(pf_isr_stub_asm!());
 
 /// Load the S02 GDT and reload visible segment registers + CS.
 ///
@@ -380,19 +499,23 @@ unsafe fn load_gdt() {
     );
 }
 
-/// Populate `#DE` (vector 0) and `lidt` the exception table.
+/// Populate `#DE` (vector 0) + `#PF` (vector 14) and `lidt` the table.
 ///
 /// # Safety
 /// Same guest-only contract as [`load_gdt`]: `IDT` static must outlive the
-/// CPU, gate targets [`baseos_isr_div0`] (code segment
+/// CPU, gates target [`baseos_isr_div0`] / [`baseos_isr_pf`] (code segment
 /// [`KERNEL_CODE_SEL`]), and `cli` is already in effect so unhandled
 /// vectors cannot fire this slice. Host builds are a no-op; e2e proves the
-/// gate by catching the intentional `#DE`.
+/// `#DE` gate by catching the intentional `#DE` (`#PF` wired but never
+/// triggered this slice, so QEMU behavior is unchanged).
 #[cfg(not(test))]
 unsafe fn load_idt() {
-    let handler = baseos_isr_div0 as *const () as u64;
-    let entry = IdtEntry::from_handler(handler, KERNEL_CODE_SEL);
-    (*core::ptr::addr_of_mut!(IDT)).entries[VECTOR_DE] = entry;
+    let de_handler = baseos_isr_div0 as *const () as u64;
+    (*core::ptr::addr_of_mut!(IDT)).entries[VECTOR_DE] =
+        IdtEntry::from_handler(de_handler, KERNEL_CODE_SEL);
+    let pf_handler = baseos_isr_pf as *const () as u64;
+    (*core::ptr::addr_of_mut!(IDT)).entries[VECTOR_PF] =
+        IdtEntry::from_handler(pf_handler, KERNEL_CODE_SEL);
     let ptr = DescriptorTablePointer {
         limit: (core::mem::size_of::<Idt>() - 1) as u16,
         base: core::ptr::addr_of!(IDT) as u64,
@@ -400,10 +523,11 @@ unsafe fn load_idt() {
     core::arch::asm!("lidt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags));
 }
 
-// Forward-declared asm stub (defined in `global_asm!` above).
+// Forward-declared asm stubs (defined in `global_asm!` above).
 #[cfg(not(test))]
 extern "C" {
     fn baseos_isr_div0();
+    fn baseos_isr_pf();
 }
 
 /// Guest-only CPU bring-up + controlled `#DE` proof: load GDT, load IDT,
@@ -577,6 +701,63 @@ mod tests {
             !stub.contains("rdi"),
             "RDI is not the Win64 argument register: {stub}"
         );
+    }
+
+    #[test]
+    fn pf_isr_stub_passes_vector_code_cr2_per_win64_abi() {
+        // `#PF` pushes an error code: the stub reads it from `[RSP]`
+        // (no pop — the handler parks), loads `CR2` into the third arg
+        // (`R8`), the vector into `RCX`, then the standard Win64
+        // align + shadow-space + call sequence.
+        let stub = pf_isr_stub_asm!();
+        assert!(
+            stub.contains("mov rdx, [rsp]"),
+            "error code must come from [RSP] without popping: {stub}"
+        );
+        assert!(
+            stub.contains("mov rax, cr2"),
+            "fault address must be read from CR2: {stub}"
+        );
+        assert!(
+            stub.contains("mov r8, rax"),
+            "CR2 must reach the third Win64 arg (R8): {stub}"
+        );
+        assert!(
+            stub.contains("mov ecx, 14"),
+            "vector 14 must be in RCX (Win64 first arg): {stub}"
+        );
+        assert!(
+            stub.contains("and rsp, -16"),
+            "RSP must be 16-byte aligned before call: {stub}"
+        );
+        assert!(
+            stub.contains("sub rsp, 32"),
+            "32-byte shadow space required by Win64 ABI: {stub}"
+        );
+        assert!(
+            stub.contains("call exception_handler_pf_rust"),
+            "stub must transfer to the PF Rust body: {stub}"
+        );
+        assert_eq!(VECTOR_PF, 14);
+    }
+
+    #[test]
+    fn idt_pf_gate_round_trips_handler_address() {
+        // Same encoding contract as the `#DE` gate, for vector 14: split
+        // offset fields reassemble, present interrupt gate, kernel code
+        // selector. Guest `load_idt` wires both gates; `#PF` stays
+        // untriggered this slice so e2e still proves `#DE` only.
+        let handler = 0x0000_0000_CAFE_F00D_u64;
+        let e = IdtEntry::from_handler(handler, KERNEL_CODE_SEL);
+        assert_eq!(e.handler_offset(), handler);
+        let type_attr = e.type_attr;
+        let selector = e.selector;
+        let ist = e.ist;
+        let reserved = e.reserved;
+        assert_eq!(type_attr, 0x8E, "present interrupt gate DPL0");
+        assert_eq!(selector, KERNEL_CODE_SEL);
+        assert_eq!(ist, 0);
+        assert_eq!(reserved, 0);
     }
 
     #[test]
