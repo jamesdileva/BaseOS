@@ -89,12 +89,15 @@ const EXCEPTION_VECTORS: usize = 32;
 /// `#PF` error-code decode (Intel SDM Vol 3 Fig 6-8: P/W-U-RSV-I bits 0-4).
 /// Pure `core`-only helper so the future guest `#PF` stub and host tests
 /// share one contract; guest wiring (IDT gate 14 + `CR2` read + serial line)
-/// rides with the live-injection slice.
+/// rides with the live-injection slice. Upper CPU bits (PK/SGX/HLAT, ...)
+/// are intentionally NOT decoded this slice — `bits()` preserves the full
+/// u64 so nothing is lost; accessors cover only bits 0-4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PfError(u64);
 
 impl PfError {
-    /// Rebuild from the CPU-pushed error code (low 5 bits defined).
+    /// Rebuild from the CPU-pushed error code (low 5 bits decoded;
+    /// full u64 retained via [`PfError::bits`] for future PK/SGX/HLAT).
     #[must_use]
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
@@ -601,5 +604,20 @@ mod tests {
         assert!(rsvd_instr.is_reserved());
         assert!(rsvd_instr.is_instr_fetch());
         assert_eq!(PfError::from_bits(0b10110).bits(), 0b10110);
+        // Upper bits preserved raw but ignored by the bit 0-4 accessors
+        // (REVIEW #225 gap 2: intentionally truncated this slice).
+        let upper = PfError::from_bits(u64::MAX);
+        assert_eq!(upper.bits(), u64::MAX);
+        assert!(upper.is_present());
+        assert!(upper.is_write());
+        assert!(upper.is_user());
+        assert!(upper.is_reserved());
+        assert!(upper.is_instr_fetch());
+        let upper_only = PfError::from_bits(!0x1F);
+        assert!(!upper_only.is_present());
+        assert!(!upper_only.is_write());
+        assert!(!upper_only.is_user());
+        assert!(!upper_only.is_reserved());
+        assert!(!upper_only.is_instr_fetch());
     }
 }
