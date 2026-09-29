@@ -3,13 +3,12 @@
 Review before each work segment. Keep ≤20 lines, compact.
 
 - Goal: perf-first x86-64 UEFI desktop OS, Rust-first; docs in repo root.
-- Now: S04 s36 correction-2 @e8570f9 (worklog-only on @a71e6a7).
-  Clean 2x rebuild 84480B 23AF9FA3 vs 3BCE0EA1 (+E9E80769 incr,
-  388BA13B commit) = hash-unstable/size-stable, PE timestamp.
-  rustc 1.98.0 88d9e12ae LLVM22.1.8. Gates: 91/91 + 16/16 + 41/41
-  + fmt/clippy -D clean + QEMU 890B viol=0. #7 done, #6 active,
-  sole open #168n4 live #PF. REVIEW #219 holds #6 active pending
-  b-side verify -- concur.
+- Now: S05 slice4 DONE (R1+R2 closed: from_handler private to cpu.rs,
+  gate_for only present-gate path; probe/guard agreement test; default
+  100/100 (21+69+4+4+2), boot-uefi 17/17, fmt/clippy clean, QEMU 937B
+  PF+EXC ok=1 guest 85504B identical to slice3). #6/#7 done, #8 active.
+  Next: CR3/EFER safe wrappers + boot-uefi UART unify. R3 (independent
+  reviewer QEMU re-run) still owed by agent-b before S05 close.
 - FRAMEALLOC delta ATTRIBUTED (agent-b #75 f2): 53248B=13p/free=52877
   @7a1ce76 → 53760B=14p/free=52876 — slice6 +512B crossed page boundary;
   2 stable reruns, spans=8 faults=3 unchanged. Not a regression.

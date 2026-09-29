@@ -3241,3 +3241,43 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Kernel CPU/table unsafe is concentrated in `cpu.rs` with safe
   gate/probe wrappers beside it. #8 stays active: next is CR3/EFER safe
   wrappers + boot-uefi UART unify.
+
+## S05 slice 4 — enforce gate selector pin + probe/guard agreement (REVIEW #240 R1+R2)
+
+- **Decision:** Close REVIEW #240 R1+R2 as one host-test-only slice:
+  (a) R1 — `IdtEntry::from_handler` is now private to `cpu.rs`, so
+  `cpu::gate_for` (pins `KERNEL_CODE_SEL`) is the only in-crate path to a
+  present gate (compiler-enforced, not convention); `lib.rs`
+  `idt_de/pf_gate_round_trips` tests now build via `gate_for`;
+  (b) R2 — new `probe_addr_valid_agrees_with_pf_probe_guard` test ties
+  `cpu::probe_addr_valid` to the raw `#PF` guard contract on one table
+  (probe, probe+0x1000 true; probe+1, hole, firmware RAM, null false) plus
+  the raw canonical/aligned/floor predicate, so the two cannot drift;
+  (c) inventory D2 notes the enforcement. R3 (independent reviewer QEMU
+  re-run) stays owed by agent-b; builder re-ran QEMU on this tree.
+- **Why:** R1 left the selector pin bypassable (`lib.rs:397,497` called
+  `from_handler` directly); R2 left `probe_addr_valid` duplicating the
+  `pf_probe` guard with no agreement test — both cheap to lock before the
+  CR3/EFER + UART-unify slice grows the boundary.
+- **Alternatives:** `debug_assert!(selector == KERNEL_CODE_SEL)` in
+  `load_idt` instead of privatizing (rejected: runtime-only, guest-only,
+  never fires on host tests — privacy is checked at compile time on every
+  build); change `probe_addr_valid` to call the guard predicate (rejected:
+  the guard lives as inline asserts, not a shared fn — the agreement test
+  is the cheapest lock without refactoring).
+- **Expected:** default 100 (21+69+4+4+2), boot-uefi 17/17, fmt/clippy clean
+  both targets, `boot-uefi.ps1` PASS with guest size stable (host-only
+  change — visibility + tests, no codegen).
+- **Measured (2026-09-29, Win11, rustc 1.98.0):** default 100/100
+  (21+69+4+4+2 — kernel 69/69 incl. the new agreement test),
+  `-p baseos-boot-uefi` 17/17, `cargo fmt --check` clean (no fix needed),
+  `cargo clippy --all-targets -D warnings` clean (host) and
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 937
+  bytes (marker FOUND, BOOTINFO/MEMMAP/FB/GOP/EBS/KERNEL/FRAMEALLOC/PAGING/
+  PERM/GUARD/PERMAUDIT[x2]/RMBZ ok, `PF ok=1 vector=14` + `EXC ok=1
+  vector=0`), guest `bootx64.efi` 85504 bytes (identical to slice 3 —
+  host-only confirmed).
+- **Final:** R1+R2 closed on this tree; R3 still owed (agent-b independent
+  QEMU re-run before S05 close). #8 stays active: next is CR3/EFER safe
+  wrappers + boot-uefi UART unify.

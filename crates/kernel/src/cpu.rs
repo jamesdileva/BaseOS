@@ -69,7 +69,11 @@ impl IdtEntry {
 
     /// Interrupt gate (type `0xE`, DPL 0, present) targeting `handler`
     /// with code selector `selector` (IST 0 — same stack this slice).
-    pub(crate) const fn from_handler(handler: u64, selector: u16) -> Self {
+    /// Private to this module so [`gate_for`] is the only in-crate path to
+    /// a present gate (REVIEW #240 R1: the `KERNEL_CODE_SEL` pin is
+    /// compiler-enforced, not convention — `lib.rs` tests reach encoding
+    /// via `gate_for`).
+    const fn from_handler(handler: u64, selector: u16) -> Self {
         Self {
             offset_low: handler as u16,
             selector,

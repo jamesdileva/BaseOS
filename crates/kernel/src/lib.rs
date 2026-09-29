@@ -392,9 +392,11 @@ mod tests {
     fn idt_de_gate_round_trips_handler_address() {
         // Encoding the guest `lidt` consumes: split offset fields must
         // reassemble to the stub address; type_attr is a present interrupt
-        // gate; selector is the kernel code segment.
+        // gate; selector is the kernel code segment. Built via `cpu::gate_for`
+        // (REVIEW #240 R1: `IdtEntry::from_handler` is private to `cpu`, so
+        // the selector pin cannot be bypassed in-crate).
         let handler = 0x0000_0000_DEAD_BEEF_u64;
-        let e = IdtEntry::from_handler(handler, KERNEL_CODE_SEL);
+        let e = cpu::gate_for(handler);
         assert_eq!(e.handler_offset(), handler);
         // Copy packed fields to locals before assert_eq! (E0793: no refs
         // into #[repr(packed)] storage).
@@ -492,9 +494,10 @@ mod tests {
         // Same encoding contract as the `#DE` gate, for vector 14: split
         // offset fields reassemble, present interrupt gate, kernel code
         // selector. Guest `load_idt` wires both gates; e2e proves `#PF`
-        // live (probe touch) chained into `#DE`.
+        // live (probe touch) chained into `#DE`. Via `cpu::gate_for`
+        // (REVIEW #240 R1: `from_handler` is private, pin enforced).
         let handler = 0x0000_0000_CAFE_F00D_u64;
-        let e = IdtEntry::from_handler(handler, KERNEL_CODE_SEL);
+        let e = cpu::gate_for(handler);
         assert_eq!(e.handler_offset(), handler);
         let type_attr = e.type_attr;
         let selector = e.selector;
@@ -566,6 +569,32 @@ mod tests {
             probe > 0x1_0000_0000,
             "probe must sit above any firmware-mapped RAM"
         );
+    }
+
+    #[test]
+    fn probe_addr_valid_agrees_with_pf_probe_guard() {
+        // REVIEW #240 R2: `cpu::probe_addr_valid` must agree with the raw
+        // `#PF` probe-guard contract on the probe + neighbors, so the two
+        // cannot silently drift (one table, one verdict each).
+        for (addr, expected) in [
+            (PF_PROBE_ADDR, true),
+            (PF_PROBE_ADDR + 0x1000, true),
+            (PF_PROBE_ADDR + 1, false),
+            (0x0000_8000_0000_0000_u64, false),
+            (0x8000_0000_u64, false),
+            (0_u64, false),
+        ] {
+            assert_eq!(
+                cpu::probe_addr_valid(addr),
+                expected,
+                "probe_addr_valid({addr:#x})"
+            );
+        }
+        // And the probe itself satisfies the raw guard predicate.
+        let probe = core::hint::black_box(PF_PROBE_ADDR);
+        assert_eq!(probe & 0xFFF, 0);
+        assert!(probe < 0x0000_8000_0000_0000);
+        assert!(probe > 0x1_0000_0000);
     }
 
     #[test]
