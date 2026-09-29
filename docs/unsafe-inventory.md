@@ -68,7 +68,7 @@ rides with the slice that closes S05. Slice 3 moved D1/D2 (+ tables) from
 | D6 | `bring_up_cpu_and_prove_exception` host stub (584, `cfg(test)`) | Same signature without hardware | Spin-only; never touches hardware | Never invoked by tests |
 | D7 | kernel `cpu::read_cr3` (slice 6 @this-slice, was boot-uefi 609): `mov {}, cr3` | Privileged register read (valid at CPL0) | Post-EBS boot CPU, single-threaded boot path | `PAGING` e2e |
 | D8 | kernel `cpu::read_efer` (slice 6 @this-slice, was boot-uefi 835): `rdmsr` on `EFER_MSR` | `rdmsr` is privileged | CPL0 guest; `ECX` = `EFER_MSR`, NXE = bit 11 | `RMBZ nxen=1` e2e |
-| D9 | guest probes `probe_paging` (664), `probe_live_flags[_for]` (800/813), `probe_rmbz` (897) via `kernel::cpu::read_cr3/read_efer` (slice 6: reads moved to `cpu`, probes stay guest-side) | Read `CR3`/`EFER` + deref firmware tables | Post-EBS boot thread; identity-map lookup via C3 | `PAGING`/`PERMAUDIT[x]`/`RMBZ` e2e |
+| D9 | guest probes `probe_paging`, `probe_live_flags[_for]`, `probe_rmbz` via `kernel::cpu::read_cr3/read_efer` for reads + `kernel::cpu::cr3_pml4_base/efer_nxe_enabled` for decode (slice 7: read+decode co-located, call-site pairing unified) | Read `CR3`/`EFER` + deref firmware tables | Post-EBS boot thread; identity-map lookup via C3 | `PAGING`/`PERMAUDIT[x]`/`RMBZ` e2e |
 | D10 | guest `panic` handler (1045, `hlt` 1046) + EBS-fail park (1028, `hlt`) | Must never return into firmware | Guest-only (`cfg(not(test))`) | Fail-loud e2e (missing lines = FAIL) |
 
 ## E. Test-only `unsafe` (host `#[cfg(test)]`, fake tables — sound by fixture)
@@ -98,5 +98,7 @@ gate/probe safe wrappers `gate_for` / `probe_addr_valid` (slice 3),
 selector-pin enforcement + agreement test (slice 4), single-source probe
 guard + pure CR3/EFER decode wrappers `cr3_pml4_base` / `efer_nxe_enabled`
 (slice 5, host-only — live reads stay D7/D8), live register reads
-`read_cr3` / `read_efer` moved into `cpu` (slice 6, this slice — probes
-call `kernel::cpu::read_*`; UART unify next).
+`read_cr3` / `read_efer` moved into `cpu` (slice 6 — probes
+call `kernel::cpu::read_*`), read+decode call-site unification onto
+`cpu::cr3_pml4_base` / `cpu::efer_nxe_enabled` (slice 7, this slice —
+REVIEW #246 wiring gap closed; UART unify next).

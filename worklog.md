@@ -3357,3 +3357,35 @@ Format per entry (per `implementation-guide.md` §31):
   slice-5 R3 debt. #8 stays active: next is boot-uefi UART unify
   (`com1_write_byte` via `kernel::uart`, pre-EBS `uart_init` stays
   guest-side).
+
+## S05 slice 7 — read+decode call-site unification onto `cpu` (REVIEW #246 gap)
+
+- **Decision:** Close the REVIEW #246 non-blocking wiring gap: promote
+  `cpu::cr3_pml4_base` / `cpu::efer_nxe_enabled` from `pub(crate)` to `pub`
+  (`#[inline(always)]`, stale `dead_code` allows + "does not call yet"
+  comments removed) and rewire all four guest decode sites
+  (`probe_paging`, `probe_live_flags_for`, `probe_rmbz` x2) from
+  `page_table::cr3_decode` / `page_table::efer_nxe_enabled` to the `cpu`
+  wrappers; inventory D9 row drops drift-prone line numbers and records
+  read+decode unified via `cpu`.
+- **Why:** Slice 6 co-located read+decode in `cpu` but left the call-site
+  pairing split (reads via `cpu`, decodes via `page_table`), so the drift
+  the boundary exists to prevent was still possible. Smallest
+  guest-touching segment: no probe logic changed, only the decode path.
+- **Alternatives:** Record-and-keep direct `page_table` decode in the guest
+  (rejected: reviewer offered it as an option, but unification is three
+  identical substitutions plus a visibility bump — cheaper than the doc
+  justifying a split); fold UART unify into the same commit (rejected:
+  same single-cycle reason as slice 6).
+- **Expected:** default 104, boot-uefi 17/17, fmt + all three clippy gates
+  clean, `boot-uefi.ps1` PASS with unchanged serial lines.
+- **Measured (2026-09-29, Win11, rustc 1.98.0):** default 104/104
+  (21+73+4+4+2), `-p baseos-boot-uefi` 17/17, `cargo fmt --check` clean
+  (one auto-format on the lengthened `page_table` import), host + `--tests`
+  + UEFI-target clippy clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0,
+  serial 937 bytes (PF ok=1 vector=14 + EXC ok=1), guest `bootx64.efi`
+  86016 bytes (+512 vs 85504 slice-6 baseline — one PE file-alignment
+  increment from the extra wrapper layer despite `#[inline(always)]`;
+  serial output identical, no behavior change).
+- **Final:** Read+decode pairs now unified at both definition and call
+  sites; #246 gap closed. #8 stays active: next is boot-uefi UART unify.

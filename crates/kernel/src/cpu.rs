@@ -151,12 +151,11 @@ pub(crate) const fn probe_addr_valid(addr: u64) -> bool {
 /// `boot-uefi`) and host tests share one decode rule beside the other
 /// `cpu` wrappers. No hardware touched; the live [`read_cr3`] (`mov {}, cr3`)
 /// lives beside it in this module (S05 slice 6 register-read move).
-/// Guest intentionally does not call this yet (wiring rides with the
-/// register-read move); the host tests are the gate, so `dead_code` in
-/// guest builds is expected.
-#[allow(dead_code)]
+/// Guest calls this with the live `read_cr3()` value (slice 7 wiring);
+/// host tests pin agreement with `page_table`.
+#[inline(always)]
 #[must_use]
-pub(crate) const fn cr3_pml4_base(cr3: u64) -> u64 {
+pub const fn cr3_pml4_base(cr3: u64) -> u64 {
     super::page_table::cr3_decode(cr3)
 }
 
@@ -166,11 +165,11 @@ pub(crate) const fn cr3_pml4_base(cr3: u64) -> u64 {
 /// so the `RMBZ nxen=` verdict and host tests share one decode rule.
 /// No hardware touched; the live [`read_efer`] (`rdmsr` on `EFER_MSR`)
 /// lives beside it in this module (S05 slice 6 register-read move).
-/// Guest intentionally does not call this yet; the host tests are the gate,
-/// so `dead_code` in guest builds is expected.
-#[allow(dead_code)]
+/// Guest calls this with the live `read_efer()` value (slice 7 wiring);
+/// host tests pin agreement with `page_table`.
+#[inline(always)]
 #[must_use]
-pub(crate) const fn efer_nxe_enabled(efer: u64) -> bool {
+pub const fn efer_nxe_enabled(efer: u64) -> bool {
     super::page_table::efer_nxe_enabled(efer)
 }
 

@@ -33,12 +33,11 @@
 #![allow(unsafe_code)]
 
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
-use baseos_kernel::cpu::{read_cr3, read_efer};
+use baseos_kernel::cpu::{cr3_pml4_base, efer_nxe_enabled, read_cr3, read_efer};
 use baseos_kernel::kernel_entry;
 use baseos_kernel::page_table::{
-    cr3_decode, efer_nxe_enabled, guard_selftest, perm_selftest, rmbz_audit_ok,
-    rmbz_count_violations, table_base_in_boot_map, walk_full, walk_full_leaf_flags,
-    walk_full_leaf_raw,
+    guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
+    walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
 };
 use baseos_serial_marker::write_marker;
 #[cfg(not(test))]
@@ -655,7 +654,7 @@ fn write_paging_line<E>(
 unsafe fn probe_paging(info: &BootInfo) -> (bool, u64, u64) {
     let cr3 = read_cr3();
     let probe_virt = info.framebuffer_opt().map(|fb| fb.base).unwrap_or(0x1000);
-    let ok_phys = walk_full(cr3_decode(cr3), probe_virt, |base| {
+    let ok_phys = walk_full(cr3_pml4_base(cr3), probe_virt, |base| {
         phys_to_table_ptr(info, base)
     });
     match ok_phys {
@@ -803,7 +802,7 @@ unsafe fn probe_live_flags(info: &BootInfo) -> (bool, u64, bool, bool, bool) {
 /// [`phys_to_table_ptr`] (identity-mapped).
 unsafe fn probe_live_flags_for(info: &BootInfo, probe_virt: u64) -> (bool, u64, bool, bool, bool) {
     let cr3 = read_cr3();
-    match walk_full_leaf_flags(cr3_decode(cr3), probe_virt, |base| {
+    match walk_full_leaf_flags(cr3_pml4_base(cr3), probe_virt, |base| {
         phys_to_table_ptr(info, base)
     }) {
         Ok((phys, flags)) => (
@@ -871,7 +870,7 @@ unsafe fn probe_rmbz(info: &BootInfo) -> (bool, bool, usize, usize, usize) {
     let fb_probe = info.framebuffer_opt().map(|fb| fb.base).unwrap_or(0x1000);
     let probes: [u64; 2] = [fb_probe, 0x1000];
     let total = if fb_probe == 0x1000 { 1 } else { 2 };
-    let cr3 = cr3_decode(read_cr3());
+    let cr3 = cr3_pml4_base(read_cr3());
     let mut leaves: [(u64, u8); 2] = [(0, 0); 2];
     let mut ok_count = 0usize;
     let mut leaf_count = 0usize;
