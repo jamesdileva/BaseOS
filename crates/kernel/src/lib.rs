@@ -24,6 +24,12 @@ use baseos_boot_info::{write_str, write_u64_dec, write_u64_hex, BootInfo};
 
 pub mod frame_alloc;
 pub mod page_table;
+/// Safe COM1 port-I/O boundary: raw `in`/`out` confined to private
+/// `uart::outb`/`inb` bodies; safe callers use `uart::com1_write_byte` and
+/// the `write_*` line helpers without an `unsafe` block.
+pub mod uart;
+
+use uart::{write_exc_line, write_pf_line};
 
 /// Enter the kernel with the boot handoff: validate [`BootInfo`] and emit
 /// the one-line entry proof on the caller's byte sink:
@@ -53,11 +59,13 @@ pub fn kernel_entry<E>(
 
 /// COM1 base port (same physical UART the S01 guest programmed; still
 /// valid post-`ExitBootServices` because it is plain port I/O).
-const COM1_PORT: u16 = 0x3F8;
+/// Lives here (not in `uart`) so the boundary-shape pin test names one
+/// owner; `uart` imports these.
+pub(crate) const COM1_PORT: u16 = 0x3F8;
 /// Line-status-register offset; bit 5 (THR empty) gates each write.
-const COM1_LSR: u16 = COM1_PORT + 5;
+pub(crate) const COM1_LSR: u16 = COM1_PORT + 5;
 /// Bit 5 of the LSR: transmitter holding register empty.
-const LSR_THR_EMPTY: u8 = 0x20;
+pub(crate) const LSR_THR_EMPTY: u8 = 0x20;
 
 /// Kernel code selector in the S02 GDT (entry 1; null is entry 0).
 const KERNEL_CODE_SEL: u16 = 0x08;
@@ -239,81 +247,10 @@ static mut IDT: Idt = Idt {
     entries: [IdtEntry::missing(); EXCEPTION_VECTORS],
 };
 
-/// Write one byte to an ISA I/O port.
+/// Port-I/O boundary moved to [`uart`] (S05 slice 2): raw `in`/`out`
+/// (`outb`/`inb`) are private unsafe bodies there; `com1_write_byte` and the
+/// `write_*` line helpers are safe wrappers. See `uart.rs`.
 ///
-/// # Safety
-/// Caller must pass a valid, writable port for this platform (here: COM1
-/// UART registers, already initialized by the S01 guest pre-handoff).
-#[inline(always)]
-unsafe fn outb(port: u16, value: u8) {
-    core::arch::asm!(
-        "out dx, al",
-        in("dx") port,
-        in("al") value,
-        options(nomem, nostack, preserves_flags),
-    );
-}
-
-/// Read one byte from an ISA I/O port.
-///
-/// # Safety
-/// Same contract as [`outb`]: caller passes a readable port (COM1 LSR).
-#[inline(always)]
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    core::arch::asm!(
-        "in al, dx",
-        out("al") value,
-        in("dx") port,
-        options(nomem, nostack, preserves_flags),
-    );
-    value
-}
-
-/// Poll THR-empty, then write one byte to COM1 (post-EBS interrupt-safe
-/// path: no firmware, plain port I/O only).
-///
-/// # Safety
-/// COM1 must have been initialized via the S01 guest's `uart_init` before
-/// `kernel_entry`; polls a read-only status bit, then writes the register.
-unsafe fn com1_write_byte(byte: u8) {
-    while inb(COM1_LSR) & LSR_THR_EMPTY == 0 {}
-    outb(COM1_PORT, byte);
-}
-
-/// Emit `EXC ok=<0|1> vector=<n>\n` directly on COM1 (interrupt context
-/// cannot use the caller-supplied `kernel_entry` sink).
-///
-/// # Safety
-/// Requires COM1 initialized (S01 `uart_init` ran before handoff); single-
-/// threaded exception context owns the UART exclusively.
-unsafe fn write_exc_line(ok: bool, vector: u64) {
-    for b in b"EXC ok=" {
-        com1_write_byte(*b);
-    }
-    com1_write_byte(if ok { b'1' } else { b'0' });
-    for b in b" vector=" {
-        com1_write_byte(*b);
-    }
-    let mut buf = [0u8; 20];
-    let mut n = 0;
-    let mut v = vector;
-    if v == 0 {
-        buf[0] = b'0';
-        n = 1;
-    } else {
-        while v > 0 {
-            buf[n] = b'0' + (v % 10) as u8;
-            v /= 10;
-            n += 1;
-        }
-    }
-    for i in (0..n).rev() {
-        com1_write_byte(buf[i]);
-    }
-    com1_write_byte(b'\n');
-}
-
 /// Rust body of the `#DE` stub: prove the exception was *caught* (serial
 /// line) then park — a controlled failure, not a triple-fault reset.
 ///
@@ -321,11 +258,12 @@ unsafe fn write_exc_line(ok: bool, vector: u64) {
 /// passed (0 for `#DE`).
 #[no_mangle]
 extern "C" fn exception_handler_rust(vector: u64) -> ! {
-    // SAFETY: COM1 was initialized pre-handoff; exception context is
-    // single-threaded and exclusive on the UART. `ok=1` means the IDT gate
-    // delivered control here — the e2e hard-require for S02 slice 2.
+    // Port I/O is a safe wrapper now (`uart::write_exc_line`); only the
+    // `hlt` park needs `unsafe`. COM1 was initialized pre-handoff and the
+    // single-threaded exception context owns the UART. `ok=1` means the IDT
+    // gate delivered control here — the e2e hard-require for S02 slice 2.
+    write_exc_line(true, vector);
     unsafe {
-        write_exc_line(true, vector);
         loop {
             core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
         }
@@ -345,89 +283,16 @@ extern "C" fn exception_handler_rust(vector: u64) -> ! {
 /// frame misaligns).
 #[no_mangle]
 pub extern "C" fn exception_handler_pf_rust(vector: u64, code: u64, cr2: u64) -> ! {
-    // SAFETY: same COM1-exclusive contract as `exception_handler_rust`.
+    // Port I/O is a safe wrapper now (`uart::write_pf_line`); only the
+    // fault-chain `div` + `hlt` park need `unsafe`. Same COM1-exclusive
+    // contract as `exception_handler_rust`.
+    write_pf_line(true, vector, code, cr2);
     unsafe {
-        write_pf_line(true, vector, code, cr2);
         // Chain: intentional #DE so e2e keeps its EXC hard-require.
         core::arch::asm!("xor eax, eax", "xor edx, edx", "div eax", options(nostack),);
         loop {
             core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
         }
-    }
-}
-
-/// Emit `PF ok=<0|1> vector=<n> code=<0x...> addr=<0x...>\n` directly on
-/// COM1 (interrupt context cannot use the caller-supplied sink).
-///
-/// # Safety
-/// Requires COM1 initialized; single-threaded exception context owns the
-/// UART exclusively.
-unsafe fn write_pf_line(ok: bool, vector: u64, code: u64, cr2: u64) {
-    for b in b"PF ok=" {
-        com1_write_byte(*b);
-    }
-    com1_write_byte(if ok { b'1' } else { b'0' });
-    for b in b" vector=" {
-        com1_write_byte(*b);
-    }
-    write_dec_u64(vector);
-    for b in b" code=" {
-        com1_write_byte(*b);
-    }
-    write_hex_u64(code);
-    for b in b" addr=" {
-        com1_write_byte(*b);
-    }
-    write_hex_u64(cr2);
-    com1_write_byte(b'\n');
-}
-
-/// Decimal writer for the COM1 interrupt path (no `core::fmt`, no
-/// allocation; mirrors `write_exc_line`).
-///
-/// # Safety
-/// COM1 initialized; exception context only.
-unsafe fn write_dec_u64(mut v: u64) {
-    let mut buf = [0u8; 20];
-    let mut n = 0;
-    if v == 0 {
-        com1_write_byte(b'0');
-        return;
-    }
-    while v > 0 {
-        buf[n] = b'0' + (v % 10) as u8;
-        v /= 10;
-        n += 1;
-    }
-    for i in (0..n).rev() {
-        com1_write_byte(buf[i]);
-    }
-}
-
-/// Hex writer for the COM1 interrupt path (`0x` + lowercase digits).
-///
-/// # Safety
-/// COM1 initialized; exception context only.
-unsafe fn write_hex_u64(v: u64) {
-    for b in b"0x" {
-        com1_write_byte(*b);
-    }
-    let mut started = false;
-    let mut i = 15;
-    loop {
-        let digit = ((v >> (i * 4)) & 0xF) as u8;
-        if digit != 0 || started || i == 0 {
-            started = true;
-            com1_write_byte(if digit < 10 {
-                b'0' + digit
-            } else {
-                b'a' + digit - 10
-            });
-        }
-        if i == 0 {
-            break;
-        }
-        i -= 1;
     }
 }
 
@@ -845,10 +710,28 @@ mod tests {
     }
 
     #[test]
+    fn uart_wrappers_are_safe_without_unsafe_block() {
+        // S05 slice 2: the kernel port-I/O boundary is safe wrappers over
+        // private unsafe `outb`/`inb` bodies. Binding to the plain `fn`
+        // type proves safeness at compile time — an `unsafe fn` would not
+        // coerce — without executing port I/O on the host (which would
+        // fault outside the guest).
+        let write_byte: fn(u8) = uart::com1_write_byte;
+        let exc: fn(bool, u64) = uart::write_exc_line;
+        let pf: fn(bool, u64, u64, u64) = uart::write_pf_line;
+        let dec: fn(u64) = uart::write_dec_u64;
+        let hex: fn(u64) = uart::write_hex_u64;
+        let _ = (write_byte, exc, pf, dec, hex);
+    }
+
+    #[test]
     fn s05_unsafe_inventory_pins_cpu_boundary_shape() {
         // S05 slice 1: `docs/unsafe-inventory.md` sections A/D list every
         // kernel unsafe site. This test pins the doc against the CPU
         // boundary shape so a dropped site or a changed constant fails here.
+        // Slice 2 hardening (REVIEW #236 nit 1): substring site names alone
+        // would still pass if a table row were deleted while the name
+        // survived elsewhere, so every §A/§D row anchor is pinned too.
         const DOC: &str = include_str!("../../../docs/unsafe-inventory.md");
         for site in [
             "outb",
@@ -863,6 +746,13 @@ mod tests {
             "baseos_isr_pf",
         ] {
             assert!(DOC.contains(site), "inventory must document {site}");
+        }
+        for row in [
+            "| A1 |", "| A2 |", "| A3 |", "| A4 |", "| A5 |", "| A6 |", "| A7 |", "| D1 |",
+            "| D2 |", "| D3 |", "| D4 |", "| D5 |", "| D6 |", "| D7 |", "| D8 |", "| D9 |",
+            "| D10 |",
+        ] {
+            assert!(DOC.contains(row), "inventory must keep row {row}");
         }
         assert_eq!(KERNEL_CODE_SEL, 0x08);
         assert_eq!(KERNEL_DATA_SEL, 0x10);

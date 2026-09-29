@@ -3142,3 +3142,52 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Inventory landed exhaustive with shape pins; #8 ready for
   agent-b review (proposed -> active this cycle; done on concurrence).
   Next: safe wrappers for port I/O, CPU/table APIs, invariant docs.
+
+## S05 slice 2 — kernel safe port-I/O wrappers + anchor pins + re-baseline policy (2026-09-29)
+
+- **Decision:** First safe-wrapper slice of #8: (a) new `crates/kernel/src/uart.rs`
+  — private unsafe `outb`/`inb` bodies, safe `pub(crate)` wrappers
+  (`com1_write_byte`, `write_dec_u64`, `write_hex_u64`, `write_exc_line`,
+  `write_pf_line`); `lib.rs` drops its unsafe port-I/O copies and calls the
+  safe wrappers (handlers keep `unsafe` only for the `hlt`/`div` asm);
+  COM1 consts stay in `lib.rs` as the single owner (`uart` imports them);
+  (b) REVIEW #236 nit 1: both shape-pin tests now also assert every table
+  row anchor (`| A1 |`…`| D10 |`, 24 rows) so a deleted row fails even if
+  the site name survives elsewhere; (c) REVIEW #236 nit 2: inventory header
+  gains a re-baseline policy (line numbers are not the gate — the anchored
+  pins are; each moving slice notes only its own new lines), §A6/A7 point
+  at `uart.rs`, and the zero claim reads `zero unsafe blocks` (page_table
+  hits are doc prose); (d) new host test
+  `uart_wrappers_are_safe_without_unsafe_block` binds the wrappers to plain
+  `fn` types — an `unsafe fn` would not coerce — proving safe-callability
+  without executing port I/O on the host.
+- **Why:** S05 verification needs safe callers unable to name a port or need
+  an `unsafe` block for serial output; the reviewer accepted slice 1 but
+  held #8 active for exactly these wrappers, and flagged both pin/dirft
+  nits for slice 2.
+- **Alternatives:** Ownership-token `Com1` claim-once guard (rejected: the
+  exception handlers are `extern "C"` from asm and cannot carry a token —
+  ordering/exclusivity stays documented, as in the inventory); shared
+  `crates/hal` for boot-uefi+kernel UART (rejected: doubles the slice —
+  boot-uefi keeps its pre-EBS `uart_init`/`com1_emit` this cycle, unify
+  later); executing the wrappers in a host test (rejected: `in`/`out`
+  faults outside the guest — the `fn`-type binding is the host proof,
+  e2e is the live proof).
+- **Expected:** default 97 (21+66+4+4+2), boot-uefi 17/17, fmt/clippy clean
+  both targets, `boot-uefi.ps1` PASS with PF+EXC lines (guest size may move
+  on the refactor — record, not assert identical).
+- **Measured (2026-09-29, Win11, rustc 1.98.0):** default 97/97
+  (21+66+4+4+2 — kernel 66/66 incl. the new safe-type test),
+  `-p baseos-boot-uefi` 17/17 (anchor asserts green),
+  `cargo fmt --check` clean (after one auto-format),
+  `cargo clippy --all-targets -D warnings` clean (host) and
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 937
+  bytes (marker FOUND, BOOTINFO/MEMMAP/FB/GOP/EBS/KERNEL/FRAMEALLOC/PAGING/
+  PERM/GUARD/PERMAUDIT[x2]/RMBZ ok, `PF ok=1 vector=14` + `EXC ok=1
+  vector=0`), guest `bootx64.efi` 85504 bytes (was 86016 @1157b60, -512B
+  refactor codegen — serial contract unchanged).
+- **Final:** Kernel port I/O is a safe boundary (unsafe confined to
+  `uart::outb`/`inb`); both REVIEW #236 nits closed on this tree. #8 stays
+  active: next is CPU/table safe wrappers (GDT/IDT/CR3/EFER) + boot-uefi
+  UART unify.

@@ -1,17 +1,27 @@
-# Unsafe inventory — S05 slice 1 (baseline @bfc4790)
+# Unsafe inventory — S05 slice 1 baseline @bfc4790, slice 2 delta noted
 
 Scope: exhaustive over `crates/` for `unsafe`, `asm!`/`global_asm!`,
 raw-pointer ops (`read_unaligned`, `from_raw_parts`, `addr_of[_mut]`,
 `transmute`, raw deref). Method: the two `Select-String` sweeps recorded
 in the S05 slice-1 worklog row (guest + test hits listed, no sampling).
 
-Result: `unsafe` is concentrated in exactly 2 files —
+Result: `unsafe` blocks are concentrated in exactly 2 files —
 `crates/boot-uefi/src/main.rs` (guest boundary) and
-`crates/kernel/src/lib.rs` (CPU/exception boundary).
+`crates/kernel/src/lib.rs` + `crates/kernel/src/uart.rs` (CPU/exception
+boundary, slice 2 split).
 `crates/kernel/src/page_table.rs`, `crates/kernel/src/frame_alloc.rs`,
 `crates/boot-info`, `crates/serial-marker`, `crates/version` contain
-**zero** `unsafe` (only doc prose and the safe
-`fill_from_raw_descriptors(&[u8])` parser). Line numbers below are @bfc4790.
+**zero** `unsafe` blocks (only doc prose and the safe
+`fill_from_raw_descriptors(&[u8])` parser; `page_table.rs` mentions of
+`unsafe` are doc-prose lines, no `unsafe` block). Line numbers below are
+@bfc4790 unless marked (slice 2).
+
+Re-baseline policy (REVIEW #236 nit 2): line numbers drift whenever
+wrappers move code, so they are NOT the gate — the host shape-pin tests
+(`s05_unsafe_inventory_pins_*`, now with per-row `| A1 |`…`| D10 |`
+anchors) are. Each slice that moves an inventoried site notes the new
+path here and re-baselines only that site's lines; full line re-baseline
+rides with the slice that closes S05.
 
 ## A. Port I/O — COM1 UART (no safe equivalent on a `no_std` guest)
 
@@ -22,8 +32,8 @@ Result: `unsafe` is concentrated in exactly 2 files —
 | A3 | boot-uefi `uart_init` (181) | Programs UART divisor/line/FIFO regs | Call once before any byte; single-threaded boot | Marker FOUND on every boot |
 | A4 | boot-uefi `com1_write_byte` (196) | LSR poll + TX write | `uart_init` ran; exclusive owner (pre-EBS boot thread) | All serial lines |
 | A5 | boot-uefi `com1_emit` (203, safe wrapper, `unsafe` block 206) | Bridges infallible sink style to A4 | Same as A4, by construction at `efi_main` | `write_marker`/`write_boot_summary` output |
-| A6 | kernel `outb` (248), `inb` (262), `com1_write_byte` (279) | Post-EBS copy of A1/A2/A4 (firmware gone, same UART) | S01 `uart_init` ran pre-handoff; post-EBS COM1 is plain port I/O | `EXC`/`PF` lines post-EBS |
-| A7 | kernel `write_exc_line` (290), `write_pf_line` (365), `write_dec_u64` (390), `write_hex_u64` (411) | Interrupt-context writers, cannot use caller sink | COM1 initialized; single-threaded exception context owns UART | `EXC`/`PF` e2e gates |
+| A6 | kernel `uart::outb/uart::inb` (private unsafe bodies) + safe `uart::com1_write_byte` (slice 2 @this-slice, was lib.rs 248/262/279 @bfc4790) | Post-EBS copy of A1/A2/A4 (firmware gone, same UART) | S01 `uart_init` ran pre-handoff; post-EBS COM1 is plain port I/O; `unsafe` confined to `outb`/`inb` bodies, callers safe | `EXC`/`PF` lines post-EBS |
+| A7 | kernel `uart::write_exc_line`, `uart::write_pf_line`, `uart::write_dec_u64`, `uart::write_hex_u64` (safe wrappers, slice 2 @this-slice, was lib.rs 290/365/390/411 @bfc4790) | Interrupt-context writers, cannot use caller sink | COM1 initialized; single-threaded exception context owns UART; host pin `uart_wrappers_are_safe_without_unsafe_block` proves `fn` (not `unsafe fn`) type | `EXC`/`PF` e2e gates |
 
 ## B. UEFI table / slot loads — raw offsets + `read_unaligned` + `transmute`
 

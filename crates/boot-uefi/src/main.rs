@@ -1865,6 +1865,9 @@ mod tests {
         // inventory (sweeps recorded in the worklog row). This test pins the
         // doc against the boundary shape so a dropped site or a changed
         // constant fails here, not in review.
+        // Slice 2 hardening (REVIEW #236 nit 1): substring site names alone
+        // would still pass if a table row were deleted while the name
+        // survived elsewhere, so every §A–E row anchor is pinned too.
         const DOC: &str = include_str!("../../../docs/unsafe-inventory.md");
         for site in [
             "outb",
@@ -1890,6 +1893,13 @@ mod tests {
             "efi_main",
         ] {
             assert!(DOC.contains(site), "inventory must document {site}");
+        }
+        for row in [
+            "| A1 |", "| A2 |", "| A3 |", "| A4 |", "| A5 |", "| A6 |", "| A7 |", "| B1 |",
+            "| B2 |", "| B3 |", "| B4 |", "| C1 |", "| C2 |", "| C3 |", "| D1 |", "| D2 |",
+            "| D3 |", "| D4 |", "| D5 |", "| D6 |", "| D7 |", "| D8 |", "| D9 |", "| D10 |",
+        ] {
+            assert!(DOC.contains(row), "inventory must keep row {row}");
         }
         assert_eq!(SYSTEM_TABLE_BOOT_SERVICES_OFF, 96);
         assert_eq!(BOOT_SERVICES_GET_MEMORY_MAP_OFF, 56);
