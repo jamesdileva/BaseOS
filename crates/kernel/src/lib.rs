@@ -556,45 +556,38 @@ mod tests {
         // #168n6 live-#PF guard: canonical low-half, 4 KiB-aligned, far
         // above firmware RAM/FB (0x80000000) and below the non-canonical
         // hole (0x0000800000000000) so OVMF faults not-present (P=0).
-        // `black_box` keeps the range asserts runtime (not const-evaluable)
-        // so `clippy -D warnings` (`assertions_on_constants`) stays clean.
+        // Single-source (REVIEW #242 nit): the raw predicate lives ONLY in
+        // `cpu::probe_addr_valid` — this test asserts via that wrapper on
+        // one table (no duplicated `& 0xFFF` / range asserts), so the
+        // contract cannot drift across copies. `black_box` keeps the probe
+        // assert runtime (not const-evaluable) so `clippy -D warnings`
+        // (`assertions_on_constants`) stays clean.
         assert_eq!(PF_PROBE_ADDR, 0x0000_5000_0000_0000);
         let probe = core::hint::black_box(PF_PROBE_ADDR);
-        assert_eq!(probe & 0xFFF, 0, "probe must be page-aligned");
         assert!(
-            probe < 0x0000_8000_0000_0000,
-            "probe must stay canonical low-half"
+            cpu::probe_addr_valid(probe),
+            "probe must pass the guard wrapper"
         );
-        assert!(
-            probe > 0x1_0000_0000,
-            "probe must sit above any firmware-mapped RAM"
-        );
-    }
-
-    #[test]
-    fn probe_addr_valid_agrees_with_pf_probe_guard() {
-        // REVIEW #240 R2: `cpu::probe_addr_valid` must agree with the raw
-        // `#PF` probe-guard contract on the probe + neighbors, so the two
-        // cannot silently drift (one table, one verdict each).
         for (addr, expected) in [
-            (PF_PROBE_ADDR, true),
             (PF_PROBE_ADDR + 0x1000, true),
             (PF_PROBE_ADDR + 1, false),
             (0x0000_8000_0000_0000_u64, false),
             (0x8000_0000_u64, false),
             (0_u64, false),
         ] {
-            assert_eq!(
-                cpu::probe_addr_valid(addr),
-                expected,
-                "probe_addr_valid({addr:#x})"
-            );
+            assert_eq!(cpu::probe_addr_valid(addr), expected, "guard({addr:#x})");
         }
-        // And the probe itself satisfies the raw guard predicate.
-        let probe = core::hint::black_box(PF_PROBE_ADDR);
-        assert_eq!(probe & 0xFFF, 0);
-        assert!(probe < 0x0000_8000_0000_0000);
-        assert!(probe > 0x1_0000_0000);
+    }
+
+    #[test]
+    fn probe_addr_valid_agrees_with_pf_probe_guard() {
+        // REVIEW #240 R2 agreement pin, single-sourced per #242: the probe
+        // constant passes the wrapper and the wrapper pins the same table
+        // as the guard test above (raw predicate lives only in `cpu`).
+        assert_eq!(PF_PROBE_ADDR, 0x0000_5000_0000_0000);
+        assert!(cpu::probe_addr_valid(PF_PROBE_ADDR));
+        assert!(cpu::probe_addr_valid(PF_PROBE_ADDR + 0x1000));
+        assert!(!cpu::probe_addr_valid(PF_PROBE_ADDR + 1));
     }
 
     #[test]

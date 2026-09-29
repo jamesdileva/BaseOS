@@ -91,8 +91,11 @@ the guest but with heap `Vec` fakes, so no firmware/hardware is touched.
   `VECTOR_DE` 0 / `VECTOR_PF` 14 / `EXCEPTION_VECTORS` 32,
   `PF_PROBE_ADDR` 0x500000000000, COM1 `0x3F8`/`+5`/`0x20`.
 
-Follow-ups (not this slice): CR3/EFER (`read_cr3`, `read_efer`, guest
-probes D7/D9) safe wrappers; boot-uefi UART unify with `kernel::uart`
-(pre-EBS `uart_init` stays guest-side); per-site invariant docs beyond
-this table. Done: port-I/O safe wrappers (slice 2), CPU gate/probe safe
-wrappers `gate_for` / `probe_addr_valid` (slice 3).
+Follow-ups (not this slice): CR3/EFER register reads (`read_cr3`,
+`read_efer`, guest probes D7/D9) move into `cpu`; boot-uefi UART unify with
+`kernel::uart` (pre-EBS `uart_init` stays guest-side); per-site invariant
+docs beyond this table. Done: port-I/O safe wrappers (slice 2), CPU
+gate/probe safe wrappers `gate_for` / `probe_addr_valid` (slice 3),
+selector-pin enforcement + agreement test (slice 4), single-source probe
+guard + pure CR3/EFER decode wrappers `cr3_pml4_base` / `efer_nxe_enabled`
+(slice 5, host-only — live reads stay D7/D8).

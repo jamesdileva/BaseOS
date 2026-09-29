@@ -8,7 +8,9 @@
 //! callers cannot wire a gate into the wrong segment, and
 //! [`probe_addr_valid`] pins the live-`#PF` guard contract (canonical
 //! low-half, 4 KiB-aligned, above firmware-mapped RAM) without touching
-//! hardware. Caller contract for the unsafe loads (documented, not
+//! hardware. Slice 5 adds [`cr3_pml4_base`] / [`efer_nxe_enabled`] pure
+//! decode wrappers over `page_table` so probe code shares one rule.
+//! Caller contract for the unsafe loads (documented, not
 //! compiler-enforced): post-`ExitBootServices` boot CPU, `cli` in effect,
 //! statics outlive use.
 
@@ -128,10 +130,45 @@ pub(crate) const fn gate_for(handler: u64) -> IdtEntry {
 /// and host tests (mirrors `pf_probe_addr_is_canonical_unmapped_guard`).
 /// Guest intentionally does not call this (no panic path post-EBS); the
 /// host tests are the gate, so `dead_code` in guest builds is expected.
+///
+/// Single source (REVIEW #242 nit): the raw canonical/aligned/floor
+/// predicate lives ONLY here — `lib.rs` probe-guard tests assert via this
+/// function (table-driven), never with duplicated raw `& 0xFFF` / range
+/// asserts, so the contract cannot drift across copies.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) const fn probe_addr_valid(addr: u64) -> bool {
     addr & 0xFFF == 0 && addr < 0x0000_8000_0000_0000 && addr > 0x1_0000_0000
+}
+
+/// PML4 base from a live `CR3` value (S05 slice 5).
+///
+/// Safe pure wrapper over [`crate::page_table::cr3_decode`] so guest probe
+/// code (`probe_paging`, `probe_live_flags_for`, `probe_rmbz` in
+/// `boot-uefi`) and host tests share one decode rule beside the other
+/// `cpu` wrappers. No hardware touched; the live `read_cr3` (`mov {}, cr3`)
+/// stays guest-side in `boot-uefi` (D7) until the register-read move slice.
+/// Guest intentionally does not call this yet (wiring rides with the
+/// register-read move); the host tests are the gate, so `dead_code` in
+/// guest builds is expected.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn cr3_pml4_base(cr3: u64) -> u64 {
+    super::page_table::cr3_decode(cr3)
+}
+
+/// `NXE` pin from a live `EFER` value (S05 slice 5).
+///
+/// Safe pure wrapper over [`crate::page_table::efer_nxe_enabled`] (bit 11)
+/// so the `RMBZ nxen=` verdict and host tests share one decode rule.
+/// No hardware touched; the live `read_efer` (`rdmsr` on `EFER_MSR`) stays
+/// guest-side in `boot-uefi` (D8) until the register-read move slice.
+/// Guest intentionally does not call this yet; the host tests are the gate,
+/// so `dead_code` in guest builds is expected.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn efer_nxe_enabled(efer: u64) -> bool {
+    super::page_table::efer_nxe_enabled(efer)
 }
 
 // Forward-declared asm stubs (defined in `global_asm!` in the parent).
@@ -227,5 +264,41 @@ mod tests {
         assert!(!probe_addr_valid(0x0000_8000_0000_0000), "hole must fail");
         assert!(!probe_addr_valid(0x8000_0000), "firmware RAM must fail");
         assert!(!probe_addr_valid(0), "null must fail");
+    }
+
+    #[test]
+    fn cr3_pml4_base_agrees_with_page_table() {
+        // S05 slice 5: safe wrapper must match `page_table::cr3_decode` on
+        // flag-masked, zero, and all-ones inputs (PML4 base = addr bits).
+        use super::super::page_table::{cr3_decode, PTE_ADDR_MASK};
+        for cr3 in [0u64, 0x7F00_1000, 0x7F00_1003, u64::MAX] {
+            assert_eq!(cr3_pml4_base(cr3), cr3_decode(cr3));
+        }
+        assert_eq!(cr3_pml4_base(0xFFFF_FFFF_FFFF_FFFF), PTE_ADDR_MASK);
+        assert_eq!(cr3_pml4_base(0x7F00_1000), 0x7F00_1000);
+    }
+
+    #[test]
+    fn efer_nxe_enabled_agrees_with_page_table() {
+        // S05 slice 5: safe wrapper must match
+        // `page_table::efer_nxe_enabled` (bit 11) exactly.
+        use super::super::page_table::{efer_nxe_enabled as raw_nxe, EFER_MSR, EFER_NXE_BIT};
+        assert_eq!(EFER_MSR, 0xC000_0080);
+        for efer in [0u64, EFER_NXE_BIT, !EFER_NXE_BIT, u64::MAX] {
+            assert_eq!(efer_nxe_enabled(efer), raw_nxe(efer));
+        }
+        assert!(efer_nxe_enabled(EFER_NXE_BIT));
+        assert!(!efer_nxe_enabled(0));
+    }
+
+    #[test]
+    fn cr3_efer_wrappers_are_safe_without_unsafe_block() {
+        // S05 slice 5: the decode wrappers are safe pure `const fn` — bind
+        // to the plain `fn` type to prove safeness at compile time (an
+        // `unsafe fn` would not coerce), mirroring the UART pin in lib.rs.
+        let cr3_base: fn(u64) -> u64 = cr3_pml4_base;
+        let nxe: fn(u64) -> bool = efer_nxe_enabled;
+        let probe: fn(u64) -> bool = probe_addr_valid;
+        let _ = (cr3_base, nxe, probe);
     }
 }

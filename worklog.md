@@ -3281,3 +3281,41 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** R1+R2 closed on this tree; R3 still owed (agent-b independent
   QEMU re-run before S05 close). #8 stays active: next is CR3/EFER safe
   wrappers + boot-uefi UART unify.
+
+## S05 slice 5 — single-source probe guard + CR3/EFER decode wrappers (REVIEW #242 nit)
+
+- **Decision:** One host-test-only slice: (a) close REVIEW #242 residual nit
+  — the raw `#PF` guard predicate lives ONLY in `cpu::probe_addr_valid`;
+  `lib.rs` `pf_probe_addr_is_canonical_unmapped_guard` now asserts via the
+  wrapper on one table (probe true, probe+0x1000 true, probe+1/hole/RAM/null
+  false) and the R2 agreement test drops its duplicated raw
+  `& 0xFFF`/range asserts, so 3 copies collapse to 1 + wrapper-table tests;
+  (b) add safe pure `cpu::cr3_pml4_base` (over `page_table::cr3_decode`) and
+  `cpu::efer_nxe_enabled` (over `page_table::efer_nxe_enabled`) with
+  agreement + safeness (`fn`-coercion) host tests — decode rules join the
+  boundary beside `gate_for`/`probe_addr_valid`; live `read_cr3`/`read_efer`
+  asm stays guest-side in `boot-uefi` (D7/D8) until the register-read move
+  slice; guest untouched. Inventory follow-ups note the delta.
+- **Why:** The nit left the guard in 3 copies (agreement test detects drift
+  but does not prevent it); CR3/EFER decodes are the next boundary growth
+  and belong as tested wrappers before any guest rewiring or UART unify.
+- **Alternatives:** Delete the agreement test as redundant (rejected: it
+  remains the R2 pin that probe+neighbors hit the wrapper; cheap to keep
+  single-sourced); move `read_cr3`/`read_efer` asm into `cpu` now (rejected:
+  doubles single-cycle risk — guest rewiring + QEMU re-proof belongs in its
+  own slice; pure decodes are independently committable).
+- **Expected:** default 103 (21+72+4+4+2), boot-uefi 17/17, fmt/clippy clean
+  both targets, `boot-uefi.ps1` PASS with guest size stable (host-only —
+  wrappers + tests, no codegen).
+- **Measured (2026-09-29, Win11, rustc 1.98.0):** default 103/103
+  (21+72+4+4+2 — kernel 72/72 incl. 3 new: cr3/efer agreement + safeness),
+  `-p baseos-boot-uefi` 17/17, `cargo fmt --check` clean,
+  `cargo clippy --all-targets -D warnings` clean (host) and
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 937
+  bytes, guest `bootx64.efi` 85504 bytes (identical to slice 4 —
+  host-only confirmed).
+- **Final:** #242 nit closed; CR3/EFER decode wrappers pinned host-side.
+  R3 still owed (agent-b independent QEMU re-run before S05 close). #8
+  stays active: next is register-read move (`read_cr3`/`read_efer` into
+  `cpu`) + boot-uefi UART unify.
