@@ -3432,3 +3432,59 @@ Format per entry (per `implementation-guide.md` §31):
   owns `in`/`out`); UART read+decode precedent now covers both S05
   boundaries. #8 stays active (S05 close-out: full line re-baseline +
   remaining review).
+
+## S05 close-out -- pub-widen DECISION + needle-tripwire record + indep re-run (REVIEW #256)
+
+- **Decision:** (a) `uart_init` + `com1_write_byte` `pub` widening from
+  `pub(crate)` is INTENTIONAL and stays: single owner (`kernel::uart`
+  owns the sole `out`/`in` bodies), guest calls the safe wrappers, ordering
+  + exclusivity stays a documented caller contract (call once pre-handoff,
+  single-threaded boot/exception path owns COM1, `cli` in effect post-EBS);
+  (b) ownership-token `Com1` claim-once guard is explicitly DEFERRED, not
+  forgotten; (c) the slice-8 `guest_uses_kernel_uart_and_cpu_wrappers` pin
+  uses concat-built needles (`["unsafe fn uart_", "init"].concat()` etc.)
+  so the test source cannot self-match its own literals -- the tripwire
+  fails only on a real guest revert, never on its own text.
+- **Why:** REVIEW #256 provisionally accepted slice 8 @bb0e839 but held
+  full close-out on exactly these two gaps: (2) pub-widening leaves misuse
+  fail-open (doc-only, no compiler bar) with the token deferral lacking an
+  explicit DECISION + alternatives; (3) PROJECT_GOAL requires a worklog
+  decision entry for the pub-widening and the string-needle tripwire, and
+  slice 8 cited neither. This row is that entry. Independence gap (1)
+  stays owed by agent-b (builder re-run != independent), so #8 stays
+  `active` per the review.
+- **Alternatives:** Ownership-token `Com1` (claim-once, `!Copy`, threaded
+  through `efi_main` -> probes -> handlers) -- rejected now: the two live
+  consumers that must share the UART (`exception_handler_rust`,
+  `exception_handler_pf_rust`) are `extern "C"` from `global_asm!` stubs
+  and cannot carry a token without a global `static` (which reintroduces
+  the shared-state the token was meant to remove); single-threaded
+  boot + `cli` + documented order is the cheaper correct contract, same
+  rationale as slice-2 `Com1` rejection, re-affirmed here. Separate
+  `crates/hal` for UART -- rejected: one-module move with zero new deps
+  already gives a single owner; a new crate doubles the slice for no new
+  bar. Keep `uart_init` guest-side, unify only the write path -- rejected
+  in slice 8 (leaves two `out` owners). For the pin: plain string
+  literals in the test -- rejected: `include_str!` of the guest source
+  would match the test's own literal and false-pass/loop; hardcoding the
+  guest path outside `include_str!` -- rejected: reintroduces drift the
+  pin exists to prevent.
+- **Expected:** No code change (worklog-only); default 104, boot-uefi 18,
+  gate 41/41, fmt + host/`--tests`/UEFI-target clippy clean,
+  `boot-uefi.ps1` PASS 937B with `PF ok=1 vector=14` + `EXC ok=1 vector=0`,
+  guest 85504B stable.
+- **Measured (2026-09-30, Win11, rustc 1.98.0, @bb0e839 tree):** default
+  `cargo test` 104/104 (21+73+4+4+2), `-p baseos-boot-uefi` 18/18 (incl.
+  the needle pin), `test-boot-uefi-gates.ps1` GATE TEST PASS (41/41),
+  `cargo fmt --check` clean, `cargo clippy --all-targets -D warnings`
+  clean (host) and `cargo clippy -p baseos-boot-uefi --target
+  x86_64-unknown-uefi -D warnings` clean; `boot-uefi.ps1` UEFI BOOT PASS
+  exit 0, serial 937 bytes (marker FOUND, BOOTINFO/MEMMAP/FB/GOP/EBS/
+  KERNEL/FRAMEALLOC/PAGING/PERM/GUARD/PERMAUDIT[x2]/RMBZ/PF+EXC all ok,
+  budget map_size=4704 desc_size=48 ok=True), guest `bootx64.efi` 85504
+  bytes (identical to slice-8 baseline; behavior-neutral unify confirmed).
+- **Final:** REVIEW #256 gaps (2)+(3) closed on this tree (explicit
+  pub-widen/token-defer DECISION + needle-tripwire rationale recorded).
+  Gap (1) remains: agent-b independent cargo+QEMU re-run still owed
+  before #8 flips to `done`. Next: agent-b re-run, then S05 close
+  (full inventory line re-baseline rides with the closing slice).
