@@ -380,6 +380,56 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
     Err(SwitchError::Unknown)
 }
 
+/// Live RSP swap probe (S06 slice 7): run `func` on `new_top`, then
+/// restore the caller stack.
+///
+/// Contract the guest MUST obey: `new_top` is the `Some(top)` value from
+/// [`swap_target`] (16-byte aligned, validated through the shared
+/// [`check_stack_entry`] gate) — never `stack_top()` alone (its
+/// fail-loud `u64::MAX` sentinel would be lethal as a raw `RSP`).
+/// `func` is an `extern "C" fn()` whose address was the `entry` half of
+/// the same `swap_target` triple. Post-`ExitBootServices` boot CPU,
+/// `cli` in effect, single-threaded boot owns both stacks.
+///
+/// Mechanism: stash the caller `RSP` in `R15` (callee-saved on both
+/// Win64 and SysV, hence preserved across `call func` by the ABI),
+/// spilling `R15` itself with `push`/`pop` on the caller stack so the
+/// probe preserves it too. The first attempt used a static slot addressed
+/// through a plain `in(reg)` pick — the callee clobbered that register
+/// (measured QEMU: `THREAD-RUN` printed, then crash before `THREAD ok=1`
+/// because the restore loaded a garbage `RSP`). Load `new_top`,
+/// `call func` (pushes the return address onto the NEW stack, so an
+/// unmapped/guard stack faults loudly instead of silently passing), then
+/// restore. A bad `RSP` triple-faults or `#PF`s and the e2e script fails
+/// on the missing `THREAD` lines — fail-loud, never silent.
+///
+/// # Safety
+/// See contract above. Host `cargo test` builds compile this out (the
+/// host harness must never execute `mov rsp, ...`).
+#[cfg(not(test))]
+pub unsafe fn run_on_thread_stack(new_top: u64, func: extern "C" fn()) {
+    core::arch::asm!(
+        "push r15",
+        "mov r15, rsp",
+        "mov rsp, {top}",
+        "call {func}",
+        "mov rsp, r15",
+        "pop r15",
+        top = in(reg) new_top,
+        func = in(reg) func,
+        clobber_abi("C"),
+    );
+}
+
+/// Host-test stub mirroring the guest signature so call sites stay
+/// symmetric; never invoked by tests (live `RSP` proof is e2e).
+///
+/// # Safety
+/// Host `cargo test` only: no-op, never touches registers. The real
+/// guest body (`cfg(not(test))`) carries the full post-EBS contract.
+#[cfg(test)]
+pub unsafe fn run_on_thread_stack(_new_top: u64, _func: extern "C" fn()) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,5 +724,39 @@ mod tests {
         assert!(done.set_state(ThreadState::Done));
         assert_eq!(swap_target(&[running, done], 1), Err(SwitchError::NotReady));
         assert_eq!(swap_target(&[], 1), Err(SwitchError::Unknown));
+    }
+
+    extern "C" fn dummy_thread_entry() {}
+
+    #[test]
+    fn live_swap_probe_is_unsafe_fn_shape() {
+        // S06 slice 7: the live `RSP` swap must stay `unsafe fn` (raw
+        // `mov rsp, ...` + indirect `call`) — bind to the `unsafe fn`
+        // type to prove callers need an `unsafe` block. Never called
+        // (would switch stacks outside the guest).
+        let probe: unsafe fn(u64, extern "C" fn()) = run_on_thread_stack;
+        let _ = probe;
+    }
+
+    #[test]
+    fn swap_target_values_are_stack_safe_for_live_swap() {
+        // S06 slice 7 pre-condition pin: the triple the guest hands to
+        // `run_on_thread_stack` is the `swap_target` triple — aligned
+        // `Some(top)` from `checked_top` (never the `u64::MAX`
+        // `stack_top()` sentinel) plus a nonzero entry, agreeing with
+        // `new()` on both stacks.
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        let b = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
+        let (id, top, entry) = swap_target(&[a, b], 1).unwrap();
+        assert_eq!(id, 2);
+        assert_eq!(top, b.checked_top().unwrap());
+        assert_eq!(top & 0xF, 0);
+        assert_ne!(top, u64::MAX);
+        assert_eq!(entry, 0x2000);
+        assert_ne!(entry, 0);
+        // Host-side shape: a dummy `extern "C" fn()` coerces to the
+        // probe's second parameter type.
+        let f: extern "C" fn() = dummy_thread_entry;
+        let _ = f;
     }
 }

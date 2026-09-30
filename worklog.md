@@ -3712,3 +3712,46 @@ Format per entry (per `implementation-guide.md` §31):
   `cargo clippy --all-targets -- -D warnings` exit 0.
 - **Final:** #283 gap closed on-tree. #9 stays active. Next: live RSP
   swap asm + QEMU fault proof.
+
+## S06 slice7 -- live RSP swap + QEMU fault proof (2026-09-30)
+
+- **Decision:** First live-context slice: (a) `kernel/thread.rs`: new
+  guest-only `unsafe fn run_on_thread_stack(top, func)` (stash caller RSP
+  in callee-saved `R15` via push/mov, load `new_top`, `call func` so the
+  return address lands on the NEW stack, restore; host stub is a no-op so
+  call sites stay symmetric) plus two host tests (unsafe-fn shape pin,
+  `swap_target` triple is stack-safe: aligned `Some(top)`, never the
+  `u64::MAX` sentinel, nonzero entry); (b) `boot-uefi/main.rs`: two 8 KiB
+  `align(16)` static stacks, `thread_b_entry` (`extern "C" fn`, emits
+  `THREAD-RUN id=2` on the new stack, returns), `probe_thread_swap`
+  (builds `Thread::new(1/2)`, resolves via `swap_target`, runs the entry
+  on the target stack, emits `THREAD ok=1 id=<n> top=<hex> entry=<hex>`,
+  fail-closed `ok=0` line on any refusal) called post-EBS after `RMBZ`
+  before bring-up; (c) `boot-uefi.ps1` hard-requires `THREAD ok=1` +
+  `THREAD-RUN id=2` (missing = FAIL).
+- **Why:** Slices 1-6 pinned the data contract host-only; S06 verification
+  needs a live `RSP` load with a fault-loud proof before any register
+  save/restore. Smallest end-to-end step is one stack switch + return.
+- **Alternatives:** Full callee-saved context switch now (rejected:
+  doubles single-cycle risk; save/restore set unproven here); static-slot
+  `SAVED_RSP` via `in(reg)` (rejected after measured QEMU fault: callee
+  clobbered the slot-address register, `THREAD-RUN` printed then crash
+  before `THREAD ok=1`; `R15` stash fixes the class, documented inline).
+- **Expected:** default 118 (116 + 2); kernel 87 (85 + 2); fmt/clippy
+  clean both targets; `boot-uefi.ps1` PASS with `THREAD ok=1` +
+  `THREAD-RUN id=2` ahead of `PF`/`EXC`.
+- **Measured (2026-09-30, Win11):** default `cargo test` 118/118
+  (21+87+4+4+2); `-p baseos-kernel` 87/87 (new: unsafe-shape +
+  stack-safe triple); `cargo fmt --check` clean;
+  `cargo clippy --all-targets -- -D warnings` exit 0;
+  `cargo clippy -p baseos-boot-uefi --tests -- -D warnings` exit 0;
+  `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi
+  -D warnings` exit 0 (one `dead_code` allow on the stack wrapper);
+  `boot-uefi.ps1` UEFI BOOT PASS exit 0 (guest 91136 bytes, serial 1000
+  bytes: marker FOUND, BOOTINFO/MEMMAP/FB/GOP/EBS/KERNEL/FRAMEALLOC/
+  PAGING/PERM/GUARD/PERMAUDIT/PERMAUDIT2/RMBZ all ok,
+  `THREAD-RUN id=2` then `THREAD ok=1 id=2 top=0x... entry=0x...`,
+  `PF ok=1 vector=14` chained to `EXC ok=1 vector=0`).
+- **Final:** Live `RSP` swap proven end-to-end with fail-loud lines. #9
+  stays active. Next: save/restore callee-saved regs + round-trip
+  switch-back stress.

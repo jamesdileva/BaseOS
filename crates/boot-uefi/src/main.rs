@@ -41,6 +41,7 @@ use baseos_kernel::page_table::{
     guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
     walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
 };
+use baseos_kernel::thread::{run_on_thread_stack, swap_target, Thread};
 use baseos_kernel::uart::{com1_write_byte, uart_init};
 use baseos_serial_marker::write_marker;
 #[cfg(not(test))]
@@ -836,6 +837,90 @@ unsafe fn probe_rmbz(info: &BootInfo) -> (bool, bool, usize, usize, usize) {
     )
 }
 
+/// S06 slice 7 live-RSP probe: two 8 KiB stacks, 16-byte aligned so
+/// `Thread::new` accepts them. Static (not stack) so the boot stack stays
+/// small; single-threaded boot owns them exclusively post-EBS.
+#[repr(align(16))]
+#[allow(dead_code)]
+struct AlignedStack([u8; 8192]);
+
+static mut THREAD_STACK_A: AlignedStack = AlignedStack([0; 8192]);
+static mut THREAD_STACK_B: AlignedStack = AlignedStack([0; 8192]);
+
+/// Second-thread entry: runs ON the swapped-to stack (the `call` in
+/// `run_on_thread_stack` pushes its return address there, and this body
+/// spills its own frame there). Emits the proof line, then returns so the
+/// probe restores the boot stack. If the new `RSP` were unmapped or
+/// misaligned this faults and e2e fails on the missing lines.
+extern "C" fn thread_b_entry() {
+    let mut emit = com1_emit;
+    let _ = write_str(&mut emit, "THREAD-RUN id=2\n");
+}
+
+/// Emit the one-line `THREAD` diagnostic after the `RMBZ` line:
+/// `THREAD ok=<0|1> id=<n> top=<0x...> entry=<0x...>` — `ok` is 1 only
+/// when two `Thread::new` descriptors validated, `swap_target` resolved,
+/// and `run_on_thread_stack` ran `thread_b_entry` on the new `RSP` and
+/// returned (the `THREAD-RUN` line above proves the new stack executed).
+/// Failure prints `ok=0` with the sentinel `top`/`entry` zeroed so serial
+/// never shows a plausible-but-unproven `RSP`/`RIP`.
+fn write_thread_line<E>(
+    ok: bool,
+    id: u64,
+    top: u64,
+    entry: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "THREAD ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " id=")?;
+    write_u64_dec(emit, id)?;
+    write_str(emit, " top=")?;
+    write_u64_hex(emit, top)?;
+    write_str(emit, " entry=")?;
+    write_u64_hex(emit, entry)?;
+    write_str(emit, "\n")
+}
+
+/// Live thread-stack swap post-`ExitBootServices`: build two descriptors
+/// from the static stacks, resolve the round-robin target through
+/// `swap_target` (the same gate future `swap` asm must use), run
+/// `thread_b_entry` on the target stack, and emit the `THREAD` line.
+///
+/// Returns the `(ok, id, top, entry)` the line reports. Never panics.
+///
+/// # Safety
+/// Post-EBS only, on the boot thread: owns the static stacks, `cli` in
+/// effect (caller upholds it — same contract as `bring_up_cpu...`), COM1
+/// exclusive. A bad stack faults loudly (missing lines fail e2e).
+unsafe fn probe_thread_swap<E>(
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(bool, u64, u64, u64), E> {
+    let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
+    let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
+    let entry_b = thread_b_entry as *const () as u64;
+    let (a, b) = match (
+        Thread::new(1, base_a, 8192, 0x1000),
+        Thread::new(2, base_b, 8192, entry_b),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            write_thread_line::<E>(false, 0, 0, 0, emit)?;
+            return Ok((false, 0, 0, 0));
+        }
+    };
+    let (id, top, entry) = match swap_target(&[a, b], 1) {
+        Ok(t) => t,
+        Err(_) => {
+            write_thread_line::<E>(false, 0, 0, 0, emit)?;
+            return Ok((false, 0, 0, 0));
+        }
+    };
+    run_on_thread_stack(top, thread_b_entry);
+    write_thread_line::<E>(true, id, top, entry, emit)?;
+    Ok((true, id, top, entry))
+}
+
 /// UEFI entry point: marker, memory-map + framebuffer fill, summary,
 /// `ExitBootServices`, kernel handoff + CPU bring-up, park.
 ///
@@ -932,6 +1017,10 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
                 &mut emit,
             )
             .unwrap();
+            // S06 slice 7: live-RSP probe — swap to a thread stack, run
+            // `thread_b_entry` there (THREAD-RUN line), restore, report
+            // THREAD ok=1. Faults loudly (missing lines) on a bad RSP.
+            let _ = probe_thread_swap::<Infallible>(&mut emit);
             baseos_kernel::bring_up_cpu_and_prove_exception();
         }
         // EBS failed: still own boot services — park fail-loud (e2e sees
