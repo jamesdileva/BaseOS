@@ -3646,3 +3646,39 @@ Format per entry (per `implementation-guide.md` §31):
   PASS (serial 937B, guest 85504B, PF+EXC ok=1).
 - **Final:** #279 notes closed on-tree. #9 stays active. Next: live RSP
   swap asm + QEMU fault proof.
+
+## S06 slice5 — validate_threads enforces all new() invariants + swap entry gate (2026-09-30)
+
+- **Decision:** Close the REVIEW #281 must-fix smuggle gap in one
+  host-testable slice, still no asm: (a) `validate_threads` now rejects
+  every `new()` invariant — `stack_base == 0`, `stack_size < MIN_STACK`,
+  misaligned base/size, `entry == 0` — in addition to the existing
+  id-0/overflow/align-top/dup/overlap/len gates, so a smuggled
+  null-entry or degenerate-stack literal fails closed as `InvalidTable`
+  before any pick/swap; (b) `swap_target` re-checks `entry == 0` after
+  `switch_stub` (defense-in-depth alongside the existing top re-check,
+  same rationale as the id-0 gate); (c) `ThreadError`/`SwitchError`/
+  picker docs name the full gate set. One new test
+  `smuggled_stack_entry_invariants_fail_closed` pins five literals
+  (null entry, null base, 16 B size, misaligned base with aligned top,
+  misaligned size) against `validate`/`switch_stub`/`swap_target`.
+  Guest untouched.
+- **Why:** #281 approved slice4 but showed a smuggled `entry == 0`,
+  `stack_base == 0`, or 16 B `stack_size` passes validation and
+  `swap_target` returns `Ok((id, top, 0))` with lethal RIP/RSP — the
+  same bypass/deserialize path the id-0 gate already assumes. Cheapest
+  disconfirm is the five-literal test, not inspection.
+- **Alternatives:** Gate only `entry == 0` (rejected: null base and
+  sub-page/misaligned stacks are the same lethal-RSP class and free in
+  the same loop); rely on private fields instead of table validation
+  (rejected: fields block outside-crate literals today but not the
+  documented future bypass/deserialize path); live RSP asm in the same
+  commit (rejected: needs guest stacks + QEMU fault proof — next slice).
+- **Expected:** default 115 (114 + 1); kernel 84 (83 + 1); fmt/clippy
+  clean; QEMU unchanged (guest untouched).
+- **Measured (2026-09-30, Win11):** default `cargo test` 115/115
+  (21+84+4+4+2); `--workspace --exclude uefi-guest` 133 total
+  (21+18+84+4+4+2, +1 kernel); `cargo fmt --check` clean (one
+  auto-format); `cargo clippy --all-targets -- -D warnings` exit 0.
+- **Final:** #281 gap closed on-tree. #9 stays active. Next: live RSP
+  swap asm + QEMU fault proof.

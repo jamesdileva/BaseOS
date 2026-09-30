@@ -14,7 +14,8 @@
 //! - `entry == 0` → `InvalidEntry` (null entry point).
 //! - `switch` to same id / non-Ready / unknown id → `NoSwitch` /
 //!   `NotReady` / `Unknown`, never a register write.
-//! - Corrupt table (duplicate id, id 0 smuggled in, overlapping stacks,
+//! - Corrupt table (duplicate id, id 0 smuggled in, null/degenerate
+//!   stack or entry smuggled in, overlapping stacks,
 //!   misaligned top, or more than `MAX_THREADS` entries) → `InvalidTable`,
 //!   never a register write.
 //! - Illegal lifecycle (`Done` resurrection, same-state no-op) → refused
@@ -63,7 +64,9 @@ pub enum SwitchError {
     NotReady,
     /// Target is already current (no-op refused loudly).
     NoSwitch,
-    /// Corrupt table: duplicate id, smuggled id 0, overlapping stacks,
+    /// Corrupt table: duplicate id, smuggled id 0, smuggled null/
+    /// degenerate stack or entry (null base, sub-page/misaligned size,
+    /// misaligned base, null entry), overlapping stacks,
     /// misaligned/overflowing top, or more than `MAX_THREADS` entries.
     InvalidTable,
 }
@@ -207,10 +210,16 @@ impl Thread {
 
 /// Table-level validation shared by the picker: duplicate ids, stack
 /// overlaps, and misaligned/overflowing tops all fail closed.
-/// Rejects tables longer than `MAX_THREADS` (bounds the O(n^2) scan)
-/// and any `id == 0` entry (the reserved null-thread sentinel can only
+/// Rejects tables longer than `MAX_THREADS` (bounds the O(n^2) scan),
+/// any `id == 0` entry (the reserved null-thread sentinel can only
 /// enter via a bypass/deserialize path since `new()` rejects it —
-/// validated here so it can never become a pick/swap target).
+/// validated here so it can never become a pick/swap target), and any
+/// entry that violates the other `new()` invariants (`stack_base == 0`,
+/// `stack_size < MIN_STACK`, misaligned base/size, `entry == 0`).
+/// Without this, a smuggled null entry or degenerate stack would pass
+/// validation and `swap_target` would return it as a lethal RIP/RSP
+/// (REVIEW #281 gap: `new()` is bypassable by a future
+/// bypass/deserialize path exactly as `id == 0` was).
 pub fn validate_threads(threads: &[Thread]) -> Result<(), SwitchError> {
     if threads.len() > MAX_THREADS {
         return Err(SwitchError::InvalidTable);
@@ -219,6 +228,21 @@ pub fn validate_threads(threads: &[Thread]) -> Result<(), SwitchError> {
     while i < threads.len() {
         let a = threads[i];
         if a.id == 0 {
+            return Err(SwitchError::InvalidTable);
+        }
+        if a.stack_base == 0 {
+            return Err(SwitchError::InvalidTable);
+        }
+        if a.stack_size < MIN_STACK {
+            return Err(SwitchError::InvalidTable);
+        }
+        if a.stack_base & 0xF != 0 {
+            return Err(SwitchError::InvalidTable);
+        }
+        if a.stack_size & 0xF != 0 {
+            return Err(SwitchError::InvalidTable);
+        }
+        if a.entry == 0 {
             return Err(SwitchError::InvalidTable);
         }
         let a_top = match a.checked_top() {
@@ -257,7 +281,8 @@ pub fn validate_threads(threads: &[Thread]) -> Result<(), SwitchError> {
 /// after a successful pick via [`Thread::set_state`].
 ///
 /// Errors: empty table → `Unknown`; current unknown → `Unknown`;
-/// corrupt table (duplicate id / smuggled id 0 / overlap / bad top /
+/// corrupt table (duplicate id / smuggled id 0 / smuggled null or
+/// degenerate stack/entry / overlap / bad top /
 /// over `MAX_THREADS`) → `InvalidTable`;
 /// no other `Ready` thread → `NotReady` (or `NoSwitch` when the only
 /// `Ready` thread is current).
@@ -316,6 +341,12 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
     let mut i = 0;
     while i < threads.len() {
         if threads[i].id == next {
+            // Defense-in-depth: `switch_stub` already ran `validate_threads`,
+            // but re-check the load-bearing values before handing them to
+            // future asm (same rationale as the id-0 gate).
+            if threads[i].entry == 0 {
+                return Err(SwitchError::InvalidTable);
+            }
             let top = match threads[i].checked_top() {
                 Some(t) => t,
                 None => return Err(SwitchError::InvalidTable),
@@ -520,6 +551,67 @@ mod tests {
         let c = Thread::new(2, 0x1000_0000 + 8192, 8192, 0x2000).unwrap();
         assert_eq!(validate_threads(&[a, c]), Ok(()));
         assert_eq!(switch_stub(&[a, c], 1), Ok(2));
+    }
+
+    #[test]
+    fn smuggled_stack_entry_invariants_fail_closed() {
+        // REVIEW #281 gap: `validate_threads` must enforce every `new()`
+        // invariant, since a future bypass/deserialize path can smuggle
+        // them exactly as it smuggles id 0. Each literal below passes the
+        // old gate (aligned non-overflowing top) but must still fail.
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        let cases = [
+            // Null entry -> lethal RIP.
+            Thread {
+                id: 2,
+                state: ThreadState::Ready,
+                stack_base: 0x2000_0000,
+                stack_size: 8192,
+                entry: 0,
+            },
+            // Null stack base.
+            Thread {
+                id: 2,
+                state: ThreadState::Ready,
+                stack_base: 0,
+                stack_size: 8192,
+                entry: 0x2000,
+            },
+            // Sub-page size (16-byte aligned, so the old top-only gate
+            // would pass it).
+            Thread {
+                id: 2,
+                state: ThreadState::Ready,
+                stack_base: 0x2000_0000,
+                stack_size: 16,
+                entry: 0x2000,
+            },
+            // Misaligned base with an aligned top (base 1 + size 8191 =
+            // aligned top, so the old top-only gate would pass it).
+            Thread {
+                id: 2,
+                state: ThreadState::Ready,
+                stack_base: 0x2000_0001,
+                stack_size: 8191,
+                entry: 0x2000,
+            },
+            // Misaligned size.
+            Thread {
+                id: 2,
+                state: ThreadState::Ready,
+                stack_base: 0x2000_0000,
+                stack_size: 5000,
+                entry: 0x2000,
+            },
+        ];
+        let mut k = 0;
+        while k < cases.len() {
+            let bad = cases[k];
+            assert_eq!(validate_threads(&[a, bad]), Err(SwitchError::InvalidTable));
+            assert_eq!(switch_stub(&[a, bad], 1), Err(SwitchError::InvalidTable));
+            assert_eq!(swap_target(&[a, bad], 1), Err(SwitchError::InvalidTable));
+            k += 1;
+        }
     }
 
     #[test]
