@@ -5,6 +5,7 @@
 //! the host instead of triple-faulting in QEMU.
 //!
 //! Failure model (fail-closed, never panics in guest path):
+//! - `id == 0` → `InvalidId` (0 is the reserved null-thread sentinel).
 //! - `stack_base == 0` → `InvalidStack` (null).
 //! - `stack_size < MIN_STACK` (4 KiB) or `stack_size == 0` → `InvalidStack`.
 //! - `stack_base` not 16-byte aligned → `InvalidStack` (ABI requirement).
@@ -13,8 +14,9 @@
 //! - `entry == 0` → `InvalidEntry` (null entry point).
 //! - `switch` to same id / non-Ready / unknown id → `NoSwitch` /
 //!   `NotReady` / `Unknown`, never a register write.
-//! - Corrupt table (duplicate id, overlapping stacks, misaligned top)
-//!   → `InvalidTable`, never a register write.
+//! - Corrupt table (duplicate id, overlapping stacks, misaligned top,
+//!   or more than `MAX_THREADS` entries) → `InvalidTable`, never a
+//!   register write.
 //! - Illegal lifecycle (`Done` resurrection, same-state no-op) → refused
 //!   (`false`, no mutation); legal: Ready→Running, Running→Ready (yield),
 //!   Ready→Done (cancel), Running→Done (exit).
@@ -24,6 +26,11 @@
 
 /// Minimum kernel stack: one page (4 KiB).
 pub const MIN_STACK: u64 = 4096;
+
+/// Maximum threads per pick table (bounds the O(n^2) `validate_threads`
+/// scan: 16^2 = 256 pair checks worst case; validate-at-insert or cache
+/// is the documented follow-up if the hot path ever grows past this).
+pub const MAX_THREADS: usize = 16;
 
 /// Thread lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +46,8 @@ pub enum ThreadState {
 /// Validation failure for thread creation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadError {
+    /// Bad id (0 is reserved: null-thread sentinel for the future table).
+    InvalidId,
     /// Bad stack (null base, too small, misaligned, overflow).
     InvalidStack,
     /// Null entry point.
@@ -83,6 +92,9 @@ impl Thread {
         stack_size: u64,
         entry: u64,
     ) -> Result<Self, ThreadError> {
+        if id == 0 {
+            return Err(ThreadError::InvalidId);
+        }
         if stack_base == 0 {
             return Err(ThreadError::InvalidStack);
         }
@@ -171,12 +183,17 @@ impl Thread {
     pub const fn stack_top(self) -> u64 {
         // `new` proved base+size neither overflows nor misaligns, and
         // fields are private so no other construction path exists.
-        // Keep the debug assert so a future bypass fails loudly on host.
+        // Fail loud (not saturating) on the unreachable overflow: u64::MAX
+        // is 16-byte-misaligned so `validate_threads` rejects it instead
+        // of masking the bug with a clamped-but-plausible top.
         debug_assert!(
             self.stack_base.checked_add(self.stack_size).is_some()
                 && (self.stack_base.wrapping_add(self.stack_size) & 0xF) == 0
         );
-        self.stack_base.saturating_add(self.stack_size)
+        match self.stack_base.checked_add(self.stack_size) {
+            Some(t) => t,
+            None => u64::MAX,
+        }
     }
 
     /// Checked stack top: `None` if the range overflows (defensive;
@@ -189,7 +206,11 @@ impl Thread {
 
 /// Table-level validation shared by the picker: duplicate ids, stack
 /// overlaps, and misaligned/overflowing tops all fail closed.
+/// Rejects tables longer than `MAX_THREADS` (bounds the O(n^2) scan).
 pub fn validate_threads(threads: &[Thread]) -> Result<(), SwitchError> {
+    if threads.len() > MAX_THREADS {
+        return Err(SwitchError::InvalidTable);
+    }
     let mut i = 0;
     while i < threads.len() {
         let a = threads[i];
@@ -320,6 +341,44 @@ mod tests {
             Thread::new(1, 0x1000_0000, 8192, 0),
             Err(ThreadError::InvalidEntry)
         );
+    }
+
+    #[test]
+    fn id_zero_reserved_and_table_capped() {
+        // Id 0 is the reserved null-thread sentinel.
+        assert_eq!(
+            Thread::new(0, 0x1000_0000, 8192, 0x1000),
+            Err(ThreadError::InvalidId)
+        );
+        // MAX_THREADS adjacent valid threads pass; one more fails closed.
+        let mut ok_table = [Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap(); MAX_THREADS];
+        let mut i = 0;
+        while i < MAX_THREADS {
+            ok_table[i] = Thread::new(
+                (i as u64) + 1,
+                0x1000_0000 + (i as u64) * 8192,
+                8192,
+                0x1000 + (i as u64),
+            )
+            .unwrap();
+            i += 1;
+        }
+        assert_eq!(validate_threads(&ok_table), Ok(()));
+        let mut big = [Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap(); MAX_THREADS + 1];
+        let mut j = 0;
+        while j < MAX_THREADS + 1 {
+            big[j] = Thread::new(
+                (j as u64) + 1,
+                0x1000_0000 + (j as u64) * 8192,
+                8192,
+                0x1000 + (j as u64),
+            )
+            .unwrap();
+            j += 1;
+        }
+        assert_eq!(validate_threads(&big), Err(SwitchError::InvalidTable));
+        // Over-cap pick refuses before touching registers too.
+        assert_eq!(switch_stub(&big, 1), Err(SwitchError::InvalidTable));
     }
 
     #[test]

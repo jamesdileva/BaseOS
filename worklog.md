@@ -3577,3 +3577,42 @@ Format per entry (per `implementation-guide.md` §31):
   Remaining carried: (b) validate O(n^2) per-pick, (c) id-0/max-threads/
   containment, (d) saturating `stack_top`. Next: slice 3 live swap stub
   + QEMU proof (or id-0 reserve before swap per risk c).
+
+## S06 slice 3 -- id-0 reserve + table cap + fail-loud top (closes REVIEW #277 risks c/d, documents b)
+
+- **Decision:** Close REVIEW #277 carried risks (c)+(d) host-only in
+  `crates/kernel/src/thread.rs` (guest untouched, no QEMU this cycle):
+  (a) `new` rejects `id == 0` with new `ThreadError::InvalidId` (0 is the
+  reserved null-thread sentinel for the future table); (b) new
+  `MAX_THREADS = 16` cap enforced as the first gate in `validate_threads`
+  (over-cap table -> `InvalidTable`, so the picker refuses before any
+  register touch); (c) `stack_top` overflow arm changed from
+  `saturating_add` to `checked_add` with `u64::MAX` sentinel (misaligned,
+  so `validate_threads` rejects it instead of masking the bug with a
+  clamped-but-plausible top); (d) `MAX_THREADS` docs pin the O(n^2) bound
+  (16^2 = 256 pair checks worst case; validate-at-insert or cache is the
+  named follow-up). One new test `id_zero_reserved_and_table_capped`
+  pins InvalidId, MAX-exact valid, MAX+1 InvalidTable on both validate
+  and pick paths.
+- **Why:** Risk (c) named id-0/max/containment as the reserve-before-swap
+  gate; risk (d) named the saturating top as fail-silent in release.
+  Both are host-pinning with zero QEMU risk, so the live-swap slice
+  builds on a reserved id space and a loud top. Stack containment stays
+  deferred (no kernel memory map pin yet -- overlap gate already covers
+  thread-vs-thread).
+- **Alternatives:** Silent `Copy` of saturating form (rejected: clamps to
+  a plausible aligned value, masking the unreachable-bypass bug);
+  `Option<u64>` return for `stack_top` (rejected: breaks the pinned
+  accessor contract; sentinel keeps the shape while failing validation);
+  larger cap like 64 (rejected: 16 bounds the per-pick scan for the
+  pre-scheduler kernel; raising it later is one constant + test).
+- **Expected:** default 113 (112 + 1); kernel 82 (81 + 1); fmt clean;
+  clippy `-D warnings` clean; no QEMU (guest untouched).
+- **Measured (2026-09-30, Win11):** default `cargo test` 113/113
+  (21+82+4+4+2); `-p baseos-kernel` 82/82 (1 new id/cap);
+  `cargo fmt --check` clean (one auto-format: blank line after the cap
+  gate); `cargo clippy -p baseos-kernel --tests -D warnings` clean.
+  Guest untouched; QEMU not re-run (S05 PASS stands by
+  non-interference).
+- **Final:** Carried risks (c)+(d) closed, (b) documented with a bound on
+  the current tree. #9 stays active. Next: live swap stub + QEMU proof.
