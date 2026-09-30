@@ -15,6 +15,9 @@
 //!   `NotReady` / `Unknown`, never a register write.
 //! - Corrupt table (duplicate id, overlapping stacks, misaligned top)
 //!   → `InvalidTable`, never a register write.
+//! - Illegal lifecycle (`Done` resurrection, same-state no-op) → refused
+//!   (`false`, no mutation); legal: Ready→Running, Running→Ready (yield),
+//!   Ready→Done (cancel), Running→Done (exit).
 //!
 //! Fields are private so `new()` cannot be bypassed by struct-literal
 //! construction (closes the S05 pub-widen fail-open pattern).
@@ -143,8 +146,24 @@ impl Thread {
 
     /// Cooperative state transition (the picker itself never mutates;
     /// the caller moves Ready->Running->Done through this gate).
-    pub fn set_state(&mut self, state: ThreadState) {
-        self.state = state;
+    /// Enforced: Ready→Running, Running→Ready (yield), Ready→Done
+    /// (cancel), Running→Done (exit). All other edges — including any
+    /// `Done` resurrection and same-state no-ops — return `false` with
+    /// no mutation (closes the unrestricted-gate risk; picker stays safe
+    /// because it only ever picks `Ready`).
+    #[must_use]
+    pub fn set_state(&mut self, next: ThreadState) -> bool {
+        let ok = matches!(
+            (self.state, next),
+            (ThreadState::Ready, ThreadState::Running)
+                | (ThreadState::Running, ThreadState::Ready)
+                | (ThreadState::Ready, ThreadState::Done)
+                | (ThreadState::Running, ThreadState::Done)
+        );
+        if ok {
+            self.state = next;
+        }
+        ok
     }
 
     /// Stack top (exclusive end). Valid only after `new` succeeds.
@@ -323,16 +342,16 @@ mod tests {
         assert_eq!(switch_stub(&[a, b, c], 1), Ok(2));
         // Skips non-Ready in wrap order: b Running, current=1 -> 3.
         let mut b_run = b;
-        b_run.set_state(ThreadState::Running);
+        assert!(b_run.set_state(ThreadState::Running));
         assert_eq!(switch_stub(&[a, b_run, c], 1), Ok(3));
     }
 
     #[test]
     fn switch_refusals_never_touch_registers() {
         let mut running = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
-        running.set_state(ThreadState::Running);
+        assert!(running.set_state(ThreadState::Running));
         let mut done = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
-        done.set_state(ThreadState::Done);
+        assert!(done.set_state(ThreadState::Done));
         // Nothing Ready (current Running) -> NotReady.
         assert_eq!(switch_stub(&[running, done], 1), Err(SwitchError::NotReady));
         // Unknown current.
@@ -341,6 +360,29 @@ mod tests {
         assert_eq!(switch_stub(&[], 1), Err(SwitchError::Unknown));
         // Only current Ready -> NoSwitch.
         assert_eq!(switch_stub(&[ready, done], 1), Err(SwitchError::NoSwitch));
+    }
+
+    #[test]
+    fn lifecycle_is_enforced_no_resurrection() {
+        let mut t = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        // Same-state no-op refused.
+        assert!(!t.set_state(ThreadState::Ready));
+        assert_eq!(t.state(), ThreadState::Ready);
+        // Dispatch + yield + exit.
+        assert!(t.set_state(ThreadState::Running));
+        assert!(!t.set_state(ThreadState::Running));
+        assert!(t.set_state(ThreadState::Ready));
+        assert!(t.set_state(ThreadState::Running));
+        assert!(t.set_state(ThreadState::Done));
+        // Terminal: any Done edge refused, no mutation.
+        assert!(!t.set_state(ThreadState::Ready));
+        assert!(!t.set_state(ThreadState::Running));
+        assert!(!t.set_state(ThreadState::Done));
+        assert_eq!(t.state(), ThreadState::Done);
+        // Cancel-before-run is legal.
+        let mut u = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
+        assert!(u.set_state(ThreadState::Done));
+        assert!(!u.set_state(ThreadState::Ready));
     }
 
     #[test]

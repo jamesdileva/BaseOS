@@ -3544,3 +3544,36 @@ Format per entry (per `implementation-guide.md` §31):
   stands by non-interference).
 - **Final:** REVIEW #275 risks 1-3 closed on the current tree. #9 stays
   active. Next: slice 2 live swap plus QEMU proof.
+
+## S06 slice 2 -- lifecycle enforcement (closes REVIEW #277 carried risk a)
+
+- **Decision:** Close REVIEW #277 carried risk (a) host-only in
+  `crates/kernel/src/thread.rs` (guest untouched, no QEMU this cycle):
+  `set_state` now enforces Ready->Running, Running->Ready (yield),
+  Ready->Done (cancel), Running->Done (exit) and returns `bool`
+  (`#[must_use]`, `false` with no mutation on any other edge, including
+  all `Done` resurrection and same-state no-ops). Two call sites updated
+  to assert the `true` path; one new test
+  `lifecycle_is_enforced_no_resurrection` pins dispatch/yield/exit,
+  cancel-before-run, and terminal-`Done`.
+- **Why:** REVIEW #277 approved slice-1 hardening @d8f9267 but carried the
+  unrestricted gate as non-blocking risk (a): any->any incl.
+  Done->Ready resurrection; picker stays safe (only Ready picked) but no
+  lifecycle enforcement. Live swap must build on a terminal-`Done`.
+- **Alternatives:** Keep `()` setter + doc-only lifecycle (rejected:
+  invalid state exists before any assert fires, same pattern as the
+  slice-1 pub-field bypass); new error enum over `bool` (rejected: four
+  legal edges vs one refusal need no diagnostics yet; `bool` keeps the
+  gate minimal and host-pinned).
+- **Expected:** default 112 (111 + 1); kernel 81 (80 + 1); fmt clean;
+  clippy `-D warnings` clean; no QEMU (guest untouched).
+- **Measured (2026-09-30, Win11):** default `cargo test` 112/112
+  (21+81+4+4+2); `-p baseos-kernel` 81/81 (1 new lifecycle);
+  workspace 130/130 incl. `-p baseos-boot-uefi` 18/18;
+  `cargo fmt --check` clean; `cargo clippy -p baseos-kernel --tests
+  -D warnings` clean. Guest untouched; QEMU not re-run (S05 PASS
+  stands by non-interference).
+- **Final:** Carried risk (a) closed on the current tree. #9 stays active.
+  Remaining carried: (b) validate O(n^2) per-pick, (c) id-0/max-threads/
+  containment, (d) saturating `stack_top`. Next: slice 3 live swap stub
+  + QEMU proof (or id-0 reserve before swap per risk c).
