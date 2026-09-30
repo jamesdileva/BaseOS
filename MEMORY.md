@@ -3,15 +3,10 @@
 Review before each work segment. Keep ≤20 lines, compact.
 
 - Goal: perf-first x86-64 UEFI desktop OS, Rust-first; docs in repo root.
-- Now: S05 slice8 DONE @be4bb60 (guest UART unify onto kernel::uart;
-  uart_init/com1_write_byte pub safe, guest local port-I/O deleted;
-  guest_uses_kernel_uart_and_cpu_wrappers pin; default 104/104
-  (21+73+4+4+2), boot-uefi 18/18, fmt/clippy clean, QEMU 937B
-  PF+EXC ok=1 guest 85504B -512 behavior-neutral). #6/#7 done, #8 active.
-  Next: S05 close-out. Indep re-run 2026-09-30 confirms 104/18,
-  fmt/clippy host+uefi clean, QEMU 937B PF ok=1 vector=14 EXC ok=1.
-  pub-widen uart_init/com1_write_byte INTENTIONAL for guest reuse
-  (ordering+exclusivity contract, unsafe confined to outb/inb bodies).
+- Now: S05 close-out @5aa60d0 (pub-widen DECISION + needle-tripwire record;
+  builder re-run 104/104 (21+73+4+4+2), boot-uefi 18/18, gate 41/41,
+  fmt/clippy host+uefi clean, QEMU 937B PF+EXC ok=1 guest 85504B).
+  #6/#7 done, #8 active awaiting agent-b indep re-run then S05 close/S06.
 - FRAMEALLOC delta ATTRIBUTED (agent-b #75 f2): 53248B=13p/free=52877
   @7a1ce76 → 53760B=14p/free=52876 — slice6 +512B crossed page boundary;
   2 stable reruns, spans=8 faults=3 unchanged. Not a regression.
