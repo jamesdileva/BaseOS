@@ -3488,3 +3488,28 @@ Format per entry (per `implementation-guide.md` §31):
   Gap (1) remains: agent-b independent cargo+QEMU re-run still owed
   before #8 flips to `done`. Next: agent-b re-run, then S05 close
   (full inventory line re-baseline rides with the closing slice).
+
+## S06 slice 1 -- thread state + stack contract + stub pick (host-only)
+
+- **Decision:** Open S06 (#9) with a host-only, no_std-clean contract in
+  `crates/kernel/src/thread.rs` (`pub mod thread`): `ThreadState`
+  (Ready/Running/Done), `Thread::new` (fail-closed: null base, size <
+  4 KiB, misaligned base, base+size overflow, null entry), `stack_top`,
+  plus pure `switch_stub` round-robin picker (no asm, no state mutation;
+  Unknown/NotReady/NoSwitch refusals). Five host tests. Guest untouched.
+- **Why:** REVIEW #273 required explicit failure/tests scope before
+  activating #9; live register swap rides with slice 2 + QEMU proof, so
+  bad stacks/entries must fail closed on the host first.
+- **Alternatives:** Live asm swap now (rejected: doubles single-cycle
+  risk; contract must exist first); QEMU proof this slice (rejected:
+  guest bytes untouched, prior PASS stands by non-interference).
+- **Expected:** default 109 (104 + 5); kernel 78 (73 + 5); fmt clean;
+  clippy clean; no QEMU.
+- **Measured (2026-09-30, Win11):** default `cargo test` 109/109
+  (21+78+4+4+2); `-p baseos-kernel` 78/78 (5 new thread);
+  `cargo fmt --check` clean (after one auto-format);
+  `cargo clippy -p baseos-kernel --all-targets -D warnings` clean.
+  Guest untouched; QEMU not re-run (S05 PASS stands).
+- **Final:** S06 failure/test scope pinned host-green. #9 active. Next:
+  slice 2 live swap stub + QEMU proof. Carried risks: S05 pub-widen
+  fail-closed decision, COM1 token, hash size-as-signal.
