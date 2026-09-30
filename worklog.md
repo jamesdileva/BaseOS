@@ -3389,3 +3389,46 @@ Format per entry (per `implementation-guide.md` §31):
   serial output identical, no behavior change).
 - **Final:** Read+decode pairs now unified at both definition and call
   sites; #246 gap closed. #8 stays active: next is boot-uefi UART unify.
+
+## S05 slice 8 -- guest UART unify onto `kernel::uart` (+ #248 risk-1 pin)
+
+- **Decision:** Unify guest port I/O onto `kernel::uart`: (a) new pub safe
+  `uart::uart_init` (ex-boot-uefi A3 init sequence, `unsafe` confined to the
+  body over private `outb`/`inb`); promote `uart::com1_write_byte` from
+  `pub(crate)` to `pub`; (b) guest deletes local `outb`/`inb`/`uart_init`/
+  `com1_write_byte` + `COM1_*` consts, `com1_emit` becomes a safe
+  delegation to `kernel::uart::com1_write_byte` (no `unsafe` block);
+  (c) new host test `guest_uses_kernel_uart_and_cpu_wrappers` pins the
+  guest to `kernel::{uart,cpu}` wrappers (concat-built needles so the test
+  source cannot self-match) and closes REVIEW #248 risk 1 (silent revert
+  to `page_table::` decode now fails here); (d) inventory A1-A5 rows
+  re-baselined to the single-owner shape.
+- **Why:** Slices 6-7 unified register reads+decodes in `cpu` but the UART
+  path still had two owners (guest-local `out`/`in` duplicates of the
+  kernel boundary) -- the same drift the boundary exists to prevent.
+  Smallest guest-touching segment: init sequence byte-identical, only the
+  owner moves.
+- **Alternatives:** Keep `uart_init` guest-side and unify only the write
+  path (rejected: leaves two `out` owners; the init sequence is 7 plain
+  register writes with the same single-threaded contract, so moving it is
+  zero extra risk); separate `STITCH`-style serial field for prove-out
+  (rejected: behavior-neutral unify needs no new e2e field -- the existing
+  full chain is the proof).
+- **Expected:** default 104, boot-uefi 18 (17 + 1 new pin), fmt + clippy
+  gates clean, `boot-uefi.ps1` PASS with unchanged serial lines.
+- **Measured (2026-09-30, Win11, rustc 1.98.0):** default 104/104
+  (21+73+4+4+2), `-p baseos-boot-uefi` 18/18, `cargo fmt --check` clean
+  (after auto-format of import order + one long assert), host + `--tests`
+  + UEFI-target clippy exit 0 `-D warnings`; `boot-uefi.ps1` UEFI BOOT
+  PASS exit 0 x2 consecutive runs, serial 937 bytes (marker FOUND,
+  BOOTINFO/MEMMAP/FB/GOP/EBS/KERNEL/FRAMEALLOC/PAGING/PERM/GUARD/
+  PERMAUDIT/PERMAUDIT2/RMBZ/PF+EXC all ok, budget ok=True), guest
+  `bootx64.efi` 85504 bytes (-512 vs 86016 slice-7 baseline -- removes
+  the duplicate port-I/O bodies; serial identical, behavior-neutral).
+  Note: `free=52869 spans=8 faults=3 stitch=5` vs slice-7 `free=52875`
+  is OVMF Usable-map variance across boots (regions=98, map_size=4704,
+  desc_size=48 stable; spans/faults/stitch identical), not a regression.
+- **Final:** Guest holds no port-I/O `unsafe` (only `kernel::uart`
+  owns `in`/`out`); UART read+decode precedent now covers both S05
+  boundaries. #8 stays active (S05 close-out: full line re-baseline +
+  remaining review).

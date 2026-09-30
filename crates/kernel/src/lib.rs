@@ -592,17 +592,19 @@ mod tests {
 
     #[test]
     fn uart_wrappers_are_safe_without_unsafe_block() {
-        // S05 slice 2: the kernel port-I/O boundary is safe wrappers over
-        // private unsafe `outb`/`inb` bodies. Binding to the plain `fn`
-        // type proves safeness at compile time — an `unsafe fn` would not
-        // coerce — without executing port I/O on the host (which would
-        // fault outside the guest).
+        // S05 slice 2 (slice 8: +`uart_init` unified from boot-uefi): the
+        // kernel port-I/O boundary is safe wrappers over private unsafe
+        // `outb`/`inb` bodies. Binding to the plain `fn` type proves
+        // safeness at compile time — an `unsafe fn` would not coerce —
+        // without executing port I/O on the host (which would fault
+        // outside the guest).
+        let init: fn() = uart::uart_init;
         let write_byte: fn(u8) = uart::com1_write_byte;
         let exc: fn(bool, u64) = uart::write_exc_line;
         let pf: fn(bool, u64, u64, u64) = uart::write_pf_line;
         let dec: fn(u64) = uart::write_dec_u64;
         let hex: fn(u64) = uart::write_hex_u64;
-        let _ = (write_byte, exc, pf, dec, hex);
+        let _ = (init, write_byte, exc, pf, dec, hex);
     }
 
     #[test]

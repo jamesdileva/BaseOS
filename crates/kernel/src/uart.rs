@@ -43,14 +43,35 @@ unsafe fn inb(port: u16) -> u8 {
     value
 }
 
+/// Initialize COM1 (16550A, 115200 8N1, FIFOs on) so bytes reach QEMU's
+/// serial backend even if firmware left the UART in an odd state.
+///
+/// Safe wrapper (S05 slice 8 UART unify, ex-boot-uefi A3): the `unsafe`
+/// (port I/O) is confined to this body. Caller contract is ordering +
+/// exclusivity only — call once before any byte on the single-threaded
+/// boot path that exclusively owns COM1.
+pub fn uart_init() {
+    // SAFETY: COM1 UART registers only, always present on the QEMU `pc`
+    // target; single-threaded boot path owns the UART pre-handoff.
+    unsafe {
+        outb(COM1_PORT + 1, 0x00); // Disable interrupts.
+        outb(COM1_PORT + 3, 0x80); // Enable DLAB (set baud-rate divisor).
+        outb(COM1_PORT, 0x01); // Divisor low byte: 115200 baud.
+        outb(COM1_PORT + 1, 0x00); // Divisor high byte.
+        outb(COM1_PORT + 3, 0x03); // 8 data bits, no parity, one stop bit.
+        outb(COM1_PORT + 2, 0xC7); // Enable FIFOs, clear them, 14-byte threshold.
+        outb(COM1_PORT + 4, 0x0B); // DTR + RTS set, IRQs off.
+    }
+}
+
 /// Poll THR-empty, then write one byte to COM1 (post-EBS path: no firmware,
 /// plain port I/O only).
 ///
 /// Safe wrapper: the `unsafe` (port I/O) is confined to this body. Caller
-/// contract is ordering + exclusivity only — COM1 was initialized via the
-/// S01 guest's `uart_init` before `kernel_entry`, and the single-threaded
+/// contract is ordering + exclusivity only — COM1 was initialized via
+/// [`uart_init`] before `kernel_entry`, and the single-threaded
 /// boot/exception path owns the UART.
-pub(crate) fn com1_write_byte(byte: u8) {
+pub fn com1_write_byte(byte: u8) {
     // SAFETY: COM1 initialized pre-handoff; post-EBS COM1 is plain port I/O;
     // polls a read-only status bit, then writes the transmit register.
     unsafe {

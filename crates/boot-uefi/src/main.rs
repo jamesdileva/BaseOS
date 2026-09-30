@@ -23,11 +23,13 @@
 
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
-// SAFETY (unsafe boundary, per `docs/coding-conventions.md`): port I/O
-// (`in`/`out`), `hlt`, and raw UEFI table/service-pointer dereference have
-// no safe equivalent in a `no_std` guest, so they live in this smallest
-// possible hardware boundary behind the safe wrappers `uart_init` /
-// `com1_write_byte` / `fill_boot_info` below. Tested end-to-end by
+// SAFETY (unsafe boundary, per `docs/coding-conventions.md`): `hlt` and raw
+// UEFI table/service-pointer dereference have no safe equivalent in a
+// `no_std` guest, so they live in this smallest possible hardware boundary
+// behind the safe wrappers below (`fill_boot_info`, `com1_emit`). Port I/O
+// (`in`/`out`) lives only in `kernel::uart` (S05 slice 8 unify): the guest
+// calls `kernel::uart::{uart_init, com1_write_byte}` (safe wrappers over
+// private `outb`/`inb` bodies). Tested end-to-end by
 // `tools/qemu/boot-uefi.ps1` (OVMF boot asserts the marker and the BOOTINFO
 // summary in the QEMU serial capture).
 #![allow(unsafe_code)]
@@ -39,17 +41,11 @@ use baseos_kernel::page_table::{
     guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
     walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
 };
+use baseos_kernel::uart::{com1_write_byte, uart_init};
 use baseos_serial_marker::write_marker;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 use core::{arch::asm, convert::Infallible};
-
-/// COM1 base port (QEMU `-serial file:` backend captures these bytes).
-const COM1_PORT: u16 = 0x3F8;
-/// Line-status-register offset; bit 5 (THR empty) gates each write.
-const COM1_LSR: u16 = COM1_PORT + 5;
-/// Bit 5 of the LSR: transmitter holding register empty.
-const LSR_THR_EMPTY: u8 = 0x20;
 
 /// Byte offset of `BootServices` in `EFI_SYSTEM_TABLE` on x86-64
 /// (header 24 + vendor 8 + revision 4 + pad 4 + six handles/pointers 48 +
@@ -142,70 +138,15 @@ const MEMMAP_BUF_LEN: usize = 16384;
 /// overflow buffer instead of growing this static.
 static mut MEMMAP_BUF: [u8; MEMMAP_BUF_LEN] = [0; MEMMAP_BUF_LEN];
 
-/// Write one byte to an ISA I/O port.
-///
-/// # Safety
-/// Caller must pass a valid, writable port for this platform (here: COM1
-/// UART registers, always present on the QEMU `pc` target).
-#[inline(always)]
-unsafe fn outb(port: u16, value: u8) {
-    asm!(
-        "out dx, al",
-        in("dx") port,
-        in("al") value,
-        options(nomem, nostack, preserves_flags),
-    );
-}
-
-/// Read one byte from an ISA I/O port.
-///
-/// # Safety
-/// Same contract as [`outb`]: caller passes a readable port (COM1 LSR).
-#[inline(always)]
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    asm!(
-        "in al, dx",
-        out("al") value,
-        in("dx") port,
-        options(nomem, nostack, preserves_flags),
-    );
-    value
-}
-
-/// Initialize COM1 (16550A, 115200 8N1, FIFOs on) so the marker reaches
-/// QEMU's serial backend even if firmware left the UART in an odd state.
-///
-/// # Safety
-/// Writes COM1 UART registers only; call once before any byte is written.
-unsafe fn uart_init() {
-    outb(COM1_PORT + 1, 0x00); // Disable interrupts.
-    outb(COM1_PORT + 3, 0x80); // Enable DLAB (set baud-rate divisor).
-    outb(COM1_PORT, 0x01); // Divisor low byte: 115200 baud.
-    outb(COM1_PORT + 1, 0x00); // Divisor high byte.
-    outb(COM1_PORT + 3, 0x03); // 8 data bits, no parity, one stop bit.
-    outb(COM1_PORT + 2, 0xC7); // Enable FIFOs, clear them, 14-byte threshold.
-    outb(COM1_PORT + 4, 0x0B); // DTR + RTS set, IRQs off.
-}
-
-/// Write one byte to COM1, polling for THR-empty first.
-///
-/// # Safety
-/// COM1 must have been initialized via [`uart_init`]; polls a read-only
-/// status bit, then writes the transmit register.
-unsafe fn com1_write_byte(byte: u8) {
-    while inb(COM1_LSR) & LSR_THR_EMPTY == 0 {}
-    outb(COM1_PORT, byte);
-}
-
 /// COM1 byte sink matching the `write_marker` / `write_boot_summary`
 /// callback style (infallible: UART polling cannot fail).
+///
+/// S05 slice 8 UART unify: safe delegation to `kernel::uart::com1_write_byte`
+/// (raw `in`/`out` lives only in `kernel::uart::outb`/`inb` now; the guest
+/// holds no port-I/O `unsafe`). COM1 was initialized via `kernel::uart::uart_init`
+/// once in `efi_main` before any emission; single-threaded boot owns the UART.
 fn com1_emit(byte: u8) -> Result<(), Infallible> {
-    // SAFETY: single-threaded boot environment, COM1 is ours exclusively;
-    // `uart_init` ran once in `efi_main` before any emission.
-    unsafe {
-        com1_write_byte(byte);
-    }
+    com1_write_byte(byte);
     Ok(())
 }
 
@@ -1828,6 +1769,44 @@ mod tests {
         // Proof the stand really drove the outgrown-map branch (required
         // map_size > 16 KiB), not a generic raw error.
         assert!(REQUIRED_MAP_SIZE.load(Ordering::Relaxed) > MEMMAP_BUF_LEN);
+    }
+
+    #[test]
+    fn guest_uses_kernel_uart_and_cpu_wrappers() {
+        // S05 slice 8 UART unify (+ REVIEW #248 risk 1 for decode): pin the
+        // guest to the `kernel::{uart, cpu}` wrappers so a silent revert to
+        // local port-I/O or `page_table::` decode fails here, not in review.
+        // Needles are built via `concat` so this test's own source does not
+        // contain them verbatim (else negative asserts would self-match).
+        const SRC: &str = include_str!("main.rs");
+        let uart_use = ["kernel:", ":uart"].concat();
+        assert!(
+            SRC.contains(&uart_use),
+            "guest must import kernel uart wrappers"
+        );
+        let cr3_wrap = ["cr3_pml4_", "base"].concat();
+        let nxe_wrap = ["efer_nxe_", "enabled"].concat();
+        assert!(
+            SRC.contains(&cr3_wrap) && SRC.contains(&nxe_wrap),
+            "guest must decode via cpu wrappers"
+        );
+        let forbidden: Vec<(String, &str)> = vec![
+            (["unsafe fn out", "b"].concat(), "local outb"),
+            (["unsafe fn in", "b"].concat(), "local inb"),
+            (["unsafe fn uart_", "init"].concat(), "local uart_init"),
+            (
+                ["unsafe fn com1_write_", "byte"].concat(),
+                "local com1_write_byte",
+            ),
+            (["page_table:", ":cr3_decode"].concat(), "page_table decode"),
+            (
+                ["page_table:", ":efer_nxe_enabled"].concat(),
+                "page_table nxe",
+            ),
+        ];
+        for (needle, label) in &forbidden {
+            assert!(!SRC.contains(needle), "guest must not contain {label}");
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Unsafe inventory — S05 slice 1 baseline @bfc4790, slice 2 + slice 3 deltas noted
+# Unsafe inventory — S05 slice 1 baseline @bfc4790, slices 2+3+8 deltas noted
 
 Scope: exhaustive over `crates/` for `unsafe`, `asm!`/`global_asm!`,
 raw-pointer ops (`read_unaligned`, `from_raw_parts`, `addr_of[_mut]`,
@@ -31,11 +31,11 @@ rides with the slice that closes S05. Slice 3 moved D1/D2 (+ tables) from
 
 | # | Site | Why unsafe | Invariant / caller contract | Proof |
 |---|---|---|---|---|
-| A1 | boot-uefi `outb` (151, `asm! out dx,al`) | `out` touches hardware directly | Caller passes a COM1 UART register; QEMU `pc` target always has COM1 | QEMU serial bytes |
-| A2 | boot-uefi `inb` (165, `asm! in al,dx`) | `in` reads hardware directly | Caller passes a readable port (COM1 LSR) | THR-empty poll never hangs on QEMU |
-| A3 | boot-uefi `uart_init` (181) | Programs UART divisor/line/FIFO regs | Call once before any byte; single-threaded boot | Marker FOUND on every boot |
-| A4 | boot-uefi `com1_write_byte` (196) | LSR poll + TX write | `uart_init` ran; exclusive owner (pre-EBS boot thread) | All serial lines |
-| A5 | boot-uefi `com1_emit` (203, safe wrapper, `unsafe` block 206) | Bridges infallible sink style to A4 | Same as A4, by construction at `efi_main` | `write_marker`/`write_boot_summary` output |
+| A1 | kernel `uart::outb` (private unsafe body; slice 8 unify: sole `out` site, ex-boot-uefi A1 removed) | `out` touches hardware directly | Caller passes a COM1 UART register; QEMU `pc` target always has COM1 | QEMU serial bytes |
+| A2 | kernel `uart::inb` (private unsafe body; slice 8 unify: sole `in` site, ex-boot-uefi A2 removed) | `in` reads hardware directly | Caller passes a readable port (COM1 LSR) | THR-empty poll never hangs on QEMU |
+| A3 | kernel `uart::uart_init` (safe wrapper; slice 8 unify: moved from boot-uefi 181, guest calls `kernel::uart::uart_init`) | Programs UART divisor/line/FIFO regs | Call once before any byte; single-threaded boot | Marker FOUND on every boot |
+| A4 | kernel `uart::com1_write_byte` (safe wrapper; slice 8 unify: guest calls `kernel::uart::com1_write_byte`, ex-boot-uefi 196 removed) | LSR poll + TX write | `uart_init` ran; exclusive owner (pre-EBS boot thread) | All serial lines |
+| A5 | boot-uefi `com1_emit` (safe delegation to kernel A4, no `unsafe` block since slice 8) | Bridges infallible sink style to A4 | Same as A4, by construction at `efi_main` | `write_marker`/`write_boot_summary` output |
 | A6 | kernel `uart::outb/uart::inb` (private unsafe bodies) + safe `uart::com1_write_byte` (slice 2 @this-slice, was lib.rs 248/262/279 @bfc4790) | Post-EBS copy of A1/A2/A4 (firmware gone, same UART) | S01 `uart_init` ran pre-handoff; post-EBS COM1 is plain port I/O; `unsafe` confined to `outb`/`inb` bodies, callers safe | `EXC`/`PF` lines post-EBS |
 | A7 | kernel `uart::write_exc_line`, `uart::write_pf_line`, `uart::write_dec_u64`, `uart::write_hex_u64` (safe wrappers, slice 2 @this-slice, was lib.rs 290/365/390/411 @bfc4790) | Interrupt-context writers, cannot use caller sink | COM1 initialized; single-threaded exception context owns UART; host pin `uart_wrappers_are_safe_without_unsafe_block` proves `fn` (not `unsafe fn`) type | `EXC`/`PF` e2e gates |
 
@@ -91,8 +91,7 @@ the guest but with heap `Vec` fakes, so no firmware/hardware is touched.
   `VECTOR_DE` 0 / `VECTOR_PF` 14 / `EXCEPTION_VECTORS` 32,
   `PF_PROBE_ADDR` 0x500000000000, COM1 `0x3F8`/`+5`/`0x20`.
 
-Follow-ups (not this slice): boot-uefi UART unify with
-`kernel::uart` (pre-EBS `uart_init` stays guest-side); per-site invariant
+Follow-ups (not this slice): per-site invariant
 docs beyond this table. Done: port-I/O safe wrappers (slice 2), CPU
 gate/probe safe wrappers `gate_for` / `probe_addr_valid` (slice 3),
 selector-pin enforcement + agreement test (slice 4), single-source probe
@@ -100,5 +99,7 @@ guard + pure CR3/EFER decode wrappers `cr3_pml4_base` / `efer_nxe_enabled`
 (slice 5, host-only — live reads stay D7/D8), live register reads
 `read_cr3` / `read_efer` moved into `cpu` (slice 6 — probes
 call `kernel::cpu::read_*`), read+decode call-site unification onto
-`cpu::cr3_pml4_base` / `cpu::efer_nxe_enabled` (slice 7, this slice —
-REVIEW #246 wiring gap closed; UART unify next).
+`cpu::cr3_pml4_base` / `cpu::efer_nxe_enabled` (slice 7 — REVIEW #246
+wiring gap closed), guest port-I/O unification onto
+`kernel::uart::{uart_init, com1_write_byte}` (slice 8, this slice —
+guest holds no `out`/`in` `unsafe`; pre-EBS init included).
