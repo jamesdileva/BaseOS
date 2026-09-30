@@ -403,6 +403,17 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
 /// restore. A bad `RSP` triple-faults or `#PF`s and the e2e script fails
 /// on the missing `THREAD` lines — fail-loud, never silent.
 ///
+/// REVIEW #287 risk 1 (must-fix): the template names literal `r15` as
+/// scratch, which the register allocator does NOT reserve on its own —
+/// a plain `in(reg)` input could itself be allocated in `r15`, so
+/// `push r15` would spill the input, `mov r15,rsp` would destroy it, and
+/// `mov rsp,{top}` / `call {func}` could load garbage. The body below
+/// declares `out("r15") _` so the allocator excludes `r15` from both
+/// inputs (conservative: the push/pop actually preserves `r15`, but
+/// claiming it clobbered is sound — the compiler simply saves around us
+/// if it needed `r15`). Do not remove that line without a
+/// `cargo show-asm` / regalloc-stress disproof.
+///
 /// # Safety
 /// See contract above. Host `cargo test` builds compile this out (the
 /// host harness must never execute `mov rsp, ...`).
@@ -417,6 +428,7 @@ pub unsafe fn run_on_thread_stack(new_top: u64, func: extern "C" fn()) {
         "pop r15",
         top = in(reg) new_top,
         func = in(reg) func,
+        out("r15") _,
         clobber_abi("C"),
     );
 }
@@ -758,5 +770,28 @@ mod tests {
         // probe's second parameter type.
         let f: extern "C" fn() = dummy_thread_entry;
         let _ = f;
+    }
+
+    #[test]
+    fn swap_entry_round_trips_through_u64() {
+        // REVIEW #287 risk 2 host half: the guest calls through the `entry`
+        // half of the `swap_target` triple (u64 -> fn transmute), not a
+        // direct reference. Pin the round-trip host-side: fn -> u64 ->
+        // fn preserves the address and stays callable (called here on the
+        // host stack — no RSP swap — to prove the transmute shape).
+        extern "C" fn probe_entry() {}
+        let addr = probe_entry as *const () as u64;
+        assert_ne!(addr, 0);
+        let back: extern "C" fn() = unsafe { core::mem::transmute(addr as *const ()) };
+        back();
+        // And the `swap_target` triple carries a round-trippable entry:
+        // store a real fn address as the entry and resolve it back.
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        let b = Thread::new(2, 0x2000_0000, 8192, addr).unwrap();
+        let (id, _top, entry) = swap_target(&[a, b], 1).unwrap();
+        assert_eq!(id, 2);
+        assert_eq!(entry, addr);
+        let back2: extern "C" fn() = unsafe { core::mem::transmute(entry as *const ()) };
+        back2();
     }
 }

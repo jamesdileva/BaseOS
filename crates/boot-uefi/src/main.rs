@@ -884,8 +884,14 @@ fn write_thread_line<E>(
 
 /// Live thread-stack swap post-`ExitBootServices`: build two descriptors
 /// from the static stacks, resolve the round-robin target through
-/// `swap_target` (the same gate future `swap` asm must use), run
-/// `thread_b_entry` on the target stack, and emit the `THREAD` line.
+/// `swap_target` (the same gate future `swap` asm must use), run the
+/// returned `entry` on the target stack, and emit the `THREAD` line.
+///
+/// REVIEW #287 risk 2: the call goes through the `entry` half of the
+/// `swap_target` triple (transmuted to `extern "C" fn()`), not a direct
+/// `thread_b_entry` reference — the emitted `entry=` hex is the address
+/// actually called, so the triple is proven callable end-to-end. A null
+/// or garbage `entry` faults loudly (missing lines fail e2e).
 ///
 /// Returns the `(ok, id, top, entry)` the line reports. Never panics.
 ///
@@ -916,7 +922,12 @@ unsafe fn probe_thread_swap<E>(
             return Ok((false, 0, 0, 0));
         }
     };
-    run_on_thread_stack(top, thread_b_entry);
+    if entry == 0 {
+        write_thread_line::<E>(false, 0, 0, 0, emit)?;
+        return Ok((false, 0, 0, 0));
+    }
+    let func: extern "C" fn() = core::mem::transmute(entry as *const ());
+    run_on_thread_stack(top, func);
     write_thread_line::<E>(true, id, top, entry, emit)?;
     Ok((true, id, top, entry))
 }
@@ -962,6 +973,11 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
         let (ebs_ok, ebs_status) = exit_boot_services(image_handle, system_table, map_key);
         write_ebs_line(ebs_ok, ebs_status);
         if ebs_ok {
+            // REVIEW #287 risk 3: the post-EBS `cli in effect` contract was
+            // doc-only (zero `cli` in the tree). Mask interrupts here, once,
+            // before any post-EBS probe — the thread swap, paging audits,
+            // and GDT/IDT bring-up below all run with IRQs masked.
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
             kernel_entry::<Infallible>(&info, &mut emit).unwrap();
             // S03 #5: post-EBS, COM1-only frame-allocator stress proof
             // (`FRAMEALLOC ok=1` hard-required by boot-uefi.ps1) before

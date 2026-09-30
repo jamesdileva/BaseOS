@@ -3755,3 +3755,13 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Live `RSP` swap proven end-to-end with fail-loud lines. #9
   stays active. Next: save/restore callee-saved regs + round-trip
   switch-back stress.
+
+
+## S06 slice8 -- REVIEW #287 risks 1-3: R15 reserve + entry-through call + post-EBS cli (2026-09-30)
+
+- **Decision:** Close all three REVIEW #287 risks in one minimal guest slice: (a) risk 1 (must-fix) -- kernel/thread.rs run_on_thread_stack asm gains out("r15") _ so the allocator excludes literal-r15 scratch from both in(reg) inputs (conservative: push/pop preserves r15, claiming clobber is sound), with inline docs recording the collision and the do-not-remove rule; (b) risk 2 -- boot-uefi/main.rs probe_thread_swap transmutes the returned entry half (entry as ptr -> extern C fn, null-checked) and calls THAT on the new RSP, so the emitted entry= hex is the address actually executed (plus host test swap_entry_round_trips_through_u64 pinning fn->u64->fn callability); (c) risk 3 -- efi_main executes one cli immediately after successful EBS before any post-EBS probe, making the documented cli-in-effect contract true (was doc-only, zero cli in tree).
+- **Why:** Agent-b REVIEW #287 APPROVED slice7 @94e59e6 but named exactly these three risks for slice8 in value order; R15 collision is soundness (single QEMU PASS cannot disprove misallocation), entry-half was reporting-only, cli was contract-without-instruction.
+- **Alternatives:** Pin inputs to fixed regs (in r14 / in r12) instead of out r15 (rejected: narrower than a reservation -- future input growth re-opens the hole); assert entry == thread_b_entry without calling through it (rejected: still reporting-only, not a callability proof); defer cli to the bring-up slice (rejected: thread probe already documents cli, one instruction now closes all callers).
+- **Expected:** default 119 (118 + 1); kernel 88 (87 + 1); boot-uefi 18; fmt clean; clippy host + UEFI exit 0; boot-uefi.ps1 PASS with THREAD ok=1 + THREAD-RUN id=2 + PF/EXC.
+- **Measured (2026-09-30, Win11):** default cargo test 119/119 (21+88+4+4+2); -p baseos-kernel 88/88 (new: entry round-trip); -p baseos-boot-uefi 18/18; cargo fmt --check clean; cargo clippy --all-targets -- -D warnings exit 0; cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings exit 0; boot-uefi.ps1 UEFI BOOT PASS exit 0 (guest 91648 bytes, serial 1000 bytes: marker FOUND, BOOTINFO/MEMMAP/FB/GOP/EBS/KERNEL/FRAMEALLOC/PAGING/PERM/GUARD/PERMAUDIT/PERMAUDIT2/RMBZ all ok, THREAD-RUN id=2 then THREAD ok=1 id=2 top/entry hex, PF ok=1 vector=14 chained to EXC ok=1 vector=0).
+- **Final:** REVIEW #287 risks 1-3 closed on-tree. #9 stays active. Next: callee-saved save/restore + round-trip stress.
