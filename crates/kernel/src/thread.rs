@@ -8,13 +8,16 @@
 //! - `stack_base == 0` → `InvalidStack` (null).
 //! - `stack_size < MIN_STACK` (4 KiB) or `stack_size == 0` → `InvalidStack`.
 //! - `stack_base` not 16-byte aligned → `InvalidStack` (ABI requirement).
-//! - `stack_base + stack_size` overflow → `InvalidStack`.
+//! - `stack_size` not 16-byte aligned → `InvalidStack` (keeps top aligned).
+//! - `stack_base + stack_size` overflow or misaligned top → `InvalidStack`.
 //! - `entry == 0` → `InvalidEntry` (null entry point).
 //! - `switch` to same id / non-Ready / unknown id → `NoSwitch` /
 //!   `NotReady` / `Unknown`, never a register write.
+//! - Corrupt table (duplicate id, overlapping stacks, misaligned top)
+//!   → `InvalidTable`, never a register write.
 //!
-//! `switch_stub` is a pure next-thread picker (round-robin over Ready)
-//! with zero asm — the real register swap rides with slice 2 + QEMU proof.
+//! Fields are private so `new()` cannot be bypassed by struct-literal
+//! construction (closes the S05 pub-widen fail-open pattern).
 
 /// Minimum kernel stack: one page (4 KiB).
 pub const MIN_STACK: u64 = 4096;
@@ -48,21 +51,24 @@ pub enum SwitchError {
     NotReady,
     /// Target is already current (no-op refused loudly).
     NoSwitch,
+    /// Corrupt table: duplicate id, overlapping stacks, or misaligned top.
+    InvalidTable,
 }
 
 /// One kernel thread descriptor (data only, no registers yet).
+/// Fields are private: construct only via [`Thread::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Thread {
     /// Small thread id (index into a future table).
-    pub id: u64,
+    id: u64,
     /// Current lifecycle state.
-    pub state: ThreadState,
+    state: ThreadState,
     /// Stack low address (inclusive).
-    pub stack_base: u64,
+    stack_base: u64,
     /// Stack size in bytes.
-    pub stack_size: u64,
+    stack_size: u64,
     /// Entry point address (guest `fn()` target).
-    pub entry: u64,
+    entry: u64,
 }
 
 impl Thread {
@@ -83,7 +89,14 @@ impl Thread {
         if stack_base & 0xF != 0 {
             return Err(ThreadError::InvalidStack);
         }
-        if stack_base.checked_add(stack_size).is_none() {
+        if stack_size & 0xF != 0 {
+            return Err(ThreadError::InvalidStack);
+        }
+        let top = match stack_base.checked_add(stack_size) {
+            Some(t) => t,
+            None => return Err(ThreadError::InvalidStack),
+        };
+        if top & 0xF != 0 {
             return Err(ThreadError::InvalidStack);
         }
         if entry == 0 {
@@ -98,62 +111,141 @@ impl Thread {
         })
     }
 
+    /// Thread id.
+    #[must_use]
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+
+    /// Current lifecycle state.
+    #[must_use]
+    pub const fn state(self) -> ThreadState {
+        self.state
+    }
+
+    /// Stack low address (inclusive).
+    #[must_use]
+    pub const fn stack_base(self) -> u64 {
+        self.stack_base
+    }
+
+    /// Stack size in bytes.
+    #[must_use]
+    pub const fn stack_size(self) -> u64 {
+        self.stack_size
+    }
+
+    /// Entry point address.
+    #[must_use]
+    pub const fn entry(self) -> u64 {
+        self.entry
+    }
+
+    /// Cooperative state transition (the picker itself never mutates;
+    /// the caller moves Ready->Running->Done through this gate).
+    pub fn set_state(&mut self, state: ThreadState) {
+        self.state = state;
+    }
+
     /// Stack top (exclusive end). Valid only after `new` succeeds.
     #[must_use]
     pub const fn stack_top(self) -> u64 {
-        // `new` already proved no overflow, so saturating add == exact add.
+        // `new` proved base+size neither overflows nor misaligns, and
+        // fields are private so no other construction path exists.
+        // Keep the debug assert so a future bypass fails loudly on host.
+        debug_assert!(
+            self.stack_base.checked_add(self.stack_size).is_some()
+                && (self.stack_base.wrapping_add(self.stack_size) & 0xF) == 0
+        );
         self.stack_base.saturating_add(self.stack_size)
+    }
+
+    /// Checked stack top: `None` if the range overflows (defensive;
+    /// `None` is unreachable for `new()`-built threads).
+    #[must_use]
+    pub const fn checked_top(self) -> Option<u64> {
+        self.stack_base.checked_add(self.stack_size)
     }
 }
 
-/// Pure cooperative pick: first `Ready` thread with `id != current`,
-/// round-robin by id order of the slice. No asm, no state mutation —
-/// the caller performs the state transition after a successful pick.
+/// Table-level validation shared by the picker: duplicate ids, stack
+/// overlaps, and misaligned/overflowing tops all fail closed.
+pub fn validate_threads(threads: &[Thread]) -> Result<(), SwitchError> {
+    let mut i = 0;
+    while i < threads.len() {
+        let a = threads[i];
+        let a_top = match a.checked_top() {
+            Some(t) => t,
+            None => return Err(SwitchError::InvalidTable),
+        };
+        if a_top & 0xF != 0 {
+            return Err(SwitchError::InvalidTable);
+        }
+        let mut j = 0;
+        while j < threads.len() {
+            if i != j {
+                let b = threads[j];
+                if a.id == b.id {
+                    return Err(SwitchError::InvalidTable);
+                }
+                let b_top = match b.checked_top() {
+                    Some(t) => t,
+                    None => return Err(SwitchError::InvalidTable),
+                };
+                // Half-open overlap: [base, top).
+                if a.stack_base < b_top && b.stack_base < a_top {
+                    return Err(SwitchError::InvalidTable);
+                }
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Pure cooperative pick: true round-robin in slice order — the first
+/// `Ready` thread after `current` (wrapping), not the lowest id.
+/// No asm, no state mutation — the caller performs the state transition
+/// after a successful pick via [`Thread::set_state`].
 ///
 /// Errors: empty table → `Unknown`; current unknown → `Unknown`;
+/// corrupt table (duplicate id / overlap / bad top) → `InvalidTable`;
 /// no other `Ready` thread → `NotReady` (or `NoSwitch` when the only
 /// `Ready` thread is current).
 pub fn switch_stub(threads: &[Thread], current: u64) -> Result<u64, SwitchError> {
     if threads.is_empty() {
         return Err(SwitchError::Unknown);
     }
-    let mut found_current = false;
-    for t in threads {
-        if t.id == current {
-            found_current = true;
+    validate_threads(threads)?;
+    let mut current_idx: Option<usize> = None;
+    let mut i = 0;
+    while i < threads.len() {
+        if threads[i].id == current {
+            current_idx = Some(i);
             break;
         }
+        i += 1;
     }
-    if !found_current {
-        return Err(SwitchError::Unknown);
-    }
-    // Collect candidates: Ready and not current, lowest id first.
-    let mut best: Option<u64> = None;
-    for t in threads {
+    let start = match current_idx {
+        Some(idx) => idx,
+        None => return Err(SwitchError::Unknown),
+    };
+    // Scan forward from current, wrapping: true RR in slice order.
+    let mut step = 1;
+    while step <= threads.len() {
+        let t = threads[(start + step) % threads.len()];
         if t.id != current && t.state == ThreadState::Ready {
-            match best {
-                None => best = Some(t.id),
-                Some(b) => {
-                    if t.id < b {
-                        best = Some(t.id);
-                    }
-                }
-            }
+            return Ok(t.id);
         }
+        step += 1;
     }
-    match best {
-        Some(id) => Ok(id),
-        None => {
-            // Distinguish "only current is Ready" (no-op) from "nothing Ready".
-            let current_ready = threads
-                .iter()
-                .any(|t| t.id == current && t.state == ThreadState::Ready);
-            if current_ready {
-                Err(SwitchError::NoSwitch)
-            } else {
-                Err(SwitchError::NotReady)
-            }
-        }
+    // No other Ready thread: distinguish no-op from nothing-Ready.
+    let current_ready = threads[start].state == ThreadState::Ready;
+    if current_ready {
+        Err(SwitchError::NoSwitch)
+    } else {
+        Err(SwitchError::NotReady)
     }
 }
 
@@ -164,8 +256,10 @@ mod tests {
     #[test]
     fn valid_thread_reports_stack_top() {
         let t = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
-        assert_eq!(t.state, ThreadState::Ready);
+        assert_eq!(t.state(), ThreadState::Ready);
+        assert_eq!(t.id(), 1);
         assert_eq!(t.stack_top(), 0x1000_0000 + 8192);
+        assert_eq!(t.checked_top(), Some(0x1000_0000 + 8192));
     }
 
     #[test]
@@ -187,6 +281,11 @@ mod tests {
         // Misaligned base.
         assert_eq!(
             Thread::new(1, 0x1000_0001, 8192, 0x1000),
+            Err(ThreadError::InvalidStack)
+        );
+        // Misaligned size (top would break 16B ABI).
+        assert_eq!(
+            Thread::new(1, 0x1000_0000, 5000, 0x1000),
             Err(ThreadError::InvalidStack)
         );
         // Overflow.
@@ -213,11 +312,27 @@ mod tests {
     }
 
     #[test]
+    fn switch_is_true_round_robin_in_slice_order() {
+        // Review #275 counterexample: [1,2,3] current=2 must yield 3
+        // (next in slice order), not 1 (lowest id).
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        let b = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
+        let c = Thread::new(3, 0x3000_0000, 8192, 0x3000).unwrap();
+        assert_eq!(switch_stub(&[a, b, c], 2), Ok(3));
+        assert_eq!(switch_stub(&[a, b, c], 3), Ok(1));
+        assert_eq!(switch_stub(&[a, b, c], 1), Ok(2));
+        // Skips non-Ready in wrap order: b Running, current=1 -> 3.
+        let mut b_run = b;
+        b_run.set_state(ThreadState::Running);
+        assert_eq!(switch_stub(&[a, b_run, c], 1), Ok(3));
+    }
+
+    #[test]
     fn switch_refusals_never_touch_registers() {
         let mut running = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
-        running.state = ThreadState::Running;
+        running.set_state(ThreadState::Running);
         let mut done = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
-        done.state = ThreadState::Done;
+        done.set_state(ThreadState::Done);
         // Nothing Ready (current Running) -> NotReady.
         assert_eq!(switch_stub(&[running, done], 1), Err(SwitchError::NotReady));
         // Unknown current.
@@ -226,5 +341,21 @@ mod tests {
         assert_eq!(switch_stub(&[], 1), Err(SwitchError::Unknown));
         // Only current Ready -> NoSwitch.
         assert_eq!(switch_stub(&[ready, done], 1), Err(SwitchError::NoSwitch));
+    }
+
+    #[test]
+    fn corrupt_tables_fail_closed_before_pick() {
+        // Duplicate id.
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        let dup = Thread::new(1, 0x2000_0000, 8192, 0x2000).unwrap();
+        assert_eq!(switch_stub(&[a, dup], 1), Err(SwitchError::InvalidTable));
+        assert_eq!(validate_threads(&[a, dup]), Err(SwitchError::InvalidTable));
+        // Overlapping stacks.
+        let b = Thread::new(2, 0x1000_0800, 8192, 0x2000).unwrap();
+        assert_eq!(switch_stub(&[a, b], 1), Err(SwitchError::InvalidTable));
+        // Adjacent (touching but not overlapping) is valid.
+        let c = Thread::new(2, 0x1000_0000 + 8192, 8192, 0x2000).unwrap();
+        assert_eq!(validate_threads(&[a, c]), Ok(()));
+        assert_eq!(switch_stub(&[a, c], 1), Ok(2));
     }
 }

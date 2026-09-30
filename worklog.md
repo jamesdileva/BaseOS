@@ -3513,3 +3513,34 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** S06 failure/test scope pinned host-green. #9 active. Next:
   slice 2 live swap stub + QEMU proof. Carried risks: S05 pub-widen
   fail-closed decision, COM1 token, hash size-as-signal.
+
+## S06 slice 1 hardening -- REVIEW #275 risks 1-3 (true RR + private fields + table validation)
+
+- **Decision:** Close all three REVIEW #275 blockers host-only in
+  `crates/kernel/src/thread.rs` (guest untouched, no QEMU this cycle):
+  (a) risk 1 -- `switch_stub` is now true round-robin in slice order
+  (first Ready after current, wrapping) instead of lowest-id pick;
+  (b) risk 2 -- `Thread` fields made private with accessors plus
+  `set_state` gate, `checked_top` helper, and `debug_assert` on
+  `stack_top` (struct-literal bypass closed); (c) risk 3 -- `new`
+  rejects misaligned size and `validate_threads` (duplicate-id /
+  overlap / bad-top) fails closed as `InvalidTable`, wired into the
+  picker; adjacent stacks stay valid.
+- **Why:** REVIEW #275 verified d159e15 but held slice 2 on exactly these
+  three gaps (doc claimed RR, pub fields bypassed `new`, no table
+  checks); cheapest disconfirm is the named host tests, keeping the
+  live-swap plus QEMU slice wiring-only.
+- **Alternatives:** Rename to pick-lowest-ready (rejected: roadmap needs
+  RR for slice 2); keep pub fields plus debug_assert only (rejected:
+  assert fires after invalid state exists); table checks only in slice 2
+  (rejected: picker must already refuse corrupt tables).
+- **Expected:** default 111 (109 + 2); kernel 80 (78 + 2); fmt clean;
+  clippy `-D warnings` clean; no QEMU (guest untouched).
+- **Measured (2026-09-30, Win11):** default `cargo test` 111/111
+  (21+80+4+4+2); `-p baseos-kernel` 80/80 (2 new: RR order plus
+  corrupt-table); `cargo fmt --check` clean (after one auto-format);
+  `cargo clippy -p baseos-kernel --all-targets -D warnings` clean (one
+  double_must_use fix). Guest untouched; QEMU not re-run (S05 PASS
+  stands by non-interference).
+- **Final:** REVIEW #275 risks 1-3 closed on the current tree. #9 stays
+  active. Next: slice 2 live swap plus QEMU proof.
