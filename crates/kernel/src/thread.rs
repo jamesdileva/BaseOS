@@ -14,9 +14,9 @@
 //! - `entry == 0` → `InvalidEntry` (null entry point).
 //! - `switch` to same id / non-Ready / unknown id → `NoSwitch` /
 //!   `NotReady` / `Unknown`, never a register write.
-//! - Corrupt table (duplicate id, overlapping stacks, misaligned top,
-//!   or more than `MAX_THREADS` entries) → `InvalidTable`, never a
-//!   register write.
+//! - Corrupt table (duplicate id, id 0 smuggled in, overlapping stacks,
+//!   misaligned top, or more than `MAX_THREADS` entries) → `InvalidTable`,
+//!   never a register write.
 //! - Illegal lifecycle (`Done` resurrection, same-state no-op) → refused
 //!   (`false`, no mutation); legal: Ready→Running, Running→Ready (yield),
 //!   Ready→Done (cancel), Running→Done (exit).
@@ -63,7 +63,8 @@ pub enum SwitchError {
     NotReady,
     /// Target is already current (no-op refused loudly).
     NoSwitch,
-    /// Corrupt table: duplicate id, overlapping stacks, or misaligned top.
+    /// Corrupt table: duplicate id, smuggled id 0, overlapping stacks,
+    /// misaligned/overflowing top, or more than `MAX_THREADS` entries.
     InvalidTable,
 }
 
@@ -206,7 +207,10 @@ impl Thread {
 
 /// Table-level validation shared by the picker: duplicate ids, stack
 /// overlaps, and misaligned/overflowing tops all fail closed.
-/// Rejects tables longer than `MAX_THREADS` (bounds the O(n^2) scan).
+/// Rejects tables longer than `MAX_THREADS` (bounds the O(n^2) scan)
+/// and any `id == 0` entry (the reserved null-thread sentinel can only
+/// enter via a bypass/deserialize path since `new()` rejects it —
+/// validated here so it can never become a pick/swap target).
 pub fn validate_threads(threads: &[Thread]) -> Result<(), SwitchError> {
     if threads.len() > MAX_THREADS {
         return Err(SwitchError::InvalidTable);
@@ -214,6 +218,9 @@ pub fn validate_threads(threads: &[Thread]) -> Result<(), SwitchError> {
     let mut i = 0;
     while i < threads.len() {
         let a = threads[i];
+        if a.id == 0 {
+            return Err(SwitchError::InvalidTable);
+        }
         let a_top = match a.checked_top() {
             Some(t) => t,
             None => return Err(SwitchError::InvalidTable),
@@ -250,7 +257,8 @@ pub fn validate_threads(threads: &[Thread]) -> Result<(), SwitchError> {
 /// after a successful pick via [`Thread::set_state`].
 ///
 /// Errors: empty table → `Unknown`; current unknown → `Unknown`;
-/// corrupt table (duplicate id / overlap / bad top) → `InvalidTable`;
+/// corrupt table (duplicate id / smuggled id 0 / overlap / bad top /
+/// over `MAX_THREADS`) → `InvalidTable`;
 /// no other `Ready` thread → `NotReady` (or `NoSwitch` when the only
 /// `Ready` thread is current).
 pub fn switch_stub(threads: &[Thread], current: u64) -> Result<u64, SwitchError> {
@@ -287,6 +295,39 @@ pub fn switch_stub(threads: &[Thread], current: u64) -> Result<u64, SwitchError>
     } else {
         Err(SwitchError::NotReady)
     }
+}
+
+/// Live-swap target resolution (host-testable half of the future `swap`
+/// stub; still no asm, no register writes).
+///
+/// Contract the guest `swap` asm MUST obey: resolve through this function
+/// (or equivalently `validate_threads` + `checked_top`) BEFORE touching
+/// `RSP` — never `stack_top()` alone. `stack_top()` fail-loud sentinel
+/// `u64::MAX` is 16-byte-misaligned precisely so a bypass is rejected
+/// here, but `u64::MAX` as a raw `RSP` would be lethal, so only the
+/// `checked_top()` `Some(top)` value below ever leaves this function.
+///
+/// Returns `(next_id, next_stack_top, next_entry)` for the same
+/// round-robin target `switch_stub` would pick. Any refusal
+/// (`Unknown`/`NotReady`/`NoSwitch`/`InvalidTable`, including a `None`
+/// top or a misaligned top) yields `Err` with no values to load.
+pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), SwitchError> {
+    let next = switch_stub(threads, current)?;
+    let mut i = 0;
+    while i < threads.len() {
+        if threads[i].id == next {
+            let top = match threads[i].checked_top() {
+                Some(t) => t,
+                None => return Err(SwitchError::InvalidTable),
+            };
+            if top & 0xF != 0 {
+                return Err(SwitchError::InvalidTable);
+            }
+            return Ok((next, top, threads[i].entry));
+        }
+        i += 1;
+    }
+    Err(SwitchError::Unknown)
 }
 
 #[cfg(test)]
@@ -451,6 +492,27 @@ mod tests {
         let dup = Thread::new(1, 0x2000_0000, 8192, 0x2000).unwrap();
         assert_eq!(switch_stub(&[a, dup], 1), Err(SwitchError::InvalidTable));
         assert_eq!(validate_threads(&[a, dup]), Err(SwitchError::InvalidTable));
+        // Smuggled id 0 (bypasses `new()` via struct literal — the test
+        // module can name private fields; outside code cannot).
+        let smuggled = Thread {
+            id: 0,
+            state: ThreadState::Ready,
+            stack_base: 0x3000_0000,
+            stack_size: 8192,
+            entry: 0x3000,
+        };
+        assert_eq!(
+            validate_threads(&[a, smuggled]),
+            Err(SwitchError::InvalidTable)
+        );
+        assert_eq!(
+            switch_stub(&[a, smuggled], 1),
+            Err(SwitchError::InvalidTable)
+        );
+        assert_eq!(
+            swap_target(&[a, smuggled], 1),
+            Err(SwitchError::InvalidTable)
+        );
         // Overlapping stacks.
         let b = Thread::new(2, 0x1000_0800, 8192, 0x2000).unwrap();
         assert_eq!(switch_stub(&[a, b], 1), Err(SwitchError::InvalidTable));
@@ -458,5 +520,21 @@ mod tests {
         let c = Thread::new(2, 0x1000_0000 + 8192, 8192, 0x2000).unwrap();
         assert_eq!(validate_threads(&[a, c]), Ok(()));
         assert_eq!(switch_stub(&[a, c], 1), Ok(2));
+    }
+
+    #[test]
+    fn swap_target_resolves_checked_top_and_entry() {
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        let b = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
+        // Same RR target as the picker, plus the only RSP-safe top.
+        assert_eq!(swap_target(&[a, b], 1), Ok((2, 0x2000_0000 + 8192, 0x2000)));
+        assert_eq!(swap_target(&[a, b], 2), Ok((1, 0x1000_0000 + 8192, 0x1000)));
+        // Refusals carry no values to load into registers.
+        let mut running = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        assert!(running.set_state(ThreadState::Running));
+        let mut done = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
+        assert!(done.set_state(ThreadState::Done));
+        assert_eq!(swap_target(&[running, done], 1), Err(SwitchError::NotReady));
+        assert_eq!(swap_target(&[], 1), Err(SwitchError::Unknown));
     }
 }

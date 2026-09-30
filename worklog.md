@@ -3616,3 +3616,33 @@ Format per entry (per `implementation-guide.md` §31):
   non-interference).
 - **Final:** Carried risks (c)+(d) closed, (b) documented with a bound on
   the current tree. #9 stays active. Next: live swap stub + QEMU proof.
+
+## S06 slice4 — swap-target resolution + id-0 smuggle gate + QEMU (2026-09-30)
+
+- **Decision:** Close all three REVIEW #279 notes in one host-testable
+  slice, still no asm: (a) new `swap_target(threads, current) ->
+  (next_id, stack_top, entry)` resolving through `switch_stub` then
+  `checked_top` (never `stack_top()` alone), so the `u64::MAX` sentinel
+  can never reach a future `RSP` load — any `None`/misaligned top
+  returns `InvalidTable` with no values; (b) `validate_threads`
+  defensively rejects `id == 0` (struct-literal smuggle path; `new()`
+  already rejects), pinned by a test-only literal; (c) `SwitchError::
+  InvalidTable` doc now names id-0 + MAX cap. Guest untouched; QEMU
+  re-run as non-interference proof.
+- **Why:** #279 approved slice3 but made these the cheapest disconfirm
+  before live asm: lethal-RSP, sentinel smuggle, stale doc. All are
+  unit-test-only with zero guest risk.
+- **Alternatives:** Take `&mut` threads and mutate state in swap_target
+  (rejected: picker stays pure; caller moves via `set_state` gate);
+  return `Option` instead of `Result` (rejected: refusal reason needed
+  for serial diagnosability); live RSP asm now (rejected: needs guest
+  stacks + QEMU fault proof — next slice).
+- **Expected:** default 114 (113 + 1); kernel 83 (82 + 1); fmt/clippy
+  clean; QEMU PASS unchanged.
+- **Measured (2026-09-30, Win11):** default `cargo test` 114/114
+  (21+83+4+4+2); `-p baseos-kernel` 83/83 (1 new swap test, 1 extended
+  corrupt-table); `cargo fmt --check` clean (one auto-format);
+  host + UEFI `clippy -D warnings` exit 0; `boot-uefi.ps1` UEFI BOOT
+  PASS (serial 937B, guest 85504B, PF+EXC ok=1).
+- **Final:** #279 notes closed on-tree. #9 stays active. Next: live RSP
+  swap asm + QEMU fault proof.
