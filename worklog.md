@@ -3682,3 +3682,33 @@ Format per entry (per `implementation-guide.md` §31):
   auto-format); `cargo clippy --all-targets -- -D warnings` exit 0.
 - **Final:** #281 gap closed on-tree. #9 stays active. Next: live RSP
   swap asm + QEMU fault proof.
+
+## S06 slice6 — shared stack/entry gate closes REVIEW #283 solo-check gap (2026-09-30)
+
+- **Decision:** Close the REVIEW #283 must-fix before live RSP asm in one
+  host-testable slice, still no asm: (a) factor `check_stack_entry()`
+  (base==0, size<MIN_STACK, base/size 16B align, overflow/top-align,
+  entry==0) as the single source shared by `new()` / `validate_threads()`
+  / `swap_target()` — `new()` delegates via `match` (no `?` in `const fn`),
+  `validate_threads` maps any `Err` to `InvalidTable`, `swap_target`'s
+  post-`switch_stub` defense-in-depth re-check calls the full gate instead
+  of entry==0 + top-only; (b) one new test
+  `swap_target_solo_gate_matches_new_invariants` pins the two load-bearing
+  top-only bypasses (16 B size, misaligned-base-with-aligned-top) against
+  the shared gate + `new()` agreement. Guest untouched.
+- **Why:** #283 approved slice5 but showed the solo re-check passes an
+  aligned `top` from a 16 B or misaligned-base stack, so a future
+  `validate_threads` bypass would still hand asm a lethal/unsafe RSP.
+  Cheapest disconfirm is the shared-gate + two-literal test, not
+  inspection.
+- **Alternatives:** Live RSP asm in the same commit (rejected: needs guest
+  stacks + QEMU fault proof — next slice, now unblocked); duplicate the
+  five checks inline in `swap_target` (rejected: drift risk — one function
+  keeps new/validate/swap in lockstep).
+- **Expected:** default 116 (115 + 1); kernel 85 (84 + 1); fmt/clippy
+  clean; QEMU unchanged (guest untouched).
+- **Measured (2026-09-30, Win11):** default `cargo test` 116/116
+  (21+85+4+4+2); `cargo fmt --check` clean;
+  `cargo clippy --all-targets -- -D warnings` exit 0.
+- **Final:** #283 gap closed on-tree. #9 stays active. Next: live RSP
+  swap asm + QEMU fault proof.

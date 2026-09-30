@@ -87,6 +87,45 @@ pub struct Thread {
     entry: u64,
 }
 
+/// Shared stack+entry gate: the exact `new()` invariants for the
+/// load-bearing values future `swap` asm will consume as RSP/RIP.
+///
+/// Single source (REVIEW #283 must-fix): `new()`, `validate_threads()`,
+/// and `swap_target()` all enforce this one function, so the
+/// defense-in-depth re-check in `swap_target` cannot drift back to a
+/// top-only gate (a 16 B stack or a misaligned-base-with-aligned-top
+/// yields an aligned `top` that passes a solo top check but is
+/// lethal/unsafe as a live RSP).
+const fn check_stack_entry(
+    stack_base: u64,
+    stack_size: u64,
+    entry: u64,
+) -> Result<(), ThreadError> {
+    if stack_base == 0 {
+        return Err(ThreadError::InvalidStack);
+    }
+    if stack_size < MIN_STACK {
+        return Err(ThreadError::InvalidStack);
+    }
+    if stack_base & 0xF != 0 {
+        return Err(ThreadError::InvalidStack);
+    }
+    if stack_size & 0xF != 0 {
+        return Err(ThreadError::InvalidStack);
+    }
+    let top = match stack_base.checked_add(stack_size) {
+        Some(t) => t,
+        None => return Err(ThreadError::InvalidStack),
+    };
+    if top & 0xF != 0 {
+        return Err(ThreadError::InvalidStack);
+    }
+    if entry == 0 {
+        return Err(ThreadError::InvalidEntry);
+    }
+    Ok(())
+}
+
 impl Thread {
     /// Validate stack + entry, returning the descriptor on success.
     /// Pure `core`-only so host tests and the guest share one rule.
@@ -99,27 +138,9 @@ impl Thread {
         if id == 0 {
             return Err(ThreadError::InvalidId);
         }
-        if stack_base == 0 {
-            return Err(ThreadError::InvalidStack);
-        }
-        if stack_size < MIN_STACK {
-            return Err(ThreadError::InvalidStack);
-        }
-        if stack_base & 0xF != 0 {
-            return Err(ThreadError::InvalidStack);
-        }
-        if stack_size & 0xF != 0 {
-            return Err(ThreadError::InvalidStack);
-        }
-        let top = match stack_base.checked_add(stack_size) {
-            Some(t) => t,
-            None => return Err(ThreadError::InvalidStack),
-        };
-        if top & 0xF != 0 {
-            return Err(ThreadError::InvalidStack);
-        }
-        if entry == 0 {
-            return Err(ThreadError::InvalidEntry);
+        match check_stack_entry(stack_base, stack_size, entry) {
+            Ok(()) => {}
+            Err(e) => return Err(e),
         }
         Ok(Self {
             id,
@@ -230,19 +251,9 @@ pub fn validate_threads(threads: &[Thread]) -> Result<(), SwitchError> {
         if a.id == 0 {
             return Err(SwitchError::InvalidTable);
         }
-        if a.stack_base == 0 {
-            return Err(SwitchError::InvalidTable);
-        }
-        if a.stack_size < MIN_STACK {
-            return Err(SwitchError::InvalidTable);
-        }
-        if a.stack_base & 0xF != 0 {
-            return Err(SwitchError::InvalidTable);
-        }
-        if a.stack_size & 0xF != 0 {
-            return Err(SwitchError::InvalidTable);
-        }
-        if a.entry == 0 {
+        // Full `new()` stack+entry invariants via the shared gate
+        // (REVIEW #283: `swap_target` solo re-check must match this).
+        if check_stack_entry(a.stack_base, a.stack_size, a.entry).is_err() {
             return Err(SwitchError::InvalidTable);
         }
         let a_top = match a.checked_top() {
@@ -342,9 +353,17 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
     while i < threads.len() {
         if threads[i].id == next {
             // Defense-in-depth: `switch_stub` already ran `validate_threads`,
-            // but re-check the load-bearing values before handing them to
-            // future asm (same rationale as the id-0 gate).
-            if threads[i].entry == 0 {
+            // but re-check the FULL `new()` invariants via the shared gate
+            // before handing values to future asm (REVIEW #283: a top-only
+            // re-check passes a 16 B stack or a misaligned-base-with-
+            // aligned-top as an aligned `top`, which is lethal as RSP).
+            if check_stack_entry(
+                threads[i].stack_base,
+                threads[i].stack_size,
+                threads[i].entry,
+            )
+            .is_err()
+            {
                 return Err(SwitchError::InvalidTable);
             }
             let top = match threads[i].checked_top() {
@@ -612,6 +631,33 @@ mod tests {
             assert_eq!(swap_target(&[a, bad], 1), Err(SwitchError::InvalidTable));
             k += 1;
         }
+    }
+
+    #[test]
+    fn swap_target_solo_gate_matches_new_invariants() {
+        // REVIEW #283: the old `swap_target` solo re-check (entry==0 +
+        // top None/align only) passes both cases below with an aligned
+        // `top`, so a future `validate_threads` bypass would hand asm a
+        // lethal/unsafe RSP. The shared `check_stack_entry` gate must
+        // reject them exactly as `new()` does.
+        assert_eq!(
+            check_stack_entry(0x2000_0000, 16, 0x2000),
+            Err(ThreadError::InvalidStack)
+        );
+        assert_eq!(
+            check_stack_entry(0x2000_0001, 8191, 0x2000),
+            Err(ThreadError::InvalidStack)
+        );
+        // Sanity: valid triple passes, and `new()` agrees on all three.
+        assert_eq!(check_stack_entry(0x2000_0000, 8192, 0x2000), Ok(()));
+        assert_eq!(
+            Thread::new(9, 0x2000_0000, 16, 0x2000),
+            Err(ThreadError::InvalidStack)
+        );
+        assert_eq!(
+            Thread::new(9, 0x2000_0001, 8191, 0x2000),
+            Err(ThreadError::InvalidStack)
+        );
     }
 
     #[test]
