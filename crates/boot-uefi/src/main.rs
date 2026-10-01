@@ -857,6 +857,47 @@ extern "C" fn thread_b_entry() {
     let _ = write_str(&mut emit, "THREAD-RUN id=2\n");
 }
 
+// S06 slice 9: naked hostile callee — trashes the callee-saved set
+// (`rbx`, `rbp`, `r12`-`r14`) then returns. `global_asm` (no compiler
+// prologue/epilogue), so the trash is real as seen by the caller:
+// `run_on_thread_stack`'s caller-stack push/pop must undo it, or the
+// boot thread corrupts within a few stress iterations (fail-loud via
+// missing `THREAD-CS` line, never silent).
+#[cfg(not(test))]
+core::arch::global_asm!(
+    r#"
+    .global thread_clobber_asm
+    thread_clobber_asm:
+        movabs rbx, 0xDEADDEADDEADDEAD
+        movabs rbp, 0xBEEFBEEFBEEFBEEF
+        movabs r12, 0x1212121212121212
+        movabs r13, 0x1313131313131313
+        movabs r14, 0x1414141414141414
+        ret
+"#
+);
+
+#[cfg(not(test))]
+extern "C" {
+    fn thread_clobber_asm();
+}
+
+/// Emit the one-line `THREAD-CS` diagnostic: `THREAD-CS ok=<0|1> iter=<n>`
+/// — `ok` is 1 only when the 16-iteration clobber stress loop ran on the
+/// swap-target stack and returned every time.
+#[cfg(not(test))]
+fn write_thread_cs_line<E>(
+    ok: bool,
+    iters: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "THREAD-CS ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " iter=")?;
+    write_u64_dec(emit, iters)?;
+    write_str(emit, "\n")
+}
+
 /// Emit the one-line `THREAD` diagnostic after the `RMBZ` line:
 /// `THREAD ok=<0|1> id=<n> top=<0x...> entry=<0x...>` — `ok` is 1 only
 /// when two `Thread::new` descriptors validated, `swap_target` resolved,
@@ -932,6 +973,67 @@ unsafe fn probe_thread_swap<E>(
     Ok((true, id, top, entry))
 }
 
+/// S06 slice 9 callee-saved stress: resolve the same `swap_target` triple,
+/// then run the naked clobber stub on the target stack 16 times through
+/// `run_on_thread_stack` and emit the `THREAD-CS` line. Any push/pop
+/// imbalance (or missing callee-saved spill) corrupts the caller stack
+/// within a few iterations and faults loudly (missing lines fail e2e).
+/// Returns `Ok(true)` only on the full 16-iteration run. Never panics.
+///
+/// # Safety
+/// Post-EBS only, same contract as [`probe_thread_swap`]: owns the static
+/// stacks, `cli` in effect, COM1 exclusive.
+#[allow(unused_variables)]
+unsafe fn probe_thread_callee_saved<E>(
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<bool, E> {
+    #[cfg(not(test))]
+    {
+        let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
+        let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
+        let entry_b = thread_b_entry as *const () as u64;
+        let (a, b) = match (
+            Thread::new(1, base_a, 8192, 0x1000),
+            Thread::new(2, base_b, 8192, entry_b),
+        ) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                write_thread_cs_line::<E>(false, 0, emit)?;
+                return Ok(false);
+            }
+        };
+        let (_, top, _) = match swap_target(&[a, b], 1) {
+            Ok(t) => t,
+            Err(_) => {
+                write_thread_cs_line::<E>(false, 0, emit)?;
+                return Ok(false);
+            }
+        };
+        // `thread_clobber_asm` is a naked asm stub (unsafe foreign fn
+        // under this toolchain); it only writes the callee-saved regs
+        // and returns, and `run_on_thread_stack` preserves exactly that
+        // set on the caller stack — so calling it as a safe fn pointer
+        // is sound here. Same transmute idiom as `probe_thread_swap`.
+        let clobber_addr = thread_clobber_asm as *const () as usize as u64;
+        if clobber_addr == 0 {
+            write_thread_cs_line::<E>(false, 0, emit)?;
+            return Ok(false);
+        }
+        let clobber: extern "C" fn() = unsafe { core::mem::transmute(clobber_addr as *const ()) };
+        let mut k = 0;
+        while k < 16 {
+            run_on_thread_stack(top, clobber);
+            k += 1;
+        }
+        write_thread_cs_line::<E>(true, 16, emit)?;
+        Ok(true)
+    }
+    #[cfg(test)]
+    {
+        Ok(true)
+    }
+}
+
 /// UEFI entry point: marker, memory-map + framebuffer fill, summary,
 /// `ExitBootServices`, kernel handoff + CPU bring-up, park.
 ///
@@ -977,7 +1079,9 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // doc-only (zero `cli` in the tree). Mask interrupts here, once,
             // before any post-EBS probe — the thread swap, paging audits,
             // and GDT/IDT bring-up below all run with IRQs masked.
-            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+            // Agent-b REVIEW #289 nit: `cli` clears IF so `preserves_flags`
+            // is false — `options(nomem, nostack)` only.
+            core::arch::asm!("cli", options(nomem, nostack));
             kernel_entry::<Infallible>(&info, &mut emit).unwrap();
             // S03 #5: post-EBS, COM1-only frame-allocator stress proof
             // (`FRAMEALLOC ok=1` hard-required by boot-uefi.ps1) before
@@ -1037,6 +1141,9 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // `thread_b_entry` there (THREAD-RUN line), restore, report
             // THREAD ok=1. Faults loudly (missing lines) on a bad RSP.
             let _ = probe_thread_swap::<Infallible>(&mut emit);
+            // S06 slice 9: callee-saved stress — 16 clobber swaps on the
+            // same target stack, THREAD-CS ok=1 iter=16 (fail-loud).
+            let _ = probe_thread_callee_saved::<Infallible>(&mut emit);
             baseos_kernel::bring_up_cpu_and_prove_exception();
         }
         // EBS failed: still own boot services — park fail-loud (e2e sees

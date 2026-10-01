@@ -380,7 +380,7 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
     Err(SwitchError::Unknown)
 }
 
-/// Live RSP swap probe (S06 slice 7): run `func` on `new_top`, then
+/// Live RSP swap probe (S06 slices 7-9): run `func` on `new_top`, then
 /// restore the caller stack.
 ///
 /// Contract the guest MUST obey: `new_top` is the `Some(top)` value from
@@ -403,6 +403,13 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
 /// restore. A bad `RSP` triple-faults or `#PF`s and the e2e script fails
 /// on the missing `THREAD` lines — fail-loud, never silent.
 ///
+/// Slice 9: the probe additionally preserves the full callee-saved set
+/// (`rbx`, `rbp`, `r12`-`r14`; `r15` via the spill above) with symmetric
+/// `push`/`pop` on the caller stack, so a hostile callee that trashes
+/// them cannot corrupt the boot thread. Push order is the pop order
+/// reversed (balanced by construction); the e2e `THREAD-CS` stress loop
+/// calls a naked clobber stub 16 times and fails loudly on any imbalance.
+///
 /// REVIEW #287 risk 1 (must-fix): the template names literal `r15` as
 /// scratch, which the register allocator does NOT reserve on its own —
 /// a plain `in(reg)` input could itself be allocated in `r15`, so
@@ -421,10 +428,20 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
 pub unsafe fn run_on_thread_stack(new_top: u64, func: extern "C" fn()) {
     core::arch::asm!(
         "push r15",
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
         "mov r15, rsp",
         "mov rsp, {top}",
         "call {func}",
         "mov rsp, r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
         "pop r15",
         top = in(reg) new_top,
         func = in(reg) func,
@@ -793,5 +810,31 @@ mod tests {
         assert_eq!(entry, addr);
         let back2: extern "C" fn() = unsafe { core::mem::transmute(entry as *const ()) };
         back2();
+    }
+
+    #[test]
+    fn swap_target_round_trip_stress() {
+        // S06 slice 9: ping-pong the round-robin target 1024 times; the
+        // triple must be bit-stable every iteration (no hidden counter or
+        // first-call-only path in the picker). Also pins the callee-saved
+        // contract the guest asm upholds: both tops stay 16-byte aligned
+        // and nonzero-entry across the whole run.
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        let b = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
+        let pair = [a, b];
+        let mut current = 1u64;
+        let mut i = 0;
+        while i < 1024 {
+            let (id, top, entry) = swap_target(&pair, current).unwrap();
+            if current == 1 {
+                assert_eq!((id, top, entry), (2, 0x2000_0000 + 8192, 0x2000));
+            } else {
+                assert_eq!((id, top, entry), (1, 0x1000_0000 + 8192, 0x1000));
+            }
+            assert_eq!(top & 0xF, 0);
+            assert_ne!(entry, 0);
+            current = id;
+            i += 1;
+        }
     }
 }

@@ -208,6 +208,7 @@ if ($serialText -and $serialText.Contains($marker)) {
   $rmbzPat = "RMBZ ok=1 [^\r\n]*viol=0(\s|$)"
   $thread = "THREAD ok=1"
   $threadRun = "THREAD-RUN id=2"
+  $threadCs = "THREAD-CS ok=1 iter=16"
   $exc = "EXC ok=1 vector=0"
   # S04 #168n6 live-#PF (REVIEW #229 cheapest disconfirm): the guest touches
   # the unmapped PF_PROBE_ADDR guard, so the PF stub must emit
@@ -260,11 +261,12 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasRmbz = [regex]::IsMatch($serialText, $rmbzPat)
   $hasThread = $serialText.Contains($thread)
   $hasThreadRun = $serialText.Contains($threadRun)
+  $hasThreadCs = $serialText.Contains($threadCs)
   $hasPf = [regex]::IsMatch($serialText, $pfPat)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasPf -and $hasExc) {
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasPf -and $hasExc) {
     Write-Output ("Boot summary: FOUND (" + $bootinfo + " + " + $memmap + " + " + $notrunc + " + " + $mapsize + " + " + $descsize + " + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + PF ok=1 vector=14 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + PF ok=1 vector=14 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -283,6 +285,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "RMBZ ok=1 viol-shape present=$hasRmbz, " +
       "THREAD ok=1 present=$hasThread, " +
       "THREAD-RUN id=2 present=$hasThreadRun, " +
+      "THREAD-CS ok=1 iter=16 present=$hasThreadCs, " +
       "PF ok=1 vector=14-shape present=$hasPf, " +
       "EXC ok=1 vector=0 present=$hasExc; " +
       "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/frame-alloc/#PF/#DE path failed " +
