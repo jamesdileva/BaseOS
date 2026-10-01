@@ -283,6 +283,10 @@ mod tests {
         assert!(s.spawn(mk(2, 0x2000_0000)));
         assert_eq!(s.state_of(1), Some(ThreadState::Ready));
         assert_eq!(s.state_of(2), Some(ThreadState::Ready));
+        // REVIEW #328 residual (b): unknown id queries `None` (read-only,
+        // never a default state) — before and after dispatch.
+        assert_eq!(s.state_of(99), None);
+        assert_eq!(s.state_of(NULL_THREAD), None);
         assert_eq!(s.dispatch(), Ok(2));
         assert_eq!(s.current(), 2);
         assert_eq!(s.state_of(1), Some(ThreadState::Ready));
@@ -292,6 +296,7 @@ mod tests {
         assert_eq!(s.current(), 1);
         assert_eq!(s.state_of(2), Some(ThreadState::Ready));
         assert_eq!(s.state_of(1), Some(ThreadState::Running));
+        assert_eq!(s.state_of(99), None);
     }
 
     /// Strip `/* ... */` (nested), `//` line comments, and blank string/char
@@ -306,6 +311,15 @@ mod tests {
     /// `Cell/*"Cell"*/<` rejoins to `Cell<` (quote in comment is inert)
     /// and `"/*Cell*/" Cell<` keeps the literal blank but the trailing
     /// code token (string markers never start a comment).
+    ///
+    /// Slice 17b (REVIEW #328 residuals a): additionally blank raw strings
+    /// (`r"..."`, `r#"..."#`, `r##"..."##`, same with a `br` prefix — no
+    /// escapes, close is `"` + the opening `#` count) and treat lifetimes
+    /// (`'a`, `'static`) as code, not char literals. Without this a raw
+    /// `r"/*Cell*/"` literal would start a phantom block comment (swallows
+    /// real code to the next `*/`) and a lifetime `'a` would open a phantom
+    /// char literal (swallows code to the next `'`), both desyncing the
+    /// `Cell` pin in exactly the way gate 1 was built to prevent.
     #[cfg(test)]
     fn strip_code(src: &str) -> String {
         let bytes = src.as_bytes();
@@ -327,6 +341,48 @@ mod tests {
                     i += 1;
                 }
                 continue;
+            }
+            // Raw string open: `[b]r#*"`. Hash count pins the close
+            // (`"` + that many `#`); content is raw (no escapes).
+            let r_pos = if bytes[i] == b'r' {
+                Some(i)
+            } else if bytes[i] == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'r' {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(rp) = r_pos {
+                let mut k = rp + 1;
+                while k < bytes.len() && bytes[k] == b'#' {
+                    k += 1;
+                }
+                if k < bytes.len() && bytes[k] == b'"' {
+                    let hashes = k - (rp + 1);
+                    out.push('"');
+                    i = k + 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'"' {
+                            let mut m = i + 1;
+                            let mut n = 0;
+                            while n < hashes && m < bytes.len() && bytes[m] == b'#' {
+                                m += 1;
+                                n += 1;
+                            }
+                            if n == hashes {
+                                out.push('"');
+                                i = m;
+                                break;
+                            }
+                            i += 1;
+                        } else {
+                            if bytes[i] == b'\n' {
+                                out.push('\n');
+                            }
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
             }
             let b = bytes[i];
             if b == b'"' {
@@ -353,6 +409,19 @@ mod tests {
                 continue;
             }
             if b == b'\'' {
+                // Lifetime vs char literal (residual a): only `'x'` and
+                // `'\'`-escape shapes are char literals. A lone `'a` /
+                // `'static` (quote + ident with no closing quote in the
+                // next-two positions) is a lifetime and stays CODE — the
+                // old unconditional literal mode swallowed code to the
+                // next `'` and desynced the pin.
+                let is_single = i + 2 < bytes.len() && bytes[i + 2] == b'\'';
+                let is_escape = i + 1 < bytes.len() && bytes[i + 1] == b'\\';
+                if !is_single && !is_escape {
+                    out.push('\'');
+                    i += 1;
+                    continue;
+                }
                 out.push('\'');
                 i += 1;
                 while i < bytes.len() {
@@ -408,6 +477,25 @@ mod tests {
         assert!(strip_code("/* o /* i */ s */Cell<").contains("Cell<"));
         assert!(!strip_code("\"Cell<\"").contains("Cell<"));
         assert!(!strip_code("// Cell<").contains("Cell<"));
+        // REVIEW #328 residual (a) disproof: raw strings are raw — block
+        // markers and quotes inside never start a comment or a string, and
+        // the trailing code token survives.
+        let r = strip_code("r\"/*Cell*/\" Cell<");
+        assert!(r.contains("Cell<"));
+        assert!(!r.contains("/*"));
+        let r_hash = strip_code("r#\"\"Cell<\"# Cell<");
+        assert!(r_hash.contains("Cell<"));
+        assert!(!strip_code("r#\"Cell<\"#").contains("Cell<"));
+        // Lifetimes are code, not char literals: `'a` must not swallow to
+        // the next `'` (which would hide a real `Cell<` or expose a fake).
+        let l = strip_code("fn f<'a>(x: &'a str) Cell<");
+        assert!(l.contains("Cell<"));
+        // Old unconditional-literal mode blanked `'a Cell<'` as one literal
+        // and hid the code token; lifetime-aware mode keeps it.
+        assert!(strip_code("'a Cell<'").contains("Cell<"));
+        // Sanity: real char literals still blank.
+        assert!(!strip_code("'C'").contains("Cell<"));
+        assert!(strip_code("'C' Cell<").contains("Cell<"));
     }
 
     #[test]
