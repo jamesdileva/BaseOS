@@ -431,6 +431,16 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
 /// if it needed them). Do not remove those lines without a
 /// `cargo show-asm` / regalloc-stress disproof.
 ///
+/// Slice 13 correction (REVIEW #299 risk 1 premise was inverted):
+/// plain `out` FORBIDS the allocator from placing any `in(reg)` input in
+/// an output reg; `lateout` would ALLOW that overlap (late outputs may
+/// reuse input regs once inputs are consumed). Since `mov rax, rsp`
+/// runs BEFORE `save`/`top` are consumed, `lateout` lets an input sit
+/// in `rax` and get clobbered — tried empirically, QEMU FAIL
+/// (`THREAD-SAVE ok=0 save=0x0`, slot never written though the call
+/// ran). Plain `out` is the sound choice here; kept after the
+/// revert + full QEMU PASS (see worklog).
+///
 /// # Safety
 /// See contract above. Host `cargo test` builds compile this out (the
 /// host harness must never execute `mov rsp, ...`).
@@ -512,7 +522,10 @@ pub unsafe fn run_on_thread_stack_with_save(
     // Same reservation rule as `run_on_thread_stack`: `rbx`/`rbp` need no
     // `out` (LLVM-reserved / frame pointer, compiler rejects the `out`);
     // every other literal reg touched (`r12`-`r15` + `rax`/`rdx` scratch)
-    // is declared `out` so inputs are never allocated there.
+    // is declared plain `out` so inputs are never allocated there
+    // (slice 13: `lateout` would ALLOW input/output overlap and `mov
+    // rax, rsp` first would clobber an input sitting in `rax` — tried,
+    // QEMU FAIL save=0x0; reverted).
     core::arch::asm!(
         "push r15",
         "push rbx",
@@ -560,6 +573,105 @@ pub unsafe fn run_on_thread_stack_with_save(
     _func: extern "C" fn(),
 ) {
     if old_save.is_null() {}
+}
+
+/// Slot-to-slot `RSP` switch (S06 slice 13): like
+/// [`run_on_thread_stack_with_save`], but the target `RSP` is LOADED from
+/// caller-owned memory (`[new_save]`) instead of arriving as an immediate
+/// top. This is the missing LOAD half REVIEW #299 demanded: `mov rdx,
+/// [new]` runs in asm from thread context, so a nested B->A hop proves a
+/// saved boot `RSP` is usable as a live stack pointer, not just stored.
+///
+/// Mechanism: caller-saved pushes (same six), `mov [old_save], rax`
+/// spills the current `RSP` while still on the current stack; `mov rdx,
+/// [new_save]` loads the target `RSP` from memory in asm (explicit
+/// memory-source load, single-threaded boot so no TOCTOU); `mov rsp, rdx`
+/// switches; `push rax` (old `RSP`) + `push old_save` (pointer spill, the
+/// slice-10 lesson: post-`call` recovery never depends on a register
+/// surviving the hostile callee); `call func`; `pop rdx` + `pop rax`;
+/// `mov rsp, rax`; caller-saved pops. Fail-closed in Rust before the asm:
+/// null `old_save`/`new_save`, or a zero/misaligned `[new_save]` target,
+/// returns with no register or stack touch (host-testable).
+///
+/// # Safety
+/// Same contract as [`run_on_thread_stack`]: guest-only, post-EBS, `cli`
+/// in effect, `new_save` points at a slot previously written by
+/// [`run_on_thread_stack_with_save`] or this function (nonzero,
+/// 16-byte-aligned, writable caller memory). Host `cargo test` builds
+/// compile to a no-op stub (never touches registers or memory).
+#[cfg(not(test))]
+pub unsafe fn swap_stacks_via_slots(
+    old_save: *mut u64,
+    new_save: *const u64,
+    func: extern "C" fn(),
+) {
+    if old_save.is_null() || new_save.is_null() {
+        return;
+    }
+    // Fail-closed: a zero/misaligned target as raw `RSP` would be lethal
+    // (triple-fault with no diagnostic line); check in Rust so the guest
+    // prints `ok=0` instead of faulting silently. Re-read in asm below so
+    // the LOAD itself is still proven in the switch path.
+    let target = core::ptr::read_volatile(new_save);
+    if target == 0 || target & 0xF != 0 {
+        return;
+    }
+    // Plain `out` (not `lateout`) for the reason documented on
+    // `run_on_thread_stack`: inputs must never share regs with scratch
+    // (`lateout` allows overlap; tried, QEMU FAIL save=0x0).
+    core::arch::asm!(
+        "push r15",
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
+        "mov rax, rsp",
+        "mov [{old}], rax",
+        "mov rdx, [{new}]",
+        "mov rsp, rdx",
+        "push rax",
+        "push {old}",
+        "call {func}",
+        "pop rdx",
+        "pop rax",
+        "mov rsp, rax",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
+        "pop r15",
+        old = in(reg) old_save,
+        new = in(reg) new_save,
+        func = in(reg) func,
+        out("rax") _,
+        out("rdx") _,
+        out("r12") _,
+        out("r13") _,
+        out("r14") _,
+        out("r15") _,
+        clobber_abi("C"),
+    );
+}
+
+/// Host-test stub: null/zero/misaligned fails closed (no touch), valid
+/// slots are a register-safe no-op (live slot-to-slot proof is e2e-only).
+///
+/// # Safety
+/// Host `cargo test` only: reads the target slot for the guard, never
+/// writes registers, stacks, or slots.
+#[cfg(test)]
+pub unsafe fn swap_stacks_via_slots(
+    old_save: *mut u64,
+    new_save: *const u64,
+    _func: extern "C" fn(),
+) {
+    if old_save.is_null() || new_save.is_null() {
+        return;
+    }
+    let target = core::ptr::read_volatile(new_save);
+    if target == 0 || target & 0xF != 0 {}
 }
 
 /// Caller-side preservation proof (S06 slice 10, REVIEW #291 gap 1).
@@ -1005,6 +1117,10 @@ mod tests {
         // (raw `mov [save], rsp` + `mov rsp, ...` + indirect `call`).
         let with_save: unsafe fn(*mut u64, u64, extern "C" fn()) = run_on_thread_stack_with_save;
         let _ = with_save;
+        // S06 slice 13: slot-to-slot switch keeps the unsafe-fn shape
+        // (raw `mov [old], rsp` + `mov rdx, [new]` + `mov rsp, rdx`).
+        let via_slots: unsafe fn(*mut u64, *const u64, extern "C" fn()) = swap_stacks_via_slots;
+        let _ = via_slots;
     }
 
     #[test]
@@ -1063,6 +1179,35 @@ mod tests {
             let mut slot: u64 = 0x1234_5678_9ABC_DEF0;
             run_on_thread_stack_with_save(&mut slot as *mut u64, 0x2000_0000, dummy);
             assert_eq!(slot, 0x1234_5678_9ABC_DEF0);
+        }
+    }
+
+    #[test]
+    fn swap_via_slots_guards_fail_closed_host_stub() {
+        // S06 slice 13: null slots, zero target, and misaligned target
+        // must all fail closed (no touch, no trap) on the host stub;
+        // valid slots are a register-safe no-op leaving both untouched
+        // (live slot-to-slot LOAD is e2e-only).
+        extern "C" fn dummy() {}
+        unsafe {
+            let mut old: u64 = 0x1111_1111_1111_1111;
+            let mut new: u64 = 0x2000_0000;
+            // Null old / null new: no trap, no write.
+            swap_stacks_via_slots(core::ptr::null_mut(), &new as *const u64, dummy);
+            swap_stacks_via_slots(&mut old as *mut u64, core::ptr::null(), dummy);
+            assert_eq!((old, new), (0x1111_1111_1111_1111, 0x2000_0000));
+            // Zero target: fail closed, slots untouched.
+            new = 0;
+            swap_stacks_via_slots(&mut old as *mut u64, &new as *const u64, dummy);
+            assert_eq!((old, new), (0x1111_1111_1111_1111, 0));
+            // Misaligned target: fail closed, slots untouched.
+            new = 0x2000_0001;
+            swap_stacks_via_slots(&mut old as *mut u64, &new as *const u64, dummy);
+            assert_eq!((old, new), (0x1111_1111_1111_1111, 0x2000_0001));
+            // Valid aligned target: host no-op, slots still untouched.
+            new = 0x2000_0000;
+            swap_stacks_via_slots(&mut old as *mut u64, &new as *const u64, dummy);
+            assert_eq!((old, new), (0x1111_1111_1111_1111, 0x2000_0000));
         }
     }
 

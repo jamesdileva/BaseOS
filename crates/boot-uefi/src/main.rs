@@ -42,6 +42,8 @@ use baseos_kernel::page_table::{
     walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
 };
 #[cfg(not(test))]
+use baseos_kernel::thread::swap_stacks_via_slots;
+#[cfg(not(test))]
 use baseos_kernel::thread::{callee_saved_survives, rbp_preserved, run_on_thread_stack_with_save};
 use baseos_kernel::thread::{run_on_thread_stack, swap_target, Thread};
 use baseos_kernel::uart::{com1_write_byte, uart_init};
@@ -850,11 +852,18 @@ static mut THREAD_STACK_A: AlignedStack = AlignedStack([0; 8192]);
 static mut THREAD_STACK_B: AlignedStack = AlignedStack([0; 8192]);
 
 /// Caller-owned two-way save slot (S06 slice 12): `run_on_thread_stack_
-// with_save` spills the boot `RSP` here before switching, so the save
+/// with_save` spills the boot `RSP` here before switching, so the save
 /// lives in caller memory (ping-pong capable) rather than only on the new
 /// stack. Zero until the `THREAD-SAVE` probe runs.
 #[cfg(not(test))]
 static mut THREAD_RSP_SAVE: u64 = 0;
+
+/// Second caller-owned slot (S06 slice 13): the nested B->A hop spills
+/// the thread-B `RSP` here via `swap_stacks_via_slots`, so the full
+/// A->B->A ping-pong leaves both directions' stacks in memory. Zero
+/// until the `THREAD-PONG` probe runs.
+#[cfg(not(test))]
+static mut THREAD_RSP_SAVE_B: u64 = 0;
 
 /// Second-thread entry: runs ON the swapped-to stack (the `call` in
 /// `run_on_thread_stack` pushes its return address there, and this body
@@ -964,6 +973,132 @@ unsafe fn probe_thread_save<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Re
 
 #[cfg(test)]
 unsafe fn probe_thread_save<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    let _ = emit;
+    Ok(true)
+}
+
+/// Pong entry (S06 slice 13): runs ON THE BOOT STACK inside the nested
+/// B->A hop (`swap_stacks_via_slots` loaded the boot `RSP` from
+/// `THREAD_RSP_SAVE`). Emits the nested proof line, then returns so the
+/// nested epilogue restores thread-B and the outer epilogue restores boot.
+/// If the slot LOAD were bogus this faults and e2e fails on the missing
+/// lines. Kept separate from `thread_b_entry` so the earlier THREAD /
+/// THREAD-SAVE probes keep their simple-return shape.
+#[cfg(not(test))]
+extern "C" fn thread_pong_entry() {
+    let mut emit = com1_emit;
+    let _ = write_str(&mut emit, "THREAD-PONG-RUN id=1\n");
+}
+
+/// Ping-pong thread-B entry (S06 slice 13): runs ON THREAD-B via the
+/// outer `run_on_thread_stack_with_save` (which spilled boot `RSP` to
+/// `THREAD_RSP_SAVE`). Performs the nested B->A hop through memory slots:
+/// spills B `RSP` to `THREAD_RSP_SAVE_B` and LOADS boot `RSP` from
+/// `THREAD_RSP_SAVE` in asm (`mov rdx, [new]` inside
+/// `swap_stacks_via_slots`), running `thread_pong_entry` on the boot
+/// stack. Return resumes B, then the outer epilogue resumes boot — the
+/// full A->B->A round trip. Kept separate from `thread_b_entry` so the
+/// earlier probes are untouched.
+#[cfg(not(test))]
+extern "C" fn thread_b_pingpong_entry() {
+    unsafe {
+        let pong_ptr = thread_pong_entry as *const ();
+        if pong_ptr.is_null() {
+            return;
+        }
+        let pong: extern "C" fn() = core::mem::transmute(pong_ptr);
+        swap_stacks_via_slots(
+            core::ptr::addr_of_mut!(THREAD_RSP_SAVE_B),
+            core::ptr::addr_of!(THREAD_RSP_SAVE),
+            pong,
+        );
+    }
+}
+
+/// Emit the one-line `THREAD-PONG` diagnostic (S06 slice 13, the LOAD
+/// half that closes REVIEW #299): `THREAD-PONG ok=<0|1> save_a=<0x...>
+/// save_b=<0x...>` — `ok` is 1 only when the outer save-slot hop ran
+/// `thread_b_pingpong_entry` on the swap-target stack, the nested
+/// slot-to-slot hop ran `thread_pong_entry` on the loaded boot `RSP`
+/// (`THREAD-PONG-RUN` line above proves the LOAD executed), both hops
+/// returned, AND both caller-owned slots hold nonzero 16-byte-aligned
+/// `RSP` values (proves STORE + LOAD in both directions through memory).
+#[cfg(not(test))]
+fn write_thread_pong_line<E>(
+    ok: bool,
+    save_a: u64,
+    save_b: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "THREAD-PONG ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " save_a=")?;
+    write_u64_hex(emit, save_a)?;
+    write_str(emit, " save_b=")?;
+    write_u64_hex(emit, save_b)?;
+    write_str(emit, "\n")
+}
+
+/// Full A->B->A ping-pong probe (S06 slice 13): resolve the same
+/// `swap_target` triple, zero both slots (stale-nonzero fail-open guard),
+/// run `thread_b_pingpong_entry` through `run_on_thread_stack_with_save`
+/// with `THREAD_RSP_SAVE` as slot A; the B entry nests
+/// `swap_stacks_via_slots` (slot B <- B `RSP`, target <- slot A) running
+/// `thread_pong_entry` on the loaded boot stack. Checks both slots and
+/// emits the `THREAD-PONG` line. Never panics.
+///
+/// # Safety
+/// Post-EBS only, same contract as [`probe_thread_save`]: owns the static
+/// stacks plus both save slots, `cli` in effect, COM1 exclusive.
+#[cfg(not(test))]
+unsafe fn probe_thread_pingpong<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
+    let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
+    let entry_b = thread_b_entry as *const () as u64;
+    let (a, b) = match (
+        Thread::new(1, base_a, 8192, 0x1000),
+        Thread::new(2, base_b, 8192, entry_b),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            write_thread_pong_line::<E>(false, 0, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let (_, top, _) = match swap_target(&[a, b], 1) {
+        Ok(t) => t,
+        Err(_) => {
+            write_thread_pong_line::<E>(false, 0, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let slot_a = core::ptr::addr_of_mut!(THREAD_RSP_SAVE);
+    let slot_b = core::ptr::addr_of_mut!(THREAD_RSP_SAVE_B);
+    // Fail-closed: zero both slots first so a no-save path prints ok=0
+    // instead of a stale nonzero value (same guard as `probe_thread_save`).
+    core::ptr::write_volatile(slot_a, 0);
+    core::ptr::write_volatile(slot_b, 0);
+    let pingpong_ptr = thread_b_pingpong_entry as *const ();
+    if pingpong_ptr.is_null() {
+        write_thread_pong_line::<E>(false, 0, 0, emit)?;
+        return Ok(false);
+    }
+    let func_b: extern "C" fn() = core::mem::transmute(pingpong_ptr);
+    run_on_thread_stack_with_save(slot_a, top, func_b);
+    let saved_a = core::ptr::read_volatile(slot_a);
+    let saved_b = core::ptr::read_volatile(slot_b);
+    let ok = saved_a != 0 && saved_a & 0xF == 0 && saved_b != 0 && saved_b & 0xF == 0;
+    write_thread_pong_line::<E>(
+        ok,
+        if ok { saved_a } else { 0 },
+        if ok { saved_b } else { 0 },
+        emit,
+    )?;
+    Ok(ok)
+}
+
+#[cfg(test)]
+unsafe fn probe_thread_pingpong<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
     let _ = emit;
     Ok(true)
 }
@@ -1255,6 +1390,9 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // S06 slice 12: two-way save-slot probe — THREAD-SAVE ok=1
             // (fail-loud on missing/zero/misaligned save).
             let _ = probe_thread_save::<Infallible>(&mut emit);
+            // S06 slice 13: full A->B->A ping-pong — THREAD-PONG ok=1
+            // (fail-loud on missing RUN line or zero/misaligned slot A/B).
+            let _ = probe_thread_pingpong::<Infallible>(&mut emit);
             baseos_kernel::bring_up_cpu_and_prove_exception();
         }
         // EBS failed: still own boot services — park fail-loud (e2e sees
