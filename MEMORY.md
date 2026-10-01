@@ -3,12 +3,10 @@
 Review before each work segment. Keep ≤20 lines, compact.
 
 - Goal: perf-first x86-64 UEFI desktop OS, Rust-first; docs in repo root.
-- Now: S06 slice14 done @81cc614 + close-out @eb90de9 (REVIEW #303 3 gaps closed: slot-path
-  sentinel/rbp proof, triple entry both hops, read-once new_rsp).
-  140 host green (21+18+91+4+4+2), fmt/clippy clean, UEFI 0 warn.
-  QEMU PASS (PONG ok=1 save_a=0xfe64760 save_b=0xde37cd0, PONG-RUN
-  id=1, CS ok=1 iter=16). REVIEW #305 APPROVED.
-- Next: next S06 slice (scheduler/jump-entry per roadmap); #9 active.
+- Now: S06 slice15 done @3303aa6 ThreadMutex coop sync (144 green
+  21+18+95+4+4+2, fmt/clippy clean, UEFI 0 warn, QEMU PASS 1143B
+  full gates PONG+SAVE+CS16). REVIEW #313 blockers closed.
+- Next: #9 retitle slice1->slice15 + #10 close; then slice16 scheduler.
 - Board: #9 active (S06 threads). OK per human #79/#80.
 - Conventions: STRUCTURAL_FAIL = usize::MAX; ASCII .ps1; raw EFI;
   ST+96/BS+56/64/232/320 efiapi; 16KiB map+slack 4096; serial hard-req
