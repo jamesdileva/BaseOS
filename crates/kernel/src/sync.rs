@@ -18,8 +18,17 @@
 //! guest path (post-EBS boot CPU, `cli` in effect). The holder travels in
 //! a plain `Cell<u64>` so the type stays `!Sync` by construction —
 //! sharing across threads must go through a future atomic/interrupt-gated
-//! primitive, not this one.
+//! primitive, not this one. The scheduler (slice16 `sched::Scheduler`)
+//! REPLACES this cell rather than reusing it: under preemption a
+//! `Cell` get-then-set is an interrupt-TOCTOU (two threads can both
+//! observe free and both store), so the preemptive path needs an
+//! atomic CAS or `cli`-gated critical section, never this `Cell`.
+//!
+//! Guest scope: out-of-scope for the guest this slice — no guest caller
+//! uses the mutex yet (post-EBS single-threaded boot owns all stacks);
+//! guest use arrives with the first multi-thread guest switch slice.
 
+use crate::thread::NULL_THREAD;
 use core::cell::Cell;
 
 /// Cooperative thread mutex: at most one holder thread id at a time.
@@ -34,7 +43,7 @@ impl ThreadMutex {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            holder: Cell::new(0),
+            holder: Cell::new(NULL_THREAD),
         }
     }
 
@@ -47,7 +56,7 @@ impl ThreadMutex {
     /// True when free.
     #[must_use]
     pub fn is_free(&self) -> bool {
-        self.holder.get() == 0
+        self.holder.get() == NULL_THREAD
     }
 
     /// Try to take the lock for `id`. Returns `true` only on
@@ -55,10 +64,10 @@ impl ThreadMutex {
     /// with no mutation.
     #[must_use]
     pub fn try_lock(&self, id: u64) -> bool {
-        if id == 0 {
+        if id == NULL_THREAD {
             return false;
         }
-        if self.holder.get() != 0 {
+        if self.holder.get() != NULL_THREAD {
             return false;
         }
         self.holder.set(id);
@@ -70,13 +79,13 @@ impl ThreadMutex {
     /// returns `false` with no mutation.
     #[must_use]
     pub fn unlock(&self, id: u64) -> bool {
-        if id == 0 {
+        if id == NULL_THREAD {
             return false;
         }
         if self.holder.get() != id {
             return false;
         }
-        self.holder.set(0);
+        self.holder.set(NULL_THREAD);
         true
     }
 }

@@ -25,6 +25,12 @@
 //! Fields are private so `new()` cannot be bypassed by struct-literal
 //! construction (closes the S05 pub-widen fail-open pattern).
 
+/// Reserved null-thread sentinel: id 0 can never be a live thread, a
+/// lock holder, or a scheduler member. Single source (REVIEW #319
+/// finding 3): `thread`, `sync`, and `sched` all compare against this
+/// const so the sentinel cannot drift across copies.
+pub const NULL_THREAD: u64 = 0;
+
 /// Minimum kernel stack: one page (4 KiB).
 pub const MIN_STACK: u64 = 4096;
 
@@ -135,7 +141,7 @@ impl Thread {
         stack_size: u64,
         entry: u64,
     ) -> Result<Self, ThreadError> {
-        if id == 0 {
+        if id == NULL_THREAD {
             return Err(ThreadError::InvalidId);
         }
         match check_stack_entry(stack_base, stack_size, entry) {
@@ -248,7 +254,7 @@ pub fn validate_threads(threads: &[Thread]) -> Result<(), SwitchError> {
     let mut i = 0;
     while i < threads.len() {
         let a = threads[i];
-        if a.id == 0 {
+        if a.id == NULL_THREAD {
             return Err(SwitchError::InvalidTable);
         }
         // Full `new()` stack+entry invariants via the shared gate

@@ -28,6 +28,7 @@ use baseos_boot_info::{write_str, write_u64_dec, write_u64_hex, BootInfo};
 pub mod cpu;
 pub mod frame_alloc;
 pub mod page_table;
+pub mod sched;
 pub mod sync;
 pub mod thread;
 /// Safe COM1 port-I/O boundary: raw `in`/`out` confined to private
