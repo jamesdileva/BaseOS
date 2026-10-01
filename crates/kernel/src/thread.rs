@@ -567,53 +567,56 @@ pub unsafe fn run_on_thread_stack_with_save(
 /// # Safety
 /// Host `cargo test` only: no-op.
 #[cfg(test)]
+#[allow(clippy::needless_return)]
 pub unsafe fn run_on_thread_stack_with_save(
     old_save: *mut u64,
     _new_top: u64,
     _func: extern "C" fn(),
 ) {
-    if old_save.is_null() {}
+    if old_save.is_null() {
+        return;
+    }
 }
 
-/// Slot-to-slot `RSP` switch (S06 slice 13): like
-/// [`run_on_thread_stack_with_save`], but the target `RSP` is LOADED from
-/// caller-owned memory (`[new_save]`) instead of arriving as an immediate
-/// top. This is the missing LOAD half REVIEW #299 demanded: `mov rdx,
-/// [new]` runs in asm from thread context, so a nested B->A hop proves a
-/// saved boot `RSP` is usable as a live stack pointer, not just stored.
+/// Slot-to-value `RSP` switch (S06 slices 13-14): like
+/// [`run_on_thread_stack_with_save`], but the target `RSP` arrives as a
+/// caller-loaded VALUE (`new_rsp`, read once from the slot with
+/// `read_volatile` by the caller) instead of a slot pointer the asm
+/// re-reads.
+///
+/// Slice 13 proved the asm LOAD (`mov rdx, [new]`) live (PONG-RUN); slice
+/// 14 retires it for TOCTOU safety (REVIEW #303 risk 3): the old shape
+/// double-read `[new]` (Rust guard `read_volatile` + asm `mov rdx,
+/// [new]`). Benign under post-EBS `cli` single-thread, but read-once-via-
+/// reg removes the class: exactly one `read_volatile` in the caller, the
+/// value travels in a register, asm never touches slot memory for the
+/// target. The slot STORE half is still proven in asm (`mov [old], rax`).
 ///
 /// Mechanism: caller-saved pushes (same six), `mov [old_save], rax`
 /// spills the current `RSP` while still on the current stack; `mov rdx,
-/// [new_save]` loads the target `RSP` from memory in asm (explicit
-/// memory-source load, single-threaded boot so no TOCTOU); `mov rsp, rdx`
-/// switches; `push rax` (old `RSP`) + `push old_save` (pointer spill, the
-/// slice-10 lesson: post-`call` recovery never depends on a register
-/// surviving the hostile callee); `call func`; `pop rdx` + `pop rax`;
-/// `mov rsp, rax`; caller-saved pops. Fail-closed in Rust before the asm:
-/// null `old_save`/`new_save`, or a zero/misaligned `[new_save]` target,
-/// returns with no register or stack touch (host-testable).
+/// new_rsp` (register source, no memory load) + `mov rsp, rdx` switches;
+/// `push rax` (old `RSP`) + `push old_save` (pointer spill, the slice-10
+/// lesson: post-`call` recovery never depends on a register surviving the
+/// hostile callee); `call func`; `pop rdx` + `pop rax`; `mov rsp, rax`;
+/// caller-saved pops. Fail-closed in Rust before the asm: null `old_save`,
+/// or a zero/misaligned `new_rsp` value, returns with no register or stack
+/// touch (host-testable).
 ///
 /// # Safety
 /// Same contract as [`run_on_thread_stack`]: guest-only, post-EBS, `cli`
-/// in effect, `new_save` points at a slot previously written by
-/// [`run_on_thread_stack_with_save`] or this function (nonzero,
-/// 16-byte-aligned, writable caller memory). Host `cargo test` builds
-/// compile to a no-op stub (never touches registers or memory).
+/// in effect, `new_rsp` is the single `read_volatile` of a slot previously
+/// written by [`run_on_thread_stack_with_save`] or this function (nonzero,
+/// 16-byte-aligned). Host `cargo test` builds compile to a no-op stub
+/// (never touches registers or memory).
 #[cfg(not(test))]
-pub unsafe fn swap_stacks_via_slots(
-    old_save: *mut u64,
-    new_save: *const u64,
-    func: extern "C" fn(),
-) {
-    if old_save.is_null() || new_save.is_null() {
+pub unsafe fn swap_stacks_via_slots(old_save: *mut u64, new_rsp: u64, func: extern "C" fn()) {
+    if old_save.is_null() {
         return;
     }
     // Fail-closed: a zero/misaligned target as raw `RSP` would be lethal
     // (triple-fault with no diagnostic line); check in Rust so the guest
-    // prints `ok=0` instead of faulting silently. Re-read in asm below so
-    // the LOAD itself is still proven in the switch path.
-    let target = core::ptr::read_volatile(new_save);
-    if target == 0 || target & 0xF != 0 {
+    // prints `ok=0` instead of faulting silently.
+    if new_rsp == 0 || new_rsp & 0xF != 0 {
         return;
     }
     // Plain `out` (not `lateout`) for the reason documented on
@@ -628,7 +631,7 @@ pub unsafe fn swap_stacks_via_slots(
         "push r14",
         "mov rax, rsp",
         "mov [{old}], rax",
-        "mov rdx, [{new}]",
+        "mov rdx, {new}",
         "mov rsp, rdx",
         "push rax",
         "push {old}",
@@ -643,7 +646,7 @@ pub unsafe fn swap_stacks_via_slots(
         "pop rbx",
         "pop r15",
         old = in(reg) old_save,
-        new = in(reg) new_save,
+        new = in(reg) new_rsp,
         func = in(reg) func,
         out("rax") _,
         out("rdx") _,
@@ -656,22 +659,19 @@ pub unsafe fn swap_stacks_via_slots(
 }
 
 /// Host-test stub: null/zero/misaligned fails closed (no touch), valid
-/// slots are a register-safe no-op (live slot-to-slot proof is e2e-only).
+/// values are a register-safe no-op (live switch proof is e2e-only).
 ///
 /// # Safety
-/// Host `cargo test` only: reads the target slot for the guard, never
-/// writes registers, stacks, or slots.
+/// Host `cargo test` only: never writes registers, stacks, or slots.
 #[cfg(test)]
-pub unsafe fn swap_stacks_via_slots(
-    old_save: *mut u64,
-    new_save: *const u64,
-    _func: extern "C" fn(),
-) {
-    if old_save.is_null() || new_save.is_null() {
+#[allow(clippy::needless_return)]
+pub unsafe fn swap_stacks_via_slots(old_save: *mut u64, new_rsp: u64, _func: extern "C" fn()) {
+    if old_save.is_null() {
         return;
     }
-    let target = core::ptr::read_volatile(new_save);
-    if target == 0 || target & 0xF != 0 {}
+    if new_rsp == 0 || new_rsp & 0xF != 0 {
+        return;
+    }
 }
 
 /// Caller-side preservation proof (S06 slice 10, REVIEW #291 gap 1).
@@ -799,6 +799,225 @@ pub unsafe fn rbp_preserved(new_top: u64, func: extern "C" fn()) -> bool {
 /// Host `cargo test` only: no-op.
 #[cfg(test)]
 pub unsafe fn rbp_preserved(_new_top: u64, _func: extern "C" fn()) -> bool {
+    true
+}
+
+/// Caller-side preservation proof for the `with_save` path (S06 slice 14,
+/// REVIEW #303 risk 1): same five-sentinel protocol as
+/// [`callee_saved_survives`], but the live call goes through
+/// [`run_on_thread_stack_with_save`] (which additionally spills `RSP` to
+/// `*old_save` and spills the slot pointer on the new stack). Catches a
+/// push/pop imbalance or wrong-order restore in the `with_save` epilogue
+/// that the base-path proof would miss.
+///
+/// # Safety
+/// Same contract as [`run_on_thread_stack_with_save`]: guest-only,
+/// post-EBS, `cli` in effect, `old_save` non-null writable caller memory.
+/// Host builds compile to a stub returning `true`.
+#[cfg(not(test))]
+pub unsafe fn callee_saved_survives_with_save(
+    old_save: *mut u64,
+    new_top: u64,
+    func: extern "C" fn(),
+) -> bool {
+    const S_RBX: u64 = 0x1B1B_1B1B_1B1B_1B1B;
+    const S_R12: u64 = 0x1212_1212_1212_1212;
+    const S_R13: u64 = 0x1313_1313_1313_1313;
+    const S_R14: u64 = 0x1414_1414_1414_1414;
+    const S_R15: u64 = 0x1515_1515_1515_1515;
+    core::arch::asm!(
+        "mov rbx, {s_rbx}",
+        "mov r12, {s_r12}",
+        "mov r13, {s_r13}",
+        "mov r14, {s_r14}",
+        "mov r15, {s_r15}",
+        s_rbx = in(reg) S_RBX,
+        s_r12 = in(reg) S_R12,
+        s_r13 = in(reg) S_R13,
+        s_r14 = in(reg) S_R14,
+        s_r15 = in(reg) S_R15,
+        out("r12") _,
+        out("r13") _,
+        out("r14") _,
+        out("r15") _,
+        options(nomem, nostack, preserves_flags),
+    );
+    run_on_thread_stack_with_save(old_save, new_top, func);
+    let (v_rbx, v_r12, v_r13, v_r14, v_r15): (u64, u64, u64, u64, u64);
+    core::arch::asm!(
+        "mov {v_rbx}, rbx",
+        "mov {v_r12}, r12",
+        "mov {v_r13}, r13",
+        "mov {v_r14}, r14",
+        "mov {v_r15}, r15",
+        v_rbx = out(reg) v_rbx,
+        v_r12 = out(reg) v_r12,
+        v_r13 = out(reg) v_r13,
+        v_r14 = out(reg) v_r14,
+        v_r15 = out(reg) v_r15,
+        options(nomem, nostack, preserves_flags),
+    );
+    v_rbx == S_RBX && v_r12 == S_R12 && v_r13 == S_R13 && v_r14 == S_R14 && v_r15 == S_R15
+}
+
+/// Host stub: preservation proof is e2e-only; always `true`.
+///
+/// # Safety
+/// Host `cargo test` only: no-op.
+#[cfg(test)]
+pub unsafe fn callee_saved_survives_with_save(
+    _old_save: *mut u64,
+    _new_top: u64,
+    _func: extern "C" fn(),
+) -> bool {
+    true
+}
+
+/// Read-only `rbp` proof for the `with_save` path (S06 slice 14): mirrors
+/// [`rbp_preserved`] around one [`run_on_thread_stack_with_save`] call.
+///
+/// # Safety
+/// Same contract as [`run_on_thread_stack_with_save`]. Host stub `true`.
+#[cfg(not(test))]
+pub unsafe fn rbp_preserved_with_save(
+    old_save: *mut u64,
+    new_top: u64,
+    func: extern "C" fn(),
+) -> bool {
+    let before: u64;
+    core::arch::asm!(
+        "mov {v}, rbp",
+        v = out(reg) before,
+        options(nomem, nostack, preserves_flags),
+    );
+    run_on_thread_stack_with_save(old_save, new_top, func);
+    let after: u64;
+    core::arch::asm!(
+        "mov {v}, rbp",
+        v = out(reg) after,
+        options(nomem, nostack, preserves_flags),
+    );
+    before == after
+}
+
+/// Host stub: `rbp` proof is e2e-only; always `true`.
+///
+/// # Safety
+/// Host `cargo test` only: no-op.
+#[cfg(test)]
+pub unsafe fn rbp_preserved_with_save(
+    _old_save: *mut u64,
+    _new_top: u64,
+    _func: extern "C" fn(),
+) -> bool {
+    true
+}
+
+/// Caller-side preservation proof for the slot-to-value path (S06 slice
+/// 14, REVIEW #303 risk 1): same five-sentinel protocol, but the live call
+/// goes through [`swap_stacks_via_slots`] with a caller-loaded `new_rsp`
+/// value. This is the most hostile-callee-exposed path (nested pong runs
+/// inside it), so its push/pop balance gets its own proof.
+///
+/// # Safety
+/// Same contract as [`swap_stacks_via_slots`]: guest-only, post-EBS, `cli`
+/// in effect. Host builds compile to a stub returning `true`.
+#[cfg(not(test))]
+pub unsafe fn callee_saved_survives_via_slots(
+    old_save: *mut u64,
+    new_rsp: u64,
+    func: extern "C" fn(),
+) -> bool {
+    const S_RBX: u64 = 0x1B1B_1B1B_1B1B_1B1B;
+    const S_R12: u64 = 0x1212_1212_1212_1212;
+    const S_R13: u64 = 0x1313_1313_1313_1313;
+    const S_R14: u64 = 0x1414_1414_1414_1414;
+    const S_R15: u64 = 0x1515_1515_1515_1515;
+    core::arch::asm!(
+        "mov rbx, {s_rbx}",
+        "mov r12, {s_r12}",
+        "mov r13, {s_r13}",
+        "mov r14, {s_r14}",
+        "mov r15, {s_r15}",
+        s_rbx = in(reg) S_RBX,
+        s_r12 = in(reg) S_R12,
+        s_r13 = in(reg) S_R13,
+        s_r14 = in(reg) S_R14,
+        s_r15 = in(reg) S_R15,
+        out("r12") _,
+        out("r13") _,
+        out("r14") _,
+        out("r15") _,
+        options(nomem, nostack, preserves_flags),
+    );
+    swap_stacks_via_slots(old_save, new_rsp, func);
+    let (v_rbx, v_r12, v_r13, v_r14, v_r15): (u64, u64, u64, u64, u64);
+    core::arch::asm!(
+        "mov {v_rbx}, rbx",
+        "mov {v_r12}, r12",
+        "mov {v_r13}, r13",
+        "mov {v_r14}, r14",
+        "mov {v_r15}, r15",
+        v_rbx = out(reg) v_rbx,
+        v_r12 = out(reg) v_r12,
+        v_r13 = out(reg) v_r13,
+        v_r14 = out(reg) v_r14,
+        v_r15 = out(reg) v_r15,
+        options(nomem, nostack, preserves_flags),
+    );
+    v_rbx == S_RBX && v_r12 == S_R12 && v_r13 == S_R13 && v_r14 == S_R14 && v_r15 == S_R15
+}
+
+/// Host stub: preservation proof is e2e-only; always `true`.
+///
+/// # Safety
+/// Host `cargo test` only: no-op.
+#[cfg(test)]
+pub unsafe fn callee_saved_survives_via_slots(
+    _old_save: *mut u64,
+    _new_rsp: u64,
+    _func: extern "C" fn(),
+) -> bool {
+    true
+}
+
+/// Read-only `rbp` proof for the slot-to-value path (S06 slice 14):
+/// mirrors [`rbp_preserved`] around one [`swap_stacks_via_slots`] call.
+///
+/// # Safety
+/// Same contract as [`swap_stacks_via_slots`]. Host stub `true`.
+#[cfg(not(test))]
+pub unsafe fn rbp_preserved_via_slots(
+    old_save: *mut u64,
+    new_rsp: u64,
+    func: extern "C" fn(),
+) -> bool {
+    let before: u64;
+    core::arch::asm!(
+        "mov {v}, rbp",
+        v = out(reg) before,
+        options(nomem, nostack, preserves_flags),
+    );
+    swap_stacks_via_slots(old_save, new_rsp, func);
+    let after: u64;
+    core::arch::asm!(
+        "mov {v}, rbp",
+        v = out(reg) after,
+        options(nomem, nostack, preserves_flags),
+    );
+    before == after
+}
+
+/// Host stub: `rbp` proof is e2e-only; always `true`.
+///
+/// # Safety
+/// Host `cargo test` only: no-op.
+#[cfg(test)]
+pub unsafe fn rbp_preserved_via_slots(
+    _old_save: *mut u64,
+    _new_rsp: u64,
+    _func: extern "C" fn(),
+) -> bool {
     true
 }
 
@@ -1117,10 +1336,24 @@ mod tests {
         // (raw `mov [save], rsp` + `mov rsp, ...` + indirect `call`).
         let with_save: unsafe fn(*mut u64, u64, extern "C" fn()) = run_on_thread_stack_with_save;
         let _ = with_save;
-        // S06 slice 13: slot-to-slot switch keeps the unsafe-fn shape
-        // (raw `mov [old], rsp` + `mov rdx, [new]` + `mov rsp, rdx`).
-        let via_slots: unsafe fn(*mut u64, *const u64, extern "C" fn()) = swap_stacks_via_slots;
+        // S06 slice 13: slot-to-value switch keeps the unsafe-fn shape
+        // (raw `mov [old], rsp` + `mov rsp, reg-value` + indirect `call`).
+        // S06 slice 14: value (not `*const u64`) — read-once-via-reg,
+        // REVIEW #303 risk 3 (no asm double-read of `[new]`).
+        let via_slots: unsafe fn(*mut u64, u64, extern "C" fn()) = swap_stacks_via_slots;
         let _ = via_slots;
+        // S06 slice 14: preservation proofs for both new paths keep the
+        // unsafe-fn shape (sentinel set + live call + capture/compare).
+        let sentinel_ws: unsafe fn(*mut u64, u64, extern "C" fn()) -> bool =
+            callee_saved_survives_with_save;
+        let _ = sentinel_ws;
+        let rbp_ws: unsafe fn(*mut u64, u64, extern "C" fn()) -> bool = rbp_preserved_with_save;
+        let _ = rbp_ws;
+        let sentinel_vs: unsafe fn(*mut u64, u64, extern "C" fn()) -> bool =
+            callee_saved_survives_via_slots;
+        let _ = sentinel_vs;
+        let rbp_vs: unsafe fn(*mut u64, u64, extern "C" fn()) -> bool = rbp_preserved_via_slots;
+        let _ = rbp_vs;
     }
 
     #[test]
@@ -1184,30 +1417,26 @@ mod tests {
 
     #[test]
     fn swap_via_slots_guards_fail_closed_host_stub() {
-        // S06 slice 13: null slots, zero target, and misaligned target
-        // must all fail closed (no touch, no trap) on the host stub;
-        // valid slots are a register-safe no-op leaving both untouched
-        // (live slot-to-slot LOAD is e2e-only).
+        // S06 slice 13-14: null slot, zero value, and misaligned value must
+        // all fail closed (no touch, no trap) on the host stub; a valid
+        // aligned value is a register-safe no-op leaving the slot untouched
+        // (live switch is e2e-only). Slice 14: value (not pointer) —
+        // read-once-via-reg, REVIEW #303 risk 3.
         extern "C" fn dummy() {}
         unsafe {
             let mut old: u64 = 0x1111_1111_1111_1111;
-            let mut new: u64 = 0x2000_0000;
-            // Null old / null new: no trap, no write.
-            swap_stacks_via_slots(core::ptr::null_mut(), &new as *const u64, dummy);
-            swap_stacks_via_slots(&mut old as *mut u64, core::ptr::null(), dummy);
-            assert_eq!((old, new), (0x1111_1111_1111_1111, 0x2000_0000));
-            // Zero target: fail closed, slots untouched.
-            new = 0;
-            swap_stacks_via_slots(&mut old as *mut u64, &new as *const u64, dummy);
-            assert_eq!((old, new), (0x1111_1111_1111_1111, 0));
-            // Misaligned target: fail closed, slots untouched.
-            new = 0x2000_0001;
-            swap_stacks_via_slots(&mut old as *mut u64, &new as *const u64, dummy);
-            assert_eq!((old, new), (0x1111_1111_1111_1111, 0x2000_0001));
-            // Valid aligned target: host no-op, slots still untouched.
-            new = 0x2000_0000;
-            swap_stacks_via_slots(&mut old as *mut u64, &new as *const u64, dummy);
-            assert_eq!((old, new), (0x1111_1111_1111_1111, 0x2000_0000));
+            // Null old: no trap, no write.
+            swap_stacks_via_slots(core::ptr::null_mut(), 0x2000_0000, dummy);
+            assert_eq!(old, 0x1111_1111_1111_1111);
+            // Zero value: fail closed, slot untouched.
+            swap_stacks_via_slots(&mut old as *mut u64, 0, dummy);
+            assert_eq!(old, 0x1111_1111_1111_1111);
+            // Misaligned value: fail closed, slot untouched.
+            swap_stacks_via_slots(&mut old as *mut u64, 0x2000_0001, dummy);
+            assert_eq!(old, 0x1111_1111_1111_1111);
+            // Valid aligned value: host no-op, slot still untouched.
+            swap_stacks_via_slots(&mut old as *mut u64, 0x2000_0000, dummy);
+            assert_eq!(old, 0x1111_1111_1111_1111);
         }
     }
 

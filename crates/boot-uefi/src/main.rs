@@ -45,6 +45,11 @@ use baseos_kernel::page_table::{
 use baseos_kernel::thread::swap_stacks_via_slots;
 #[cfg(not(test))]
 use baseos_kernel::thread::{callee_saved_survives, rbp_preserved, run_on_thread_stack_with_save};
+#[cfg(not(test))]
+use baseos_kernel::thread::{
+    callee_saved_survives_via_slots, callee_saved_survives_with_save, rbp_preserved_via_slots,
+    rbp_preserved_with_save,
+};
 use baseos_kernel::thread::{run_on_thread_stack, swap_target, Thread};
 use baseos_kernel::uart::{com1_write_byte, uart_init};
 use baseos_serial_marker::write_marker;
@@ -973,8 +978,11 @@ unsafe fn probe_thread_save<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Re
 
 #[cfg(test)]
 unsafe fn probe_thread_save<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    // Host covers the triple-resolution shape (no live RSP swap).
     let _ = emit;
-    Ok(true)
+    let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+    let b = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
+    Ok(swap_target(&[a, b], 1).is_ok())
 }
 
 /// Pong entry (S06 slice 13): runs ON THE BOOT STACK inside the nested
@@ -990,28 +998,48 @@ extern "C" fn thread_pong_entry() {
     let _ = write_str(&mut emit, "THREAD-PONG-RUN id=1\n");
 }
 
-/// Ping-pong thread-B entry (S06 slice 13): runs ON THREAD-B via the
+/// Ping-pong thread-B entry (S06 slices 13-14): runs ON THREAD-B via the
 /// outer `run_on_thread_stack_with_save` (which spilled boot `RSP` to
-/// `THREAD_RSP_SAVE`). Performs the nested B->A hop through memory slots:
-/// spills B `RSP` to `THREAD_RSP_SAVE_B` and LOADS boot `RSP` from
-/// `THREAD_RSP_SAVE` in asm (`mov rdx, [new]` inside
-/// `swap_stacks_via_slots`), running `thread_pong_entry` on the boot
-/// stack. Return resumes B, then the outer epilogue resumes boot — the
-/// full A->B->A round trip. Kept separate from `thread_b_entry` so the
-/// earlier probes are untouched.
+/// `THREAD_RSP_SAVE`). Performs the nested B->A hop: read-once
+/// `read_volatile` of slot A (REVIEW #303 risk 3: exactly one read, value
+/// travels in a register — asm never re-reads the slot), resolve the pong
+/// `entry` through the `swap_target` triple for B->A (REVIEW #303 risk 2:
+/// no hardcoded entry — the same gate future `swap` asm must use), and run
+/// it on the loaded boot `RSP` via the slot-to-value switch. Return resumes
+/// B, then the outer epilogue resumes boot — the full A->B->A round trip.
+/// Kept separate from `thread_b_entry` so the earlier probes are untouched.
 #[cfg(not(test))]
 extern "C" fn thread_b_pingpong_entry() {
     unsafe {
-        let pong_ptr = thread_pong_entry as *const ();
-        if pong_ptr.is_null() {
+        // Read-once: single volatile read of the boot-RSP slot; the value
+        // below travels in a register into `swap_stacks_via_slots`.
+        let boot_rsp = core::ptr::read_volatile(core::ptr::addr_of!(THREAD_RSP_SAVE));
+        if boot_rsp == 0 || boot_rsp & 0xF != 0 {
             return;
         }
-        let pong: extern "C" fn() = core::mem::transmute(pong_ptr);
-        swap_stacks_via_slots(
-            core::ptr::addr_of_mut!(THREAD_RSP_SAVE_B),
-            core::ptr::addr_of!(THREAD_RSP_SAVE),
-            pong,
-        );
+        // Entry via the triple (B->A), not a hardcoded reference: rebuild
+        // the same descriptors the outer probe used (A entry = pong, B
+        // entry = self) and resolve through `swap_target`.
+        let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
+        let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
+        let pong_addr = thread_pong_entry as *const () as u64;
+        let self_addr = thread_b_pingpong_entry as *const () as u64;
+        let (a, b) = match (
+            Thread::new(1, base_a, 8192, pong_addr),
+            Thread::new(2, base_b, 8192, self_addr),
+        ) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return,
+        };
+        let (_, _, entry_a) = match swap_target(&[a, b], 2) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        if entry_a == 0 {
+            return;
+        }
+        let pong: extern "C" fn() = core::mem::transmute(entry_a as *const ());
+        swap_stacks_via_slots(core::ptr::addr_of_mut!(THREAD_RSP_SAVE_B), boot_rsp, pong);
     }
 }
 
@@ -1039,11 +1067,14 @@ fn write_thread_pong_line<E>(
     write_str(emit, "\n")
 }
 
-/// Full A->B->A ping-pong probe (S06 slice 13): resolve the same
-/// `swap_target` triple, zero both slots (stale-nonzero fail-open guard),
-/// run `thread_b_pingpong_entry` through `run_on_thread_stack_with_save`
-/// with `THREAD_RSP_SAVE` as slot A; the B entry nests
-/// `swap_stacks_via_slots` (slot B <- B `RSP`, target <- slot A) running
+/// Full A->B->A ping-pong probe (S06 slices 13-14): resolve the
+/// `swap_target` triple for A->B (thread B entry IS `thread_b_pingpong_
+/// entry`, so the triple `entry` half is the function actually called —
+/// REVIEW #303 risk 2: no discarded `(_, top, _)` + hardcoded transmute),
+/// zero both slots (stale-nonzero fail-open guard), run the triple `entry`
+/// through `run_on_thread_stack_with_save` with `THREAD_RSP_SAVE` as slot
+/// A; the B entry nests the slot-to-value switch (slot B <- B `RSP`,
+/// target = read-once boot `RSP` value, entry = B->A triple entry) running
 /// `thread_pong_entry` on the loaded boot stack. Checks both slots and
 /// emits the `THREAD-PONG` line. Never panics.
 ///
@@ -1054,10 +1085,14 @@ fn write_thread_pong_line<E>(
 unsafe fn probe_thread_pingpong<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
     let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
     let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
-    let entry_b = thread_b_entry as *const () as u64;
+    // Both entries are real fn addresses in the triple: A = pong (used by
+    // the nested B->A hop via its own `swap_target` resolve), B = pingpong
+    // (called below through the outer triple `entry`, not hardcoded).
+    let pong_addr = thread_pong_entry as *const () as u64;
+    let pingpong_addr = thread_b_pingpong_entry as *const () as u64;
     let (a, b) = match (
-        Thread::new(1, base_a, 8192, 0x1000),
-        Thread::new(2, base_b, 8192, entry_b),
+        Thread::new(1, base_a, 8192, pong_addr),
+        Thread::new(2, base_b, 8192, pingpong_addr),
     ) {
         (Ok(a), Ok(b)) => (a, b),
         _ => {
@@ -1065,25 +1100,24 @@ unsafe fn probe_thread_pingpong<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -
             return Ok(false);
         }
     };
-    let (_, top, _) = match swap_target(&[a, b], 1) {
+    let (_, top, entry_b) = match swap_target(&[a, b], 1) {
         Ok(t) => t,
         Err(_) => {
             write_thread_pong_line::<E>(false, 0, 0, emit)?;
             return Ok(false);
         }
     };
+    if entry_b == 0 || entry_b != pingpong_addr {
+        write_thread_pong_line::<E>(false, 0, 0, emit)?;
+        return Ok(false);
+    }
     let slot_a = core::ptr::addr_of_mut!(THREAD_RSP_SAVE);
     let slot_b = core::ptr::addr_of_mut!(THREAD_RSP_SAVE_B);
     // Fail-closed: zero both slots first so a no-save path prints ok=0
     // instead of a stale nonzero value (same guard as `probe_thread_save`).
     core::ptr::write_volatile(slot_a, 0);
     core::ptr::write_volatile(slot_b, 0);
-    let pingpong_ptr = thread_b_pingpong_entry as *const ();
-    if pingpong_ptr.is_null() {
-        write_thread_pong_line::<E>(false, 0, 0, emit)?;
-        return Ok(false);
-    }
-    let func_b: extern "C" fn() = core::mem::transmute(pingpong_ptr);
+    let func_b: extern "C" fn() = core::mem::transmute(entry_b as *const ());
     run_on_thread_stack_with_save(slot_a, top, func_b);
     let saved_a = core::ptr::read_volatile(slot_a);
     let saved_b = core::ptr::read_volatile(slot_b);
@@ -1099,8 +1133,12 @@ unsafe fn probe_thread_pingpong<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -
 
 #[cfg(test)]
 unsafe fn probe_thread_pingpong<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    // Host covers the triple-resolution shape (no live RSP swap): the same
+    // descriptors the guest builds must resolve through `swap_target`.
     let _ = emit;
-    Ok(true)
+    let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+    let b = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
+    Ok(swap_target(&[a, b], 1).is_ok())
 }
 
 /// Emit the one-line `THREAD-CS` diagnostic: `THREAD-CS ok=<0|1> iter=<n>`
@@ -1265,6 +1303,43 @@ unsafe fn probe_thread_callee_saved<E>(
         // `ok=1`. `THREAD-CS` line shape unchanged (`ok=1 iter=16`), still
         // hard-required by `boot-uefi.ps1`.
         if !rbp_preserved(top, clobber) {
+            write_thread_cs_line::<E>(false, 16, emit)?;
+            return Ok(false);
+        }
+        // S06 slice 14 (REVIEW #303 risk 1): the two newer asm paths get
+        // the same hostile-callee treatment — clobber stub through
+        // `with_save` (slot-owned save) and through the slot-to-value
+        // switch (read-once boot-RSP-shaped value `top`), each with its own
+        // sentinel + read-only `rbp` proof. The base-path checks above
+        // would miss a push/pop imbalance confined to either new epilogue;
+        // ` THREAD-CS` line shape unchanged (`ok=1 iter=16`), still
+        // hard-required by `boot-uefi.ps1`.
+        let slot = core::ptr::addr_of_mut!(THREAD_RSP_SAVE);
+        core::ptr::write_volatile(slot, 0);
+        run_on_thread_stack_with_save(slot, top, clobber);
+        if core::ptr::read_volatile(slot) == 0 {
+            write_thread_cs_line::<E>(false, 16, emit)?;
+            return Ok(false);
+        }
+        if !callee_saved_survives_with_save(slot, top, clobber) {
+            write_thread_cs_line::<E>(false, 16, emit)?;
+            return Ok(false);
+        }
+        if !rbp_preserved_with_save(slot, top, clobber) {
+            write_thread_cs_line::<E>(false, 16, emit)?;
+            return Ok(false);
+        }
+        core::ptr::write_volatile(slot, 0);
+        swap_stacks_via_slots(slot, top, clobber);
+        if core::ptr::read_volatile(slot) == 0 {
+            write_thread_cs_line::<E>(false, 16, emit)?;
+            return Ok(false);
+        }
+        if !callee_saved_survives_via_slots(slot, top, clobber) {
+            write_thread_cs_line::<E>(false, 16, emit)?;
+            return Ok(false);
+        }
+        if !rbp_preserved_via_slots(slot, top, clobber) {
             write_thread_cs_line::<E>(false, 16, emit)?;
             return Ok(false);
         }
