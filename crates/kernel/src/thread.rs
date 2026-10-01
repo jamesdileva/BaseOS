@@ -558,6 +558,55 @@ pub unsafe fn callee_saved_survives(_new_top: u64, _func: extern "C" fn()) -> bo
     true
 }
 
+/// Read-only `rbp` preservation proof (S06 slice 11, REVIEW #293 risk 1).
+///
+/// `rbp` is the frame pointer, so it can never be covered by the sentinel
+/// write in [`callee_saved_survives`] (overwriting it across a Rust call
+/// corrupts frame-relative accesses and the epilogue restore). This check
+/// therefore never WRITES `rbp`: it captures `rbp` before and after one
+/// `run_on_thread_stack` call and compares bit-exact. A missing or
+/// unbalanced `push rbp` / `pop rbp` in `run_on_thread_stack` (or a
+/// callee that escapes the caller-stack restore) returns `false` and the
+/// guest fails loud (`THREAD-CS ok=0`).
+///
+/// Capture uses `mov {v}, rbp` into a general `out(reg)` with no pinned
+/// outs; `rbx`/`rbp` need no reservation (LLVM reserves `rbx` internally
+/// and `rbp` is the frame pointer, so `in(reg)`/`out(reg)` are never
+/// allocated there — the compiler rejects `out("rbx")`/`out("rbp")`
+/// outright, same rule documented on [`run_on_thread_stack`]).
+///
+/// # Safety
+/// Same contract as [`run_on_thread_stack`]: guest-only, post-EBS, `cli`
+/// in effect, `new_top`/`func` from [`swap_target`]. Host builds compile
+/// to a stub returning `true` (never touches registers).
+#[cfg(not(test))]
+pub unsafe fn rbp_preserved(new_top: u64, func: extern "C" fn()) -> bool {
+    let before: u64;
+    core::arch::asm!(
+        "mov {v}, rbp",
+        v = out(reg) before,
+        options(nomem, nostack, preserves_flags),
+    );
+    run_on_thread_stack(new_top, func);
+    let after: u64;
+    core::arch::asm!(
+        "mov {v}, rbp",
+        v = out(reg) after,
+        options(nomem, nostack, preserves_flags),
+    );
+    before == after
+}
+
+/// Host stub: `rbp` proof is e2e-only; always `true` so host tests stay
+/// register-safe.
+///
+/// # Safety
+/// Host `cargo test` only: no-op.
+#[cfg(test)]
+pub unsafe fn rbp_preserved(_new_top: u64, _func: extern "C" fn()) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,6 +913,11 @@ mod tests {
         // (would switch stacks outside the guest).
         let probe: unsafe fn(u64, extern "C" fn()) = run_on_thread_stack;
         let _ = probe;
+        // S06 slice 11: both preservation proofs keep the same shape.
+        let sentinel: unsafe fn(u64, extern "C" fn()) -> bool = callee_saved_survives;
+        let _ = sentinel;
+        let rbp_only: unsafe fn(u64, extern "C" fn()) -> bool = rbp_preserved;
+        let _ = rbp_only;
     }
 
     #[test]

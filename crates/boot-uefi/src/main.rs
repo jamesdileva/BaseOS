@@ -42,7 +42,7 @@ use baseos_kernel::page_table::{
     walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
 };
 #[cfg(not(test))]
-use baseos_kernel::thread::callee_saved_survives;
+use baseos_kernel::thread::{callee_saved_survives, rbp_preserved};
 use baseos_kernel::thread::{run_on_thread_stack, swap_target, Thread};
 use baseos_kernel::uart::{com1_write_byte, uart_init};
 use baseos_serial_marker::write_marker;
@@ -979,14 +979,20 @@ unsafe fn probe_thread_swap<E>(
     Ok((true, id, top, entry))
 }
 
-/// S06 slice 10 callee-saved stress + preservation: resolve the same
-/// `swap_target` triple, run the naked clobber stub on the target stack 16
-/// times through `run_on_thread_stack` (liveness), then run ONE sentinel
-/// preservation check via `callee_saved_survives` and emit the `THREAD-CS`
-/// line. Any push/pop imbalance corrupts within a few iterations and faults
-/// loudly; a swapped-but-balanced pop order (REVIEW #291 gap 1) passes
-/// liveness but fails the sentinel compare -> `ok=0`. Returns `Ok(true)`
-/// only on full 16-iteration run PLUS preservation. Never panics.
+/// S06 slice 10 callee-saved stress + preservation, slice 11 `rbp`
+/// read-only proof: resolve the same `swap_target` triple, run the naked
+/// clobber stub on the target stack 16 times through
+/// `run_on_thread_stack` (liveness), then run ONE sentinel preservation
+/// check via `callee_saved_survives` plus ONE read-only `rbp` check via
+/// `rbp_preserved` (REVIEW #293 risk 1: `rbp` can never take a sentinel
+/// write as frame pointer, so it is captured before/after and compared)
+/// and emit the `THREAD-CS` line. Any push/pop imbalance corrupts within
+/// a few iterations and faults loudly; a swapped-but-balanced pop order
+/// (REVIEW #291 gap 1) passes liveness but fails the sentinel compare ->
+/// `ok=0`; a missing/unbalanced `push rbp`/`pop rbp` passes the five-reg
+/// sentinel (which excludes `rbp`) but fails the read-only compare ->
+/// `ok=0`. Returns `Ok(true)` only on full 16-iteration run PLUS both
+/// proofs. Never panics.
 ///
 /// # Safety
 /// Post-EBS only, same contract as [`probe_thread_swap`]: owns the static
@@ -1034,6 +1040,16 @@ unsafe fn probe_thread_callee_saved<E>(
             k += 1;
         }
         if !callee_saved_survives(top, clobber) {
+            write_thread_cs_line::<E>(false, 16, emit)?;
+            return Ok(false);
+        }
+        // S06 slice 11 (REVIEW #293 risk 1): read-only `rbp` proof against
+        // the same hostile stub (which trashes `rbp` with 0xBEEF...). The
+        // five-reg sentinel above excludes `rbp` by design (frame pointer),
+        // so without this a `push rbp`/`pop rbp` omission would still print
+        // `ok=1`. `THREAD-CS` line shape unchanged (`ok=1 iter=16`), still
+        // hard-required by `boot-uefi.ps1`.
+        if !rbp_preserved(top, clobber) {
             write_thread_cs_line::<E>(false, 16, emit)?;
             return Ok(false);
         }
