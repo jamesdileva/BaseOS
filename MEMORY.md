@@ -3,7 +3,7 @@
 Review before each work segment. Keep ≤20 lines, compact.
 
 - Goal: perf-first x86-64 UEFI desktop OS, Rust-first; docs in repo root.
-- Now: S06 slice14 @81cc614 (REVIEW #303 3 gaps closed: slot-path
+- Now: S06 slice14 done @81cc614 + close-out @eb90de9 (REVIEW #303 3 gaps closed: slot-path
   sentinel/rbp proof, triple entry both hops, read-once new_rsp).
   140 host green (21+18+91+4+4+2), fmt/clippy clean, UEFI 0 warn.
   QEMU PASS (PONG ok=1 save_a=0xfe64760 save_b=0xde37cd0, PONG-RUN
