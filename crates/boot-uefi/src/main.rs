@@ -42,7 +42,7 @@ use baseos_kernel::page_table::{
     walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
 };
 #[cfg(not(test))]
-use baseos_kernel::thread::{callee_saved_survives, rbp_preserved};
+use baseos_kernel::thread::{callee_saved_survives, rbp_preserved, run_on_thread_stack_with_save};
 use baseos_kernel::thread::{run_on_thread_stack, swap_target, Thread};
 use baseos_kernel::uart::{com1_write_byte, uart_init};
 use baseos_serial_marker::write_marker;
@@ -849,6 +849,13 @@ struct AlignedStack([u8; 8192]);
 static mut THREAD_STACK_A: AlignedStack = AlignedStack([0; 8192]);
 static mut THREAD_STACK_B: AlignedStack = AlignedStack([0; 8192]);
 
+/// Caller-owned two-way save slot (S06 slice 12): `run_on_thread_stack_
+// with_save` spills the boot `RSP` here before switching, so the save
+/// lives in caller memory (ping-pong capable) rather than only on the new
+/// stack. Zero until the `THREAD-SAVE` probe runs.
+#[cfg(not(test))]
+static mut THREAD_RSP_SAVE: u64 = 0;
+
 /// Second-thread entry: runs ON the swapped-to stack (the `call` in
 /// `run_on_thread_stack` pushes its return address there, and this body
 /// spills its own frame there). Emits the proof line, then returns so the
@@ -886,6 +893,79 @@ core::arch::global_asm!(
 #[cfg(not(test))]
 extern "C" {
     fn thread_clobber_asm();
+}
+
+/// Emit the one-line `THREAD-SAVE` diagnostic (S06 slice 12, first true
+/// two-way half): `THREAD-SAVE ok=<0|1> save=<0x...>` — `ok` is 1 only
+/// when `run_on_thread_stack_with_save` ran `thread_b_entry` on the
+/// swap-target stack, returned to the boot stack, AND the caller-owned
+/// save slot holds a nonzero 16-byte-aligned boot `RSP` (proves the save
+/// to memory happened, not just the new-stack return slot).
+#[cfg(not(test))]
+fn write_thread_save_line<E>(
+    ok: bool,
+    save: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "THREAD-SAVE ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " save=")?;
+    write_u64_hex(emit, save)?;
+    write_str(emit, "\n")
+}
+
+/// Two-way save-slot probe (S06 slice 12): resolve the same `swap_target`
+/// triple, run `thread_b_entry` through `run_on_thread_stack_with_save`
+/// with `THREAD_RSP_SAVE` as the caller-owned slot, then check the slot
+/// is a nonzero 16-byte-aligned `RSP` and emit the `THREAD-SAVE` line.
+/// Liveness (return) + save proof; full A->B->A ping-pong is the next
+/// slice. Never panics.
+///
+/// # Safety
+/// Post-EBS only, same contract as [`probe_thread_swap`]: owns the static
+/// stacks plus the save slot, `cli` in effect, COM1 exclusive.
+#[cfg(not(test))]
+unsafe fn probe_thread_save<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
+    let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
+    let entry_b = thread_b_entry as *const () as u64;
+    let (a, b) = match (
+        Thread::new(1, base_a, 8192, 0x1000),
+        Thread::new(2, base_b, 8192, entry_b),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            write_thread_save_line::<E>(false, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let (_, top, entry) = match swap_target(&[a, b], 1) {
+        Ok(t) => t,
+        Err(_) => {
+            write_thread_save_line::<E>(false, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    if entry == 0 {
+        write_thread_save_line::<E>(false, 0, emit)?;
+        return Ok(false);
+    }
+    let func: extern "C" fn() = core::mem::transmute(entry as *const ());
+    let slot = core::ptr::addr_of_mut!(THREAD_RSP_SAVE);
+    // Fail-closed: zero the slot first so a no-save path prints ok=0
+    // instead of a stale nonzero value.
+    core::ptr::write_volatile(slot, 0);
+    run_on_thread_stack_with_save(slot, top, func);
+    let saved = core::ptr::read_volatile(slot);
+    let ok = saved != 0 && saved & 0xF == 0;
+    write_thread_save_line::<E>(ok, if ok { saved } else { 0 }, emit)?;
+    Ok(ok)
+}
+
+#[cfg(test)]
+unsafe fn probe_thread_save<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    let _ = emit;
+    Ok(true)
 }
 
 /// Emit the one-line `THREAD-CS` diagnostic: `THREAD-CS ok=<0|1> iter=<n>`
@@ -1172,6 +1252,9 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // S06 slice 9: callee-saved stress — 16 clobber swaps on the
             // same target stack, THREAD-CS ok=1 iter=16 (fail-loud).
             let _ = probe_thread_callee_saved::<Infallible>(&mut emit);
+            // S06 slice 12: two-way save-slot probe — THREAD-SAVE ok=1
+            // (fail-loud on missing/zero/misaligned save).
+            let _ = probe_thread_save::<Infallible>(&mut emit);
             baseos_kernel::bring_up_cpu_and_prove_exception();
         }
         // EBS failed: still own boot services — park fail-loud (e2e sees

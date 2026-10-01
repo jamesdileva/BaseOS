@@ -479,6 +479,89 @@ pub unsafe fn run_on_thread_stack(new_top: u64, func: extern "C" fn()) {
 #[cfg(test)]
 pub unsafe fn run_on_thread_stack(_new_top: u64, _func: extern "C" fn()) {}
 
+/// Two-way `RSP` save/restore probe (S06 slice 12): like
+/// [`run_on_thread_stack`], but the caller `RSP` is additionally saved to
+/// caller-owned memory (`*old_save`) BEFORE the stack switch, so two
+/// thread stacks can ping-pong through memory slots instead of a single
+/// return slot.
+///
+/// Mechanism: caller-saved pushes (same six as `run_on_thread_stack`),
+/// then `mov [old_save], rax` spills the boot `RSP` to memory while still
+/// on the boot stack; `mov rsp, top`; `push rax` (boot `RSP`) + `push
+/// old_save` (pointer spill, so post-`call` recovery never depends on a
+/// register surviving the hostile callee — the slice 10 lesson applied to
+/// the pointer itself); `call func`; `pop rdx` (pointer) + `pop rax`
+/// (boot `RSP`); `mov rsp, rax`; caller-saved pops. Fail-closed: null
+/// `old_save` returns with no register or stack touch (Rust guard before
+/// the asm, host-testable).
+///
+/// # Safety
+/// Same contract as [`run_on_thread_stack`]: guest-only, post-EBS, `cli`
+/// in effect, `new_top`/`func` from [`swap_target`], `old_save` non-null,
+/// 8-byte aligned, writable caller memory. Host `cargo test` builds
+/// compile to a no-op stub (never touches registers or memory).
+#[cfg(not(test))]
+pub unsafe fn run_on_thread_stack_with_save(
+    old_save: *mut u64,
+    new_top: u64,
+    func: extern "C" fn(),
+) {
+    if old_save.is_null() {
+        return;
+    }
+    // Same reservation rule as `run_on_thread_stack`: `rbx`/`rbp` need no
+    // `out` (LLVM-reserved / frame pointer, compiler rejects the `out`);
+    // every other literal reg touched (`r12`-`r15` + `rax`/`rdx` scratch)
+    // is declared `out` so inputs are never allocated there.
+    core::arch::asm!(
+        "push r15",
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
+        "mov rax, rsp",
+        "mov [{save}], rax",
+        "mov rsp, {top}",
+        "push rax",
+        "push {save}",
+        "call {func}",
+        "pop rdx",
+        "pop rax",
+        "mov rsp, rax",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
+        "pop r15",
+        save = in(reg) old_save,
+        top = in(reg) new_top,
+        func = in(reg) func,
+        out("rax") _,
+        out("rdx") _,
+        out("r12") _,
+        out("r13") _,
+        out("r14") _,
+        out("r15") _,
+        clobber_abi("C"),
+    );
+}
+
+/// Host-test stub: null fails closed (no touch), non-null is a register-
+/// safe no-op (live `RSP` proof is e2e-only).
+///
+/// # Safety
+/// Host `cargo test` only: no-op.
+#[cfg(test)]
+pub unsafe fn run_on_thread_stack_with_save(
+    old_save: *mut u64,
+    _new_top: u64,
+    _func: extern "C" fn(),
+) {
+    if old_save.is_null() {}
+}
+
 /// Caller-side preservation proof (S06 slice 10, REVIEW #291 gap 1).
 ///
 /// Liveness (`THREAD-CS` 16x returns) does NOT prove preservation: pops in
@@ -918,6 +1001,10 @@ mod tests {
         let _ = sentinel;
         let rbp_only: unsafe fn(u64, extern "C" fn()) -> bool = rbp_preserved;
         let _ = rbp_only;
+        // S06 slice 12: two-way save-slot probe keeps the unsafe-fn shape
+        // (raw `mov [save], rsp` + `mov rsp, ...` + indirect `call`).
+        let with_save: unsafe fn(*mut u64, u64, extern "C" fn()) = run_on_thread_stack_with_save;
+        let _ = with_save;
     }
 
     #[test]
@@ -963,6 +1050,20 @@ mod tests {
         assert_eq!(entry, addr);
         let back2: extern "C" fn() = unsafe { core::mem::transmute(entry as *const ()) };
         back2();
+    }
+
+    #[test]
+    fn with_save_null_fails_closed_host_stub() {
+        // S06 slice 12: null `old_save` must fail closed (no touch, no
+        // trap) on the host stub; non-null is a register-safe no-op that
+        // leaves the slot untouched (live save is e2e-only).
+        extern "C" fn dummy() {}
+        unsafe {
+            run_on_thread_stack_with_save(core::ptr::null_mut(), 0x2000_0000, dummy);
+            let mut slot: u64 = 0x1234_5678_9ABC_DEF0;
+            run_on_thread_stack_with_save(&mut slot as *mut u64, 0x2000_0000, dummy);
+            assert_eq!(slot, 0x1234_5678_9ABC_DEF0);
+        }
     }
 
     #[test]

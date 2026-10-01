@@ -3,11 +3,11 @@
 Review before each work segment. Keep ≤20 lines, compact.
 
 - Goal: perf-first x86-64 UEFI desktop OS, Rust-first; docs in repo root.
-- Now: S06 slice11 (read-only rbp_preserved + folded into THREAD-CS ok=1).
-  138 host tests green (21+18+89+4+4+2), fmt/clippy host+uefi clean,
-  UEFI 0 warnings. QEMU PASS 1023B
-  (THREAD+THREAD-RUN+THREAD-CS iter=16+PF+EXC). REVIEW #295 accept stood.
-- Next: true two-way RSP save/restore; #293 risks 2-3 carried
+- Now: S06 slice12 (two-way save-slot probe + THREAD-SAVE ok=1).
+  139 host tests green (21+18+90+4+4+2), fmt/clippy host+uefi clean,
+  UEFI 0 warnings. QEMU PASS 1071B
+  (THREAD+THREAD-RUN+THREAD-CS iter=16+THREAD-SAVE+PF+EXC). REVIEW #297 accept stood.
+- Next: full A->B->A ping-pong through two save slots; #297 risks (a)(b) carried
   (rbx/FP reservation disproof, FP pinning).
 - Board: #9 active (S06 threads). OK per human #79/#80.
 - Conventions: STRUCTURAL_FAIL = usize::MAX; ASCII .ps1; raw EFI;
