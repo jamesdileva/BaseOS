@@ -79,6 +79,24 @@ impl Scheduler {
         self.current
     }
 
+    /// Lifecycle state of one spawned thread (`None` when unknown id).
+    /// Test- and guest-wiring query: read-only, never mutates, so the
+    /// first-dispatch bookkeeping (boot stays `Ready`, parked-nothing)
+    /// is assertable without exposing `&mut` table access.
+    #[must_use]
+    pub fn state_of(&self, id: u64) -> Option<ThreadState> {
+        let mut i = 0;
+        while i < self.len {
+            if let Some(t) = self.table[i] {
+                if t.id() == id {
+                    return Some(t.state());
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// Live table as a packed array copy for the picker. Packed (no holes):
     /// `spawn` appends, never leaves `None` inside `[..len)`. Copies every
     /// populated slot over the full capacity, so a just-written
@@ -257,14 +275,139 @@ mod tests {
         // REVIEW #321 residual (a): `new(current)` never marks `current`
         // `Running`, so the first `dispatch` parks nothing — the
         // ex-current stays `Ready` while the pick moves to `Running`.
+        // REVIEW #325 gate (2): pin the STATES, not just the ids — a
+        // future `dispatch` rewrite that flips ids correctly but parks
+        // wrong (e.g. marks boot `Running` on first dispatch) must go red.
         let mut s = Scheduler::new(1);
         assert!(s.spawn(mk(1, 0x1000_0000)));
         assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert_eq!(s.state_of(1), Some(ThreadState::Ready));
+        assert_eq!(s.state_of(2), Some(ThreadState::Ready));
         assert_eq!(s.dispatch(), Ok(2));
         assert_eq!(s.current(), 2);
+        assert_eq!(s.state_of(1), Some(ThreadState::Ready));
+        assert_eq!(s.state_of(2), Some(ThreadState::Running));
         // Second dispatch onward parks the previous Running thread.
         assert_eq!(s.dispatch(), Ok(1));
         assert_eq!(s.current(), 1);
+        assert_eq!(s.state_of(2), Some(ThreadState::Ready));
+        assert_eq!(s.state_of(1), Some(ThreadState::Running));
+    }
+
+    /// Strip `/* ... */` (nested), `//` line comments, and blank string/char
+    /// literal contents so the no-`Cell` pin below scans CODE only.
+    ///
+    /// S06 slice 17 (REVIEW #325 gate 1): the slice-16 strip was
+    /// block-only, non-nesting, and string-blind — a `"` inside a block
+    /// comment or a `/*` inside a `"..."` literal desynced it (skipped
+    /// real code or swallowed it), and a split token (`Cell/*c*/<`) relied
+    /// on accidental rejoin. This lexer blanks `"..."`/`'...'` (escapes
+    /// honored, newline preserved) and tracks block depth, so:
+    /// `Cell/*"Cell"*/<` rejoins to `Cell<` (quote in comment is inert)
+    /// and `"/*Cell*/" Cell<` keeps the literal blank but the trailing
+    /// code token (string markers never start a comment).
+    #[cfg(test)]
+    fn strip_code(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        let mut block_depth: usize = 0;
+        while i < bytes.len() {
+            if block_depth > 0 {
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    block_depth += 1;
+                    i += 2;
+                } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    block_depth -= 1;
+                    i += 2;
+                } else {
+                    if bytes[i] == b'\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            let b = bytes[i];
+            if b == b'"' {
+                out.push('"');
+                i += 1;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    if c == b'\n' {
+                        out.push('\n');
+                        i += 1;
+                        break;
+                    }
+                    if c == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    if c == b'"' {
+                        out.push('"');
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if b == b'\'' {
+                out.push('\'');
+                i += 1;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    if c == b'\n' {
+                        out.push('\n');
+                        i += 1;
+                        break;
+                    }
+                    if c == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    if c == b'\'' {
+                        out.push('\'');
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if i + 1 < bytes.len() && b == b'/' && bytes[i + 1] == b'*' {
+                block_depth = 1;
+                i += 2;
+                continue;
+            }
+            if i + 1 < bytes.len() && b == b'/' && bytes[i + 1] == b'/' {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(b as char);
+            i += 1;
+        }
+        if block_depth != 0 {
+            panic!("unterminated block comment");
+        }
+        out
+    }
+
+    #[test]
+    fn strip_code_keeps_split_token_but_ignores_strings() {
+        // Quote inside a block comment is inert: split token rejoins.
+        assert!(strip_code("Cell/*\"Cell\"*/<").contains("Cell<"));
+        // Block markers inside a string never start a comment: the literal
+        // blanks to `""` and the trailing code token survives.
+        let s = strip_code("\"/*Cell*/\" Cell<");
+        assert!(s.contains("Cell<"));
+        assert!(!s.contains("/*"));
+        // Nested blocks strip fully; pure-string banned text blanks out.
+        assert!(strip_code("/* o /* i */ s */Cell<").contains("Cell<"));
+        assert!(!strip_code("\"Cell<\"").contains("Cell<"));
+        assert!(!strip_code("// Cell<").contains("Cell<"));
     }
 
     #[test]
@@ -287,31 +430,9 @@ mod tests {
         ];
         // Strip block comments first so a banned token hidden inside
         // `/* ... */` cannot slip past the line-based doc filter.
-        let bytes = SRC.as_bytes();
-        let mut stripped = std::string::String::with_capacity(SRC.len());
-        let mut k = 0usize;
-        let mut in_block = false;
-        while k < bytes.len() {
-            if !in_block && k + 1 < bytes.len() && bytes[k] == b'/' && bytes[k + 1] == b'*' {
-                in_block = true;
-                k += 2;
-            } else if in_block && k + 1 < bytes.len() && bytes[k] == b'*' && bytes[k + 1] == b'/' {
-                in_block = false;
-                k += 2;
-            } else if in_block {
-                // Keep newlines so line numbers survive the strip.
-                if bytes[k] == b'\n' {
-                    stripped.push('\n');
-                }
-                k += 1;
-            } else {
-                stripped.push(bytes[k] as char);
-                k += 1;
-            }
-        }
-        if in_block {
-            panic!("unterminated block comment in sched.rs");
-        }
+        // String/char-aware + nesting (see `strip_code`): a `"` inside a
+        // block or a `/*` inside a literal no longer desyncs the strip.
+        let stripped = strip_code(SRC);
         let mut in_code = true;
         let sbytes = stripped.as_bytes();
         let mut line_start = 0usize;
