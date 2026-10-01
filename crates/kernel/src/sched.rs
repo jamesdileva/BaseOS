@@ -320,6 +320,18 @@ mod tests {
     /// real code to the next `*/`) and a lifetime `'a` would open a phantom
     /// char literal (swallows code to the next `'`), both desyncing the
     /// `Cell` pin in exactly the way gate 1 was built to prevent.
+    ///
+    /// Slice 17c (REVIEW #330 residuals): raw prefix requires an ident
+    /// boundary (the `r`/`b` must not follow `[0-9A-Za-z_]`, so `bar"#"`
+    /// lexes as ident `bar` + normal string, never a raw open — without
+    /// this `bar#"fake" Cell<` false-opens a 1-hash raw and blanks the
+    /// real `Cell<` to EOF). `rb` handled symmetrically with `br` (not
+    /// valid Rust, but blanked the same way a normal string would be, so
+    /// the pin is a superset either way). Known doc-only limits: multi-byte
+    /// char literals (`'é'`) fall back to lifetime-shape (single-char body
+    /// can never hide `Cell<`, so no pin bypass) and an unterminated raw
+    /// blanks to EOF (unterminated is a compile error — no real code after
+    /// matters).
     #[cfg(test)]
     fn strip_code(src: &str) -> String {
         let bytes = src.as_bytes();
@@ -344,7 +356,20 @@ mod tests {
             }
             // Raw string open: `[b]r#*"`. Hash count pins the close
             // (`"` + that many `#`); content is raw (no escapes).
-            let r_pos = if bytes[i] == b'r' {
+            // Slice 17c: ident-boundary + `rb` symmetry (REVIEW #330).
+            let prev_ident = i > 0
+                && matches!(
+                    bytes[i - 1],
+                    b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'_'
+                );
+            let r_pos = if prev_ident {
+                None
+            } else if bytes[i] == b'r' && i + 1 < bytes.len() && bytes[i + 1] == b'b' {
+                // `rb#*"` (not valid Rust; blanked symmetrically with `br`
+                // so the pin stays a superset — the `rb` body would blank
+                // as a normal string either way).
+                Some(i + 1)
+            } else if bytes[i] == b'r' {
                 Some(i)
             } else if bytes[i] == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'r' {
                 Some(i + 1)
@@ -496,6 +521,22 @@ mod tests {
         // Sanity: real char literals still blank.
         assert!(!strip_code("'C'").contains("Cell<"));
         assert!(strip_code("'C' Cell<").contains("Cell<"));
+        // REVIEW #330 cheapest disproof (slice 17c): `rb` blanks like `br`
+        // (superset — would blank as a normal string either way), and a raw
+        // prefix glued to an ident never opens (else `bar#"fake" Cell<`
+        // false-opens a 1-hash raw with no `"#` close and blanks the real
+        // `Cell<` to EOF, while the correct ident + normal-string lex keeps
+        // it).
+        let rb = strip_code("rb\"/*Cell*/\" Cell<");
+        assert!(rb.contains("Cell<"));
+        assert!(!rb.contains("/*"));
+        let br = strip_code("br\"/*Cell*/\" Cell<");
+        assert!(br.contains("Cell<"));
+        assert!(!br.contains("/*"));
+        let glued = strip_code("bar#\"fake\" Cell<");
+        assert!(glued.contains("Cell<"));
+        let glued_br = strip_code("foobarbr#\"fake\" Cell<");
+        assert!(glued_br.contains("Cell<"));
     }
 
     #[test]
