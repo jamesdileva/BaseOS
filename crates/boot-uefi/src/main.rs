@@ -41,6 +41,8 @@ use baseos_kernel::page_table::{
     guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
     walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
 };
+#[cfg(not(test))]
+use baseos_kernel::thread::callee_saved_survives;
 use baseos_kernel::thread::{run_on_thread_stack, swap_target, Thread};
 use baseos_kernel::uart::{com1_write_byte, uart_init};
 use baseos_serial_marker::write_marker;
@@ -857,12 +859,15 @@ extern "C" fn thread_b_entry() {
     let _ = write_str(&mut emit, "THREAD-RUN id=2\n");
 }
 
-// S06 slice 9: naked hostile callee — trashes the callee-saved set
-// (`rbx`, `rbp`, `r12`-`r14`) then returns. `global_asm` (no compiler
+// S06 slice 10: naked hostile callee — trashes the full callee-saved set
+// (`rbx`, `rbp`, `r12`-`r15`) then returns. `global_asm` (no compiler
 // prologue/epilogue), so the trash is real as seen by the caller:
 // `run_on_thread_stack`'s caller-stack push/pop must undo it, or the
 // boot thread corrupts within a few stress iterations (fail-loud via
-// missing `THREAD-CS` line, never silent).
+// missing `THREAD-CS` line, never silent). Slice 9 covered only
+// `rbx`/`rbp`/`r12`-`r14`, leaving the old `r15`-as-RSP spill untested
+// (REVIEW #291 gap 2); slice 10 spills old `RSP` to the new stack and
+// trashes `r15` too, so the SPoF path is proven.
 #[cfg(not(test))]
 core::arch::global_asm!(
     r#"
@@ -873,6 +878,7 @@ core::arch::global_asm!(
         movabs r12, 0x1212121212121212
         movabs r13, 0x1313131313131313
         movabs r14, 0x1414141414141414
+        movabs r15, 0x1515151515151515
         ret
 "#
 );
@@ -973,12 +979,14 @@ unsafe fn probe_thread_swap<E>(
     Ok((true, id, top, entry))
 }
 
-/// S06 slice 9 callee-saved stress: resolve the same `swap_target` triple,
-/// then run the naked clobber stub on the target stack 16 times through
-/// `run_on_thread_stack` and emit the `THREAD-CS` line. Any push/pop
-/// imbalance (or missing callee-saved spill) corrupts the caller stack
-/// within a few iterations and faults loudly (missing lines fail e2e).
-/// Returns `Ok(true)` only on the full 16-iteration run. Never panics.
+/// S06 slice 10 callee-saved stress + preservation: resolve the same
+/// `swap_target` triple, run the naked clobber stub on the target stack 16
+/// times through `run_on_thread_stack` (liveness), then run ONE sentinel
+/// preservation check via `callee_saved_survives` and emit the `THREAD-CS`
+/// line. Any push/pop imbalance corrupts within a few iterations and faults
+/// loudly; a swapped-but-balanced pop order (REVIEW #291 gap 1) passes
+/// liveness but fails the sentinel compare -> `ok=0`. Returns `Ok(true)`
+/// only on full 16-iteration run PLUS preservation. Never panics.
 ///
 /// # Safety
 /// Post-EBS only, same contract as [`probe_thread_swap`]: owns the static
@@ -1009,21 +1017,25 @@ unsafe fn probe_thread_callee_saved<E>(
                 return Ok(false);
             }
         };
-        // `thread_clobber_asm` is a naked asm stub (unsafe foreign fn
-        // under this toolchain); it only writes the callee-saved regs
-        // and returns, and `run_on_thread_stack` preserves exactly that
-        // set on the caller stack — so calling it as a safe fn pointer
-        // is sound here. Same transmute idiom as `probe_thread_swap`.
-        let clobber_addr = thread_clobber_asm as *const () as usize as u64;
-        if clobber_addr == 0 {
+        // `thread_clobber_asm` is a naked asm stub: it only writes the
+        // callee-saved regs and returns, and `run_on_thread_stack` preserves
+        // exactly that set on the caller stack. Transmute the `*const ()`
+        // directly (REVIEW #291 nit: the old `as usize as u64 -> as *const ()`
+        // round-trip loses provenance for no reason).
+        let clobber_ptr = thread_clobber_asm as *const ();
+        if clobber_ptr.is_null() {
             write_thread_cs_line::<E>(false, 0, emit)?;
             return Ok(false);
         }
-        let clobber: extern "C" fn() = unsafe { core::mem::transmute(clobber_addr as *const ()) };
+        let clobber: extern "C" fn() = unsafe { core::mem::transmute(clobber_ptr) };
         let mut k = 0;
         while k < 16 {
             run_on_thread_stack(top, clobber);
             k += 1;
+        }
+        if !callee_saved_survives(top, clobber) {
+            write_thread_cs_line::<E>(false, 16, emit)?;
+            return Ok(false);
         }
         write_thread_cs_line::<E>(true, 16, emit)?;
         Ok(true)

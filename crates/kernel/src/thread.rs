@@ -380,7 +380,7 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
     Err(SwitchError::Unknown)
 }
 
-/// Live RSP swap probe (S06 slices 7-9): run `func` on `new_top`, then
+/// Live RSP swap probe (S06 slices 7-10): run `func` on `new_top`, then
 /// restore the caller stack.
 ///
 /// Contract the guest MUST obey: `new_top` is the `Some(top)` value from
@@ -391,34 +391,44 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
 /// the same `swap_target` triple. Post-`ExitBootServices` boot CPU,
 /// `cli` in effect, single-threaded boot owns both stacks.
 ///
-/// Mechanism: stash the caller `RSP` in `R15` (callee-saved on both
-/// Win64 and SysV, hence preserved across `call func` by the ABI),
-/// spilling `R15` itself with `push`/`pop` on the caller stack so the
-/// probe preserves it too. The first attempt used a static slot addressed
-/// through a plain `in(reg)` pick — the callee clobbered that register
-/// (measured QEMU: `THREAD-RUN` printed, then crash before `THREAD ok=1`
-/// because the restore loaded a garbage `RSP`). Load `new_top`,
-/// `call func` (pushes the return address onto the NEW stack, so an
-/// unmapped/guard stack faults loudly instead of silently passing), then
-/// restore. A bad `RSP` triple-faults or `#PF`s and the e2e script fails
-/// on the missing `THREAD` lines — fail-loud, never silent.
+/// Mechanism (slice 10, REVIEW #291 gap 2 fix): the caller `RSP` is
+/// spilled to the NEW stack (`push rax` after `mov rsp, top`), never to
+/// a register. The slice 7-9 design stashed it in `R15` (`mov r15,rsp` /
+/// `mov rsp,r15`), which assumes the callee preserves `r15` — a thread
+/// entry that trashes `r15` loses the return stack and triple-faults, and
+/// the slice 9 stress stub deliberately avoided `r15` so the vulnerable
+/// path was untested. The new-stack slot removes that single point of
+/// failure: even a callee that overwrites every callee-saved register
+/// (including `r15`, now covered by the extended clobber stub) cannot
+/// lose the return address because it lives in memory on the new stack,
+/// above the `call` return address (`[top-8]` vs `[top-16]`), which the
+/// stub never touches (it only writes registers + `ret`).
+/// `call func` pushes its return address onto the NEW stack, so an
+/// unmapped/guard stack faults loudly instead of silently passing. A bad
+/// `RSP` triple-faults or `#PF`s and the e2e script fails on the missing
+/// `THREAD` lines — fail-loud, never silent.
 ///
-/// Slice 9: the probe additionally preserves the full callee-saved set
-/// (`rbx`, `rbp`, `r12`-`r14`; `r15` via the spill above) with symmetric
-/// `push`/`pop` on the caller stack, so a hostile callee that trashes
-/// them cannot corrupt the boot thread. Push order is the pop order
-/// reversed (balanced by construction); the e2e `THREAD-CS` stress loop
-/// calls a naked clobber stub 16 times and fails loudly on any imbalance.
+/// Slice 9-10: the probe additionally preserves the full callee-saved set
+/// (`rbx`, `rbp`, `r12`-`r15`) with symmetric `push`/`pop` on the caller
+/// stack, so a hostile callee that trashes them cannot corrupt the boot
+/// thread. Push order is the pop order reversed (balanced by construction);
+/// the e2e `THREAD-CS` stress loop calls a naked clobber stub 16 times and
+/// fails loudly on any imbalance. Slice 10 proves PRESERVATION (not just
+/// liveness, REVIEW #291 gap 1): the caller-side sentinel check
+/// (`probe_thread_callee_saved` in the guest) sets known values in all six
+/// regs around one `run_on_thread_stack` call and fails loud (`ok=0`) on
+/// any bit mismatch — a swapped pop order (e.g. r13/r14) still balances
+/// the stack and would print `ok=1` under the old liveness-only gate.
 ///
-/// REVIEW #287 risk 1 (must-fix): the template names literal `r15` as
+/// REVIEW #287 risk 1 (must-fix): the template names literal regs as
 /// scratch, which the register allocator does NOT reserve on its own —
-/// a plain `in(reg)` input could itself be allocated in `r15`, so
-/// `push r15` would spill the input, `mov r15,rsp` would destroy it, and
-/// `mov rsp,{top}` / `call {func}` could load garbage. The body below
-/// declares `out("r15") _` so the allocator excludes `r15` from both
-/// inputs (conservative: the push/pop actually preserves `r15`, but
-/// claiming it clobbered is sound — the compiler simply saves around us
-/// if it needed `r15`). Do not remove that line without a
+/// an `in(reg)` input allocated in e.g. `rbx` would make `push rbx` spill
+/// the input instead of the caller value and corrupt the restore. The body
+/// below declares `out(...) _` for every literal reg it touches (`rbx`,
+/// `rbp`, `r12`-`r15` plus `rax` scratch) so the allocator excludes them
+/// from both inputs (conservative: push/pop actually preserves the six,
+/// but claiming clobber is sound — the compiler simply saves around us
+/// if it needed them). Do not remove those lines without a
 /// `cargo show-asm` / regalloc-stress disproof.
 ///
 /// # Safety
@@ -426,6 +436,10 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
 /// host harness must never execute `mov rsp, ...`).
 #[cfg(not(test))]
 pub unsafe fn run_on_thread_stack(new_top: u64, func: extern "C" fn()) {
+    // `rbx`/`rbp` need no `out` reservation: LLVM reserves `rbx`
+    // internally and `rbp` is the frame pointer, so `in(reg)` inputs are
+    // never allocated there (the compiler rejects `out("rbx")`/`out("rbp")`
+    // outright). `r12`-`r15`+`rax` ARE allocatable, hence the `out`s below.
     core::arch::asm!(
         "push r15",
         "push rbx",
@@ -433,10 +447,12 @@ pub unsafe fn run_on_thread_stack(new_top: u64, func: extern "C" fn()) {
         "push r12",
         "push r13",
         "push r14",
-        "mov r15, rsp",
+        "mov rax, rsp",
         "mov rsp, {top}",
+        "push rax",
         "call {func}",
-        "mov rsp, r15",
+        "pop rax",
+        "mov rsp, rax",
         "pop r14",
         "pop r13",
         "pop r12",
@@ -445,6 +461,10 @@ pub unsafe fn run_on_thread_stack(new_top: u64, func: extern "C" fn()) {
         "pop r15",
         top = in(reg) new_top,
         func = in(reg) func,
+        out("rax") _,
+        out("r12") _,
+        out("r13") _,
+        out("r14") _,
         out("r15") _,
         clobber_abi("C"),
     );
@@ -458,6 +478,85 @@ pub unsafe fn run_on_thread_stack(new_top: u64, func: extern "C" fn()) {
 /// guest body (`cfg(not(test))`) carries the full post-EBS contract.
 #[cfg(test)]
 pub unsafe fn run_on_thread_stack(_new_top: u64, _func: extern "C" fn()) {}
+
+/// Caller-side preservation proof (S06 slice 10, REVIEW #291 gap 1).
+///
+/// Liveness (`THREAD-CS` 16x returns) does NOT prove preservation: pops in
+/// the wrong order (e.g. swapped `r13`/`r14`) still balance the stack and
+/// print `ok=1`. This check sets known sentinels in five callee-saved regs
+/// (`rbx`, `r12`-`r15`) in ONE asm block, runs ONE `run_on_thread_stack`
+/// call, then captures all five in ONE asm block and compares bit-exact.
+/// Any mismatch (wrong pop order, missing spill) returns `false` and the
+/// guest fails loud (`THREAD-CS ok=0`).
+///
+/// `rbp` is deliberately EXCLUDED: it is the frame pointer, so overwriting
+/// it with a sentinel across a Rust call would corrupt frame-relative
+/// accesses and the epilogue restore. Five distinct sentinels still catch
+/// any pop-order permutation: a permutation that misplaces only `rbp`
+/// alone is impossible (a swap needs two regs, and any swap touching a
+/// checked reg misplaces its distinct sentinel).
+///
+/// `rbx` needs no `out`: LLVM reserves it, so `in(reg)` inputs are never
+/// allocated there (the compiler rejects `out("rbx")` outright, same for
+/// `rbp`). `r12`-`r15` ARE allocatable, hence the `out`s in the set block
+/// so sentinels cannot alias an input. The capture block moves each reg to
+/// a general output (`mov {v}, rbx`) with no pinned outs.
+///
+/// # Safety
+/// Same contract as [`run_on_thread_stack`]: guest-only, post-EBS, `cli`
+/// in effect, `new_top`/`func` from [`swap_target`]. Host builds compile
+/// to a stub returning `true` (never touches registers).
+#[cfg(not(test))]
+pub unsafe fn callee_saved_survives(new_top: u64, func: extern "C" fn()) -> bool {
+    const S_RBX: u64 = 0x1B1B_1B1B_1B1B_1B1B;
+    const S_R12: u64 = 0x1212_1212_1212_1212;
+    const S_R13: u64 = 0x1313_1313_1313_1313;
+    const S_R14: u64 = 0x1414_1414_1414_1414;
+    const S_R15: u64 = 0x1515_1515_1515_1515;
+    core::arch::asm!(
+        "mov rbx, {s_rbx}",
+        "mov r12, {s_r12}",
+        "mov r13, {s_r13}",
+        "mov r14, {s_r14}",
+        "mov r15, {s_r15}",
+        s_rbx = in(reg) S_RBX,
+        s_r12 = in(reg) S_R12,
+        s_r13 = in(reg) S_R13,
+        s_r14 = in(reg) S_R14,
+        s_r15 = in(reg) S_R15,
+        out("r12") _,
+        out("r13") _,
+        out("r14") _,
+        out("r15") _,
+        options(nomem, nostack, preserves_flags),
+    );
+    run_on_thread_stack(new_top, func);
+    let (v_rbx, v_r12, v_r13, v_r14, v_r15): (u64, u64, u64, u64, u64);
+    core::arch::asm!(
+        "mov {v_rbx}, rbx",
+        "mov {v_r12}, r12",
+        "mov {v_r13}, r13",
+        "mov {v_r14}, r14",
+        "mov {v_r15}, r15",
+        v_rbx = out(reg) v_rbx,
+        v_r12 = out(reg) v_r12,
+        v_r13 = out(reg) v_r13,
+        v_r14 = out(reg) v_r14,
+        v_r15 = out(reg) v_r15,
+        options(nomem, nostack, preserves_flags),
+    );
+    v_rbx == S_RBX && v_r12 == S_R12 && v_r13 == S_R13 && v_r14 == S_R14 && v_r15 == S_R15
+}
+
+/// Host stub: preservation proof is e2e-only; always `true` so host tests
+/// stay register-safe.
+///
+/// # Safety
+/// Host `cargo test` only: no-op.
+#[cfg(test)]
+pub unsafe fn callee_saved_survives(_new_top: u64, _func: extern "C" fn()) -> bool {
+    true
+}
 
 #[cfg(test)]
 mod tests {
