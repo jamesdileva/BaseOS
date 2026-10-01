@@ -43,6 +43,15 @@ impl Scheduler {
     /// id, or `NULL_THREAD` when no thread runs yet). `current` is NOT
     /// validated here — `pick_next` fails closed (`Unknown`) when it is
     /// absent from the table, so construction can never smuggle a target.
+    ///
+    /// Boot bookkeeping (REVIEW #321 residual a): `new` never marks
+    /// `current` as `Running` — the spawned descriptor stays `Ready`
+    /// (as built by `Thread::new`). The first `dispatch` therefore
+    /// parks nothing: the ex-current slot is `Ready`, not `Running`,
+    /// so it stays `Ready` while the picked next moves Ready->Running.
+    /// Benign under cooperative yield (the boot thread simply becomes
+    /// scheduled like any other `Ready` thread); the second `dispatch`
+    /// onward parks the previous `Running` thread normally.
     #[must_use]
     pub const fn new(current: u64) -> Self {
         Self {
@@ -72,8 +81,12 @@ impl Scheduler {
 
     /// Live table as a packed array copy for the picker. Packed (no holes):
     /// `spawn` appends, never leaves `None` inside `[..len)`. Copies every
-    /// populated slot (so a just-written `table[len]` is included), which
-    /// keeps `spawn`'s pre-commit `validate_threads` exact.
+    /// populated slot over the full capacity, so a just-written
+    /// `table[len]` pending slot is included too (REVIEW #321 residual b:
+    /// looping only `[..len)` would EXCLUDE that pending slot and break
+    /// `spawn`'s pre-commit `validate_threads` — tried, 4 tests went red).
+    /// Callers slice with `len` (`pick_next`) or `len + 1` (`spawn`
+    /// pre-commit); the filler beyond the slice is unreachable.
     fn packed(&self) -> [Thread; MAX_THREADS] {
         // `Thread` has no `Default`; rebuild from a known descriptor then
         // overwrite the live prefix. The filler is unreachable via `len`.
@@ -137,7 +150,10 @@ impl Scheduler {
     /// Pick the next `Ready` thread and move it Ready→Running, parking the
     /// previous `Running` thread back to Ready (cooperative yield). The
     /// previous `Done` thread stays `Done`. On pick refusal returns the
-    /// picker's `Err` with no mutation.
+    /// picker's `Err` with no mutation. First-dispatch note: when the
+    /// scheduler was built with `new(current)` the ex-current descriptor
+    /// is still `Ready`, so nothing is parked on the first success (only
+    /// the picked next flips to `Running`).
     pub fn dispatch(&mut self) -> Result<u64, SwitchError> {
         let next = self.pick_next()?;
         let mut i = 0;
@@ -237,13 +253,29 @@ mod tests {
     }
 
     #[test]
+    fn first_dispatch_parks_nothing_boot_thread_stays_ready() {
+        // REVIEW #321 residual (a): `new(current)` never marks `current`
+        // `Running`, so the first `dispatch` parks nothing — the
+        // ex-current stays `Ready` while the pick moves to `Running`.
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert_eq!(s.dispatch(), Ok(2));
+        assert_eq!(s.current(), 2);
+        // Second dispatch onward parks the previous Running thread.
+        assert_eq!(s.dispatch(), Ok(1));
+        assert_eq!(s.current(), 1);
+    }
+
+    #[test]
     fn scheduler_holds_no_cell_interior_mutability() {
-        // Replace-not-reuse pin (REVIEW #319 finding 2): the scheduler
-        // type must not contain the coop interior-mutability primitive —
-        // mutation is `&mut self` only. Doc prose names the cell to
-        // explain the ban, and the ban list itself would self-match, so
-        // fragments are built with `concat!` (no verbatim hit) and matched
-        // against non-doc code lines only (`///`/`//!` stripped).
+        // Replace-not-reuse pin (REVIEW #319 finding 2, REVIEW #321
+        // residual c): the scheduler type must not contain the coop
+        // interior-mutability primitive — mutation is `&mut self` only.
+        // Doc prose names the cell to explain the ban, and the ban list
+        // itself would self-match, so fragments are built with `concat!`
+        // (no verbatim hit) and matched against non-doc code lines only
+        // (`///`/`//!` stripped, `/* ... */` block comments stripped).
         const SRC: &str = include_str!("sched.rs");
         let banned = [
             concat!("core", "::cell"),
@@ -253,13 +285,40 @@ mod tests {
             concat!("Thread", "Mutex {"),
             concat!(": Thread", "Mutex"),
         ];
-        let mut in_code = true;
+        // Strip block comments first so a banned token hidden inside
+        // `/* ... */` cannot slip past the line-based doc filter.
         let bytes = SRC.as_bytes();
+        let mut stripped = std::string::String::with_capacity(SRC.len());
+        let mut k = 0usize;
+        let mut in_block = false;
+        while k < bytes.len() {
+            if !in_block && k + 1 < bytes.len() && bytes[k] == b'/' && bytes[k + 1] == b'*' {
+                in_block = true;
+                k += 2;
+            } else if in_block && k + 1 < bytes.len() && bytes[k] == b'*' && bytes[k + 1] == b'/' {
+                in_block = false;
+                k += 2;
+            } else if in_block {
+                // Keep newlines so line numbers survive the strip.
+                if bytes[k] == b'\n' {
+                    stripped.push('\n');
+                }
+                k += 1;
+            } else {
+                stripped.push(bytes[k] as char);
+                k += 1;
+            }
+        }
+        if in_block {
+            panic!("unterminated block comment in sched.rs");
+        }
+        let mut in_code = true;
+        let sbytes = stripped.as_bytes();
         let mut line_start = 0usize;
         let mut li = 0usize;
-        while li <= bytes.len() {
-            if li == bytes.len() || bytes[li] == b'\n' {
-                let line = &SRC[line_start..li];
+        while li <= sbytes.len() {
+            if li == sbytes.len() || sbytes[li] == b'\n' {
+                let line = &stripped[line_start..li];
                 let t = line.trim_start();
                 in_code = !(t.starts_with("//") || t.starts_with("///") || t.starts_with("//!"));
                 if in_code {
