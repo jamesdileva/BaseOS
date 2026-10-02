@@ -3,12 +3,14 @@
 Review before each work segment. Keep ≤20 lines, compact.
 
 - Goal: perf-first x86-64 UEFI desktop OS, Rust-first; docs in repo root.
-- Now: S06 slice17d done @358dcaa (152 green
-  21+18+103+4+4+2, fmt/clippy clean, guest untouched no QEMU).
-  REVIEW #334 cond-accept host-only (r1 fixed br-only, r2 pinned
-  boundary, r3 weak-accept multibyte/E0748 doc-only). Worklog 17d done.
-- Next: slice18 guest-switch wiring (preempt TOCTOU doc-not-tested,
-  #9 retitle slice1->slice17 owed) + #330 cheapest disproof re-verify.
+- Now: S06 slice18 done (154 green
+  21+19+104+4+4+2, fmt/clippy clean, QEMU PASS 1189B
+  SCHED-SWITCH ok=1 from=1 to=2, guest 104448B).
+  REVIEW #336 accepted 17d close-out; slice18 wires
+  Scheduler dispatch == swap_target triple in guest.
+  TOCTOU preempt documented-not-tested in sched.rs.
+- Next: fuller context switch (jump entry/multi-dispatch)
+  + #9 retitle slice1->slice17 owed via #11. #9 active.
 - Board: #9 active (S06 threads). OK per human #79/#80.
 - Board: #9 active (S06 threads). OK per human #79/#80.
 - Conventions: STRUCTURAL_FAIL = usize::MAX; ASCII .ps1; raw EFI;

@@ -41,6 +41,7 @@ use baseos_kernel::page_table::{
     guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
     walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
 };
+use baseos_kernel::sched::Scheduler;
 #[cfg(not(test))]
 use baseos_kernel::thread::swap_stacks_via_slots;
 #[cfg(not(test))]
@@ -1182,6 +1183,122 @@ fn write_thread_line<E>(
     write_str(emit, "\n")
 }
 
+/// Emit the one-line `SCHED-SWITCH` diagnostic (S06 slice18, minimal
+/// guest-switch wiring): `SCHED-SWITCH ok=<0|1> from=<n> to=<m>` — `ok`
+/// is 1 only when a `Scheduler` table (boot 1 + thread 2) dispatched
+/// 1->2, the `swap_target` triple for the same pair agreed on id 2, and
+/// the triple entry ran on the target stack and returned. First-dispatch
+/// parks nothing (boot stays `Ready`), so the line pins guest/host parity:
+/// scheduler pick == swap-gate pick == executed entry.
+fn write_sched_line<E>(
+    ok: bool,
+    from: u64,
+    to: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "SCHED-SWITCH ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " from=")?;
+    write_u64_dec(emit, from)?;
+    write_str(emit, " to=")?;
+    write_u64_dec(emit, to)?;
+    write_str(emit, "\n")
+}
+
+/// Minimal scheduler-driven switch post-`ExitBootServices`: build the same
+/// two descriptors the `THREAD` probe uses, drive the pick through
+/// `Scheduler::dispatch` (not `switch_stub` directly), resolve the live
+/// `RSP`/`RIP` through `swap_target`, require both picks to agree, run the
+/// triple entry on the target stack, and emit the `SCHED-SWITCH` line.
+/// Fail-closed (`ok=0`) on any spawn/dispatch/triple mismatch — never runs
+/// a disagreeing entry. Never panics.
+///
+/// # Safety
+/// Post-EBS only, same contract as [`probe_thread_swap`]: owns the static
+/// stacks, `cli` in effect, COM1 exclusive.
+///
+/// Host `cargo test` builds link `baseos_kernel` as a dependency (its
+/// `cfg(test)` live-swap stubs do NOT apply), so the live `run_on_thread_
+/// stack` path must never execute on the host — the `#[cfg(test)]` stub
+/// below covers the dispatch/triple parity shape instead (live proof is
+/// e2e-only, same pattern as `probe_thread_save`).
+#[cfg(not(test))]
+unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
+    let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
+    let entry_b = thread_b_entry as *const () as u64;
+    let (a, b) = match (
+        Thread::new(1, base_a, 8192, 0x1000),
+        Thread::new(2, base_b, 8192, entry_b),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            write_sched_line::<E>(false, 1, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let mut sched = Scheduler::new(1);
+    if !sched.spawn(a) || !sched.spawn(b) {
+        write_sched_line::<E>(false, 1, 0, emit)?;
+        return Ok(false);
+    }
+    let next = match sched.dispatch() {
+        Ok(n) => n,
+        Err(_) => {
+            write_sched_line::<E>(false, 1, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let (id, top, entry) = match swap_target(&[a, b], 1) {
+        Ok(t) => t,
+        Err(_) => {
+            write_sched_line::<E>(false, 1, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    if next != id || next != 2 || entry == 0 {
+        write_sched_line::<E>(false, 1, id, emit)?;
+        return Ok(false);
+    }
+    let func: extern "C" fn() = core::mem::transmute(entry as *const ());
+    run_on_thread_stack(top, func);
+    write_sched_line::<E>(true, 1, next, emit)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    // Host covers the dispatch/triple parity shape (no live RSP swap:
+    // `baseos_kernel` dependency builds use the guest asm path here).
+    let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+    let b = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
+    let mut sched = Scheduler::new(1);
+    if !sched.spawn(a) || !sched.spawn(b) {
+        write_sched_line::<E>(false, 1, 0, emit)?;
+        return Ok(false);
+    }
+    let next = match sched.dispatch() {
+        Ok(n) => n,
+        Err(_) => {
+            write_sched_line::<E>(false, 1, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let (id, _, entry) = match swap_target(&[a, b], 1) {
+        Ok(t) => t,
+        Err(_) => {
+            write_sched_line::<E>(false, 1, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    if next != id || next != 2 || entry == 0 {
+        write_sched_line::<E>(false, 1, id, emit)?;
+        return Ok(false);
+    }
+    write_sched_line::<E>(true, 1, next, emit)?;
+    Ok(true)
+}
+
 /// Live thread-stack swap post-`ExitBootServices`: build two descriptors
 /// from the static stacks, resolve the round-robin target through
 /// `swap_target` (the same gate future `swap` asm must use), run the
@@ -1468,6 +1585,9 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // S06 slice 13: full A->B->A ping-pong — THREAD-PONG ok=1
             // (fail-loud on missing RUN line or zero/misaligned slot A/B).
             let _ = probe_thread_pingpong::<Infallible>(&mut emit);
+            // S06 slice18: minimal scheduler-driven switch — SCHED-SWITCH
+            // ok=1 from=1 to=2 (fail-loud on dispatch/triple mismatch).
+            let _ = probe_sched_switch::<Infallible>(&mut emit);
             baseos_kernel::bring_up_cpu_and_prove_exception();
         }
         // EBS failed: still own boot services — park fail-loud (e2e sees
@@ -2343,6 +2463,21 @@ mod tests {
         for (needle, label) in &forbidden {
             assert!(!SRC.contains(needle), "guest must not contain {label}");
         }
+    }
+
+    #[test]
+    fn sched_switch_probe_parity_host() {
+        // S06 slice18 guest/host parity: the scheduler-driven probe must
+        // agree (dispatch 1->2 == swap_target 1->2) and emit the
+        // `SCHED-SWITCH ok=1 from=1 to=2` line on the host too (live RSP
+        // swap is a no-op stub here; the QEMU boot proves the live path).
+        let mut out: Vec<u8> = Vec::new();
+        let ok =
+            unsafe { probe_sched_switch::<core::convert::Infallible>(&mut |b| Ok(out.push(b))) }
+                .unwrap();
+        assert!(ok);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("SCHED-SWITCH ok=1 from=1 to=2"));
     }
 
     #[test]

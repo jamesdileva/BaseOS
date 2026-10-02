@@ -25,6 +25,17 @@
 //! in effect). Guest multi-thread switch arrives in a later slice; the
 //! mutex stays coop-only fail-closed and guest mutex use is out-of-scope
 //! this slice.
+//!
+//! Preemption TOCTOU (documented-not-tested, S06 slice18): `pick_next` and
+//! `dispatch` read-then-write the table through `&mut self` with no
+//! atomic CAS and no `cli` gate inside this type — the caller must hold
+//! the critical section (post-EBS `cli` single-thread today, a future
+//! atomic/IRQ gate under preemption). Two preempted `dispatch` calls can
+//! both pick the same `Ready` target and both mark it `Running`
+//! (lost-wake/double-dispatch); the coop `ThreadMutex` `Cell` has the same
+//! class (get-then-set double-take). No host test can prove an interrupt
+//! race — the pin is this doc plus the `&mut self` shape (no shared
+//! `Cell`/interior mutability to misuse).
 
 use crate::thread::{validate_threads, SwitchError, Thread, ThreadState, MAX_THREADS, NULL_THREAD};
 
@@ -231,6 +242,23 @@ mod tests {
         assert_eq!(s.current(), 2);
         assert_eq!(s.dispatch(), Ok(3));
         assert_eq!(s.dispatch(), Ok(1));
+    }
+
+    #[test]
+    fn dispatch_agrees_with_swap_target_parity() {
+        // S06 slice18 guest/host parity pin: the scheduler pick and the
+        // swap-gate triple must agree on the same next id for the same
+        // table, or the guest would dispatch one thread and run another.
+        let a = mk(1, 0x1000_0000);
+        let b = mk(2, 0x2000_0000);
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(a));
+        assert!(s.spawn(b));
+        assert_eq!(s.pick_next(), Ok(2));
+        let triple = crate::thread::swap_target(&[a, b], 1).unwrap();
+        assert_eq!(triple.0, 2);
+        assert_eq!(s.dispatch(), Ok(triple.0));
+        assert_eq!(s.current(), 2);
     }
 
     #[test]
