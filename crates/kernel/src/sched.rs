@@ -295,15 +295,25 @@ mod tests {
         assert_eq!(u.dispatch(), Err(SwitchError::Unknown));
         assert_eq!(u.current(), 99);
         assert_eq!(u.state_of(1), Some(ThreadState::Ready));
-        // Nothing Ready: sole thread Running (parked past first hop).
-        let mut n = Scheduler::new(1);
-        assert!(n.spawn(mk2(1, 0x1000_0000)));
-        assert!(n.spawn(mk2(2, 0x2000_0000)));
-        assert_eq!(n.dispatch(), Ok(2));
-        assert_eq!(n.dispatch(), Ok(1));
-        // Cancel both to Done via direct state moves is outside the
-        // scheduler; instead drive to NotReady: mark all non-current
-        // Done through a fresh table where only current is Ready.
+        // Nothing Ready -> NotReady (target non-Ready) leaves `current`
+        // and all states untouched: current Running + other Done picks
+        // nothing (no other Ready, current not Ready), so `dispatch`
+        // refuses via the pick with no mutation. Pre-set states before
+        // `spawn` (`spawn` carries state through; `validate_threads`
+        // gates stacks/ids only, never lifecycle).
+        let mut run = mk2(1, 0x1000_0000);
+        assert!(run.set_state(ThreadState::Running));
+        let mut done = mk2(2, 0x2000_0000);
+        assert!(done.set_state(ThreadState::Done));
+        let mut nr = Scheduler::new(1);
+        assert!(nr.spawn(run));
+        assert!(nr.spawn(done));
+        assert_eq!(nr.pick_next(), Err(SwitchError::NotReady));
+        assert_eq!(nr.dispatch(), Err(SwitchError::NotReady));
+        assert_eq!(nr.current(), 1);
+        assert_eq!(nr.state_of(1), Some(ThreadState::Running));
+        assert_eq!(nr.state_of(2), Some(ThreadState::Done));
+        assert_eq!(nr.len(), 2);
         let mut solo = Scheduler::new(1);
         assert!(solo.spawn(mk2(1, 0x1000_0000)));
         assert_eq!(solo.dispatch(), Err(SwitchError::NoSwitch));
