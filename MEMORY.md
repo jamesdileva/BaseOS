@@ -3,9 +3,10 @@
 Review before each work segment. Keep ≤20 lines, compact.
 
 - Goal: perf-first x86-64 UEFI desktop OS, Rust-first; docs in repo root.
-- Now: S06 slice17c done @e5810f7 (152 green
-  21+18+103+4+4+2, fmt/clippy clean, QEMU 1143B carry-forward
-  kernel-only HEAD, guest untouched). Worklog 17a/b/c closed this cycle.
+- Now: S06 slice17d done @358dcaa (152 green
+  21+18+103+4+4+2, fmt/clippy clean, guest untouched no QEMU).
+  REVIEW #334 cond-accept host-only (r1 fixed br-only, r2 pinned
+  boundary, r3 weak-accept multibyte/E0748 doc-only). Worklog 17d done.
 - Next: slice18 guest-switch wiring (preempt TOCTOU doc-not-tested,
   #9 retitle slice1->slice17 owed) + #330 cheapest disproof re-verify.
 - Board: #9 active (S06 threads). OK per human #79/#80.
