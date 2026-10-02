@@ -3954,3 +3954,12 @@ Format per entry (per `implementation-guide.md` §31):
 - **Expected:** `cargo test --workspace` 161/161 (21+22+108+4+4+2); fmt clean; clippy kernel + boot-uefi-tests clean; gates 41/41; `boot-uefi.ps1` PASS with both `THREAD-JUMP` lines.
 - **Measured (2026-10-02, Win11):** `cargo test --workspace` 161/161 (21 boot-info + 22 bootx64 + 108 kernel + 4 + 4 serial-marker + 2 version); `cargo fmt --check` clean; `cargo clippy -p baseos-kernel --all-targets` clean; `cargo clippy -p baseos-boot-uefi --tests` clean (split `check_jump_entry`/`jump_to_thread_stack` imports so the host-test build has no unused import); `test-boot-uefi-gates.ps1` 41/41; `boot-uefi.ps1` UEFI BOOT PASS, serial 1232 bytes, guest `bootx64.efi` 105984 bytes: `THREAD-JUMP ok=1 id=2` + `THREAD-JUMP-RUN id=2` present, `PF ok=1 vector=14` + `EXC ok=1 vector=0` chained from the jumped-to stack.
 - **Final:** Jump-not-call path proven live (triple AND gate, never-return entry, QEMU). Remaining per #352: (1) ok=0 funnel has shape pins but zero fault-injection evidence, (3) fragile literals/diag cleanup. #9 stays active.
+
+## S06 slice22 R1 -- independent re-run for REVIEW #364 (2026-10-02)
+
+- **Decision:** Independent re-run on committed `b9bffba` (tree clean, no code change): `cargo test --workspace`, `fmt --check`, both clippy, gate test, QEMU.
+- **Why:** REVIEW #364 COND-ACCEPT: dirty tree + SKIPPED checks blocked S06 close; cheapest disproof is commit-then-rerun with hashes/logs.
+- **Alternatives:** New code in same cycle (rejected: one segment per cycle; R2 ok=0 fault proof rides next).
+- **Expected:** 161/161, fmt clean, both clippy clean, 41/41, QEMU PASS 1232B.
+- **Measured (2026-10-02, Win11):** `cargo test --workspace` 161/161 (21+22+108+4+4+2); `cargo fmt --check` exit 0; `clippy -p baseos-kernel --all-targets` exit 0; `clippy -p baseos-boot-uefi --tests` exit 0; `test-boot-uefi-gates.ps1` 41/41; `boot-uefi.ps1` UEFI BOOT PASS serial 1232B guest 105984B: `THREAD-JUMP ok=1 id=2` + `THREAD-JUMP-RUN id=2`, `PF ok=1 vector=14` + `EXC ok=1 vector=0` chained; SHA256 serial `E8BB25BD52655AC0A4CDF99E64F5F052D6D59AD13BD158073F7798A68BC352A0`, guest `24F358A0702A922F28B40280A3CF4F138CFCBACBA6ED1C4742550479A40D5810`.
+- **Final:** R1 closed on committed tree. Remaining per #364: R2 forced-refusal QEMU ok=0 log, plus cfg(test) `->()` vs `->!` divergence / transmute nonzero-only / hlt-park / fragile literals. #9 stays active.
