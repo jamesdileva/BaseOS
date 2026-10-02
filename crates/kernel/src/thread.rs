@@ -386,6 +386,34 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
     Err(SwitchError::Unknown)
 }
 
+/// Jump-entry gate (S06 slice21, narrow first half of jump-not-call).
+///
+/// Pure `const` check the future jump asm MUST pass BEFORE loading `RSP`:
+/// `new_top` nonzero, 16-byte aligned, never the `u64::MAX`
+/// `stack_top()` fail-loud sentinel; `entry` nonzero. Mirrors the tail of
+/// [`swap_target`] so a jump path cannot drift to a weaker gate.
+///
+/// Discipline (call vs jump): `run_on_thread_stack` uses `call func`, so
+/// the return address lands on the NEW stack and the entry returns via
+/// `ret`. A true thread entry uses `jmp` instead — NO return address is
+/// pushed, so the entry MUST NEVER `ret`: it must park (`hlt` loop),
+/// fault-chain, or switch stacks explicitly. The caller MUST have saved
+/// its own `RSP` elsewhere (slot, e.g. [`run_on_thread_stack_with_save`])
+/// before jumping, or the return stack is lost by construction.
+#[must_use]
+pub const fn check_jump_entry(new_top: u64, entry: u64) -> bool {
+    if new_top == 0 || new_top == u64::MAX {
+        return false;
+    }
+    if new_top & 0xF != 0 {
+        return false;
+    }
+    if entry == 0 {
+        return false;
+    }
+    true
+}
+
 /// Live RSP swap probe (S06 slices 7-10): run `func` on `new_top`, then
 /// restore the caller stack.
 ///
@@ -1444,6 +1472,21 @@ mod tests {
             swap_stacks_via_slots(&mut old as *mut u64, 0x2000_0000, dummy);
             assert_eq!(old, 0x1111_1111_1111_1111);
         }
+    }
+
+    #[test]
+    fn jump_entry_gate_matches_swap_triple() {
+        // S06 slice21 narrow: future jump asm loads RSP then `jmp` (no
+        // return address), so the gate must refuse everything `swap_target`
+        // refuses at the top/entry tail — plus the u64::MAX sentinel.
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        let b = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
+        let (_, top, entry) = swap_target(&[a, b], 1).unwrap();
+        assert!(check_jump_entry(top, entry));
+        assert!(!check_jump_entry(0, entry));
+        assert!(!check_jump_entry(top | 0x1, entry));
+        assert!(!check_jump_entry(u64::MAX, entry));
+        assert!(!check_jump_entry(top, 0));
     }
 
     #[test]
