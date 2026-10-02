@@ -3900,3 +3900,30 @@ Format per entry (per `implementation-guide.md` §31):
 - **Expected:** 156 host green; fmt/clippy clean; QEMU carried (line shape unchanged).
 - **Measured (Win11):** `cargo test --workspace` 156/156 (21 boot-info + 20 bootx64 + 105 kernel + 4 + 4 serial-marker + 2 version); `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings` clean; QEMU carried (guest line `SCHED-SWITCH ok=1 from=1 to=2` unchanged, re-run owed next slice with jump/multi work).
 - **Final:** Persistent table + fail-closed shapes pinned host-side; guest proves two-hop agreement live on first hop. #9 stays active. Next: jump-not-call entry + QEMU re-run.
+
+## S06 slice19a -- REVIEW #340 finding 1: drop dead n-block, pin Done-target NotReady no-mutation (2026-10-02)
+
+- **Decision:** One `kernel/sched.rs`-only fix: drop the dead `n` block (built 1+2, dispatched 1->2->1, asserted nothing) and replace with a true NotReady no-mutation pin -- pre-set thread-1 `Running` + thread-2 `Done` before `spawn` (`spawn` carries state through; `validate_threads` gates stacks/ids only), then `pick_next` + `dispatch` both refuse `NotReady` with `current`, states, and `len` untouched.
+- **Why:** REVIEW #340 finding 1: the `n` block exercised dispatches but pinned nothing, while the Done-target refusal path (current Running, other Done, no Ready) had no pin that states stay untouched.
+- **Alternatives:** Keep `n` block plus add new test (rejected: dead code in test, same count, more lines); drive Done via scheduler API (rejected: no lifecycle transition API -- direct `set_state` before `spawn` is the explicit path).
+- **Expected:** 156 host green (no count change -- assertions extend existing test); fmt/clippy clean; QEMU carried.
+- **Measured (@d66fa45, Win11):** `cargo test --workspace` 156/156 (21 + 20 + 105 + 4 + 4 + 2); `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean; QEMU carried (kernel-only change, guest line unchanged).
+- **Final:** Finding 1 closed on-tree. #9 stays active. Next: slice19b clippy fix + jump-not-call entry + QEMU re-run.
+
+## S06 slice19b -- fix clippy unit_arg in sched host tests (2026-10-02)
+
+- **Decision:** Test-only `boot-uefi/main.rs` fix: expand `|b| Ok(out.push(b))` to block form `|b| { out.push(b); Ok(()) }` in 3 spots (`sched_switch_probe_parity_host` + 2x `sched_switch_fail_closed_line_shape`) so `()` from `push` is not passed as `Ok` arg.
+- **Why:** `cargo clippy --all-targets -- -D warnings` (with `--tests` per d66fa45 lesson) flags `unit_arg`; zero behavior change, line shape unchanged.
+- **Alternatives:** `#[allow]` (rejected: hides real lints); change writer signature (rejected: guest path uses same shape).
+- **Expected:** 156 host green; fmt clean; clippy host+UEFI clean; QEMU carried.
+- **Measured (@5d73543, Win11):** `cargo test --workspace` 156/156 (21 + 20 + 105 + 4 + 4 + 2); `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo clippy --target x86_64-unknown-uefi --tests -- -D warnings` clean; QEMU carried.
+- **Final:** Clippy green with `--tests` on both targets. #9 stays active. Next: jump-not-call entry + QEMU re-run.
+
+## S06 slice19b repro -- independent clean-tree verification for REVIEW #348 (2026-10-02)
+
+- **Decision:** No code change; independent repro of @5d73543 on clean tree to close REVIEW #348 ACK-UNVERIFIED.
+- **Why:** #348: prior cycle reported 156-green with checks SKIPPED, so committed-clean did not prove reproduced.
+- **Alternatives:** None -- repro is the cheapest disconfirm.
+- **Expected:** 156 green; fmt + both clippy lines clean.
+- **Measured (this cycle, Win11, @5d73543 clean):** `cargo test --workspace` 156/156 (21 + 20 + 105 + 4 + 4 + 2, 0 failed); `cargo fmt --check` clean (exit 0); `cargo clippy --all-targets -- -D warnings` clean; `cargo clippy --target x86_64-unknown-uefi --tests -- -D warnings` clean.
+- **Final:** #348 repro owed closed on-measure; risks still owed unchanged: (1) ok=0 funnel can hide failures, (2) jump-not-call entry + QEMU re-run next, (3) fragile literals/diag. #9 stays active; #11 retitle owed by agent-b.
