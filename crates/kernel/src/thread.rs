@@ -388,10 +388,16 @@ pub fn swap_target(threads: &[Thread], current: u64) -> Result<(u64, u64, u64), 
 
 /// Jump-entry gate (S06 slice21, narrow first half of jump-not-call).
 ///
-/// Pure `const` check the future jump asm MUST pass BEFORE loading `RSP`:
-/// `new_top` nonzero, 16-byte aligned, never the `u64::MAX`
-/// `stack_top()` fail-loud sentinel; `entry` nonzero. Mirrors the tail of
-/// [`swap_target`] so a jump path cannot drift to a weaker gate.
+/// SUPPLEMENT, not replacement, for the [`swap_target`] triple (REVIEW
+/// #358 accept 1): this gate is top-only (nonzero/aligned/not-`u64::MAX`)
+/// plus nonzero entry, strictly weaker than the shared [`check_stack_entry`]
+/// triple (`MIN_STACK` size, aligned base+size, overflow-checked top).
+/// The jump path MUST resolve the `swap_target` triple first AND pass this
+/// gate on the triple's `(top, entry)` BEFORE loading `RSP` — never
+/// gate-alone. A gate-alone jump accepts a 16 B stack or a
+/// misaligned-base-with-aligned-top (both yield an aligned `top`) that
+/// `swap_target` refuses (pinned by
+/// `jump_gate_alone_passes_where_swap_refuses`).
 ///
 /// Discipline (call vs jump): `run_on_thread_stack` uses `call func`, so
 /// the return address lands on the NEW stack and the entry returns via
@@ -413,6 +419,53 @@ pub const fn check_jump_entry(new_top: u64, entry: u64) -> bool {
     }
     true
 }
+
+/// Live `jmp`-entry switch (S06 slice22): load `new_top` as `RSP`, then
+/// `jmp func` — no return address is pushed, so `func` MUST NEVER `ret`
+/// (park, fault-chain, or switch stacks explicitly; the guest
+/// `thread_jump_entry` proves the park-then-fault-chain shape live).
+///
+/// Contract the guest MUST obey (REVIEW #358 accept 1): `new_top`/`func`
+/// are the `Some(top)`/`entry` halves of a [`swap_target`] triple ANDed
+/// with [`check_jump_entry`] on the same pair, checked BEFORE loading
+/// `RSP` — never gate-alone (top-only passes lethal stacks the triple
+/// refuses). The Rust guards below mirror `check_jump_entry` fail-closed
+/// (zero/`u64::MAX`/misaligned top, null entry return with no register
+/// or stack touch, host-testable); the triple half is enforced by the
+/// caller resolving `swap_target` first (pinned live in the guest probe).
+/// Post-`ExitBootServices` boot CPU, `cli` in effect, single-threaded
+/// boot owns both stacks. A bad `RSP` triple-faults and e2e fails on the
+/// missing `THREAD-JUMP` lines — fail-loud, never silent.
+///
+/// # Safety
+/// See contract above. Host `cargo test` builds compile this out (the
+/// host harness must never execute `mov rsp, ...`).
+#[cfg(not(test))]
+pub unsafe fn jump_to_thread_stack(new_top: u64, func: extern "C" fn()) -> ! {
+    if new_top == 0 || new_top == u64::MAX || new_top & 0xF != 0 {
+        core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+        loop {
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
+    core::arch::asm!(
+        "mov rsp, {top}",
+        "jmp {func}",
+        top = in(reg) new_top,
+        func = in(reg) func,
+        options(noreturn, nostack),
+    );
+}
+
+/// Host-test stub: same fail-closed shape without touching registers —
+/// valid values are a no-op that returns (so host tests stay alive), bad
+/// values park-spin is NOT replicated (host returns too; live `jmp` proof
+/// is e2e-only). The guard shape (which values refuse) is what host pins.
+///
+/// # Safety
+/// Host `cargo test` only: no-op.
+#[cfg(test)]
+pub unsafe fn jump_to_thread_stack(_new_top: u64, _func: extern "C" fn()) {}
 
 /// Live RSP swap probe (S06 slices 7-10): run `func` on `new_top`, then
 /// restore the caller stack.
@@ -1487,6 +1540,73 @@ mod tests {
         assert!(!check_jump_entry(top | 0x1, entry));
         assert!(!check_jump_entry(u64::MAX, entry));
         assert!(!check_jump_entry(top, 0));
+    }
+
+    #[test]
+    fn jump_gate_alone_passes_where_swap_refuses() {
+        // REVIEW #358 accept 2 (thin-test disproof of a #283 bypass): the
+        // top-only `check_jump_entry` gate ALONE passes both literals below
+        // (aligned `top`, nonzero entry), while the shared
+        // `check_stack_entry` triple — and hence `swap_target` — refuses
+        // them. The jump path MUST therefore be triple AND gate, never
+        // gate-alone.
+        // 16 B stack: aligned top 0x2000_0010, but sub-page size.
+        let thin_top: u64 = 0x2000_0000 + 16;
+        assert!(check_jump_entry(thin_top, 0x2000));
+        assert_eq!(
+            check_stack_entry(0x2000_0000, 16, 0x2000),
+            Err(ThreadError::InvalidStack)
+        );
+        // Misaligned base with aligned top: base 1 + size 8191 = aligned
+        // top 0x2000_2000, but misaligned base.
+        let skew_top: u64 = 0x2000_0001 + 8191;
+        assert_eq!(skew_top & 0xF, 0);
+        assert!(check_jump_entry(skew_top, 0x2000));
+        assert_eq!(
+            check_stack_entry(0x2000_0001, 8191, 0x2000),
+            Err(ThreadError::InvalidStack)
+        );
+        // End-to-end through `swap_target` with smuggled descriptors (the
+        // test module can name private fields; outside code cannot): the
+        // gate-alone pair passes, the triple refuses with no values to load.
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        let thin = Thread {
+            id: 2,
+            state: ThreadState::Ready,
+            stack_base: 0x2000_0000,
+            stack_size: 16,
+            entry: 0x2000,
+        };
+        assert!(check_jump_entry(thin_top, thin.entry()));
+        assert_eq!(swap_target(&[a, thin], 1), Err(SwitchError::InvalidTable));
+        let skew = Thread {
+            id: 2,
+            state: ThreadState::Ready,
+            stack_base: 0x2000_0001,
+            stack_size: 8191,
+            entry: 0x2000,
+        };
+        assert!(check_jump_entry(skew_top, skew.entry()));
+        assert_eq!(swap_target(&[a, skew], 1), Err(SwitchError::InvalidTable));
+    }
+
+    #[test]
+    fn jump_to_thread_stack_is_never_return_shape() {
+        // S06 slice22: the live `jmp` switch must stay `unsafe fn -> !`
+        // (raw `mov rsp, ...` + indirect `jmp`, no return address pushed).
+        // Host stub returns `()` so tests stay alive; bind the guest shape
+        // via a function-pointer type check that `!` coerces (diverging
+        // entry never returns to the caller).
+        extern "C" fn diverging() {
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+        let entry: extern "C" fn() = diverging;
+        let _ = entry;
+        // Guard shape host half: the stub exists and links (live proof e2e).
+        let jump: unsafe fn(u64, extern "C" fn()) = jump_to_thread_stack;
+        let _ = jump;
     }
 
     #[test]

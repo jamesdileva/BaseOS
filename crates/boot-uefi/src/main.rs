@@ -42,6 +42,9 @@ use baseos_kernel::page_table::{
     walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
 };
 use baseos_kernel::sched::Scheduler;
+use baseos_kernel::thread::check_jump_entry;
+#[cfg(not(test))]
+use baseos_kernel::thread::jump_to_thread_stack;
 #[cfg(not(test))]
 use baseos_kernel::thread::swap_stacks_via_slots;
 #[cfg(not(test))]
@@ -1294,7 +1297,6 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
 
 #[cfg(test)]
 unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
-    // Host covers the dispatch/triple parity shape (no live RSP swap:
     // `baseos_kernel` dependency builds use the guest asm path here).
     let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
     let b = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
@@ -1341,6 +1343,113 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
         return Ok(false);
     }
     write_sched_line::<E>(true, 1, next, emit)?;
+    Ok(true)
+}
+
+/// Never-return jump entry (S06 slice22): runs ON the jumped-to stack (no
+/// return address was pushed — `jmp`, not `call`), so this function MUST
+/// NEVER `ret`. Emits the `THREAD-JUMP-RUN` proof line plus the
+/// `THREAD-JUMP ok=1` line from the new stack, then chains into
+/// `bring_up_cpu_and_prove_exception` (GDT/IDT + live `#PF` touch, which
+/// emits `PF ok=1` then chains `#DE` → `EXC ok=1`) — the boot never
+/// resumes on the old stack by construction (the caller `RSP` was already
+/// proven through the save-slot probes; loss is intended here).
+#[cfg(not(test))]
+extern "C" fn thread_jump_entry() -> ! {
+    let mut emit = com1_emit;
+    let _ = write_str(&mut emit, "THREAD-JUMP-RUN id=2\n");
+    let _ = write_thread_jump_line::<core::convert::Infallible>(true, 2, &mut emit);
+    unsafe {
+        baseos_kernel::bring_up_cpu_and_prove_exception();
+    }
+}
+
+/// Emit the one-line `THREAD-JUMP` diagnostic (S06 slice22):
+/// `THREAD-JUMP ok=<0|1> id=<n>` — `ok` is 1 only when the
+/// `swap_target` triple AND the supplemental [`check_jump_entry`] gate
+/// both passed on the same pair and the `jmp` landed (the
+/// `THREAD-JUMP-RUN` line above proves the new stack executed). `ok=0`
+/// is emitted by the probe without jumping (fail-closed funnel: the
+/// caller stays on the boot stack and falls through to the legacy
+/// bring-up, so `PF`/`EXC` still fire — e2e fails on the missing ok=1,
+/// never on a silent hang).
+fn write_thread_jump_line<E>(
+    ok: bool,
+    id: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "THREAD-JUMP ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " id=")?;
+    write_u64_dec(emit, id)?;
+    write_str(emit, "\n")
+}
+
+/// Live `jmp`-entry probe (S06 slice22): build the same two descriptors
+/// the `THREAD` probe uses (B entry IS `thread_jump_entry`), resolve the
+/// `swap_target` triple for A->B, AND the supplemental
+/// [`check_jump_entry`] gate on the same `(top, entry)` BEFORE loading
+/// `RSP` (never gate-alone — the top-only gate passes lethal stacks the
+/// triple refuses, pinned host-side). On any refusal emit
+/// `THREAD-JUMP ok=0 id=0` and return `Ok(false)` (caller falls through
+/// to the legacy bring-up — failure evidence, never silent). On success
+/// `jmp` to the entry and never return (the entry chains to bring-up
+/// from the new stack).
+///
+/// # Safety
+/// Post-EBS only, same contract as [`probe_thread_swap`]: owns the static
+/// stacks, `cli` in effect, COM1 exclusive.
+///
+/// Host `cargo test` builds cover the triple+gate parity shape only (no
+/// live `RSP` swap — same pattern as `probe_sched_switch`).
+#[cfg(not(test))]
+unsafe fn probe_thread_jump<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
+    let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
+    let entry_b = thread_jump_entry as *const () as u64;
+    let (a, b) = match (
+        Thread::new(1, base_a, 8192, 0x1000),
+        Thread::new(2, base_b, 8192, entry_b),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            write_thread_jump_line::<E>(false, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let (id, top, entry) = match swap_target(&[a, b], 1) {
+        Ok(t) => t,
+        Err(_) => {
+            write_thread_jump_line::<E>(false, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    if id != 2 || !check_jump_entry(top, entry) {
+        write_thread_jump_line::<E>(false, 0, emit)?;
+        return Ok(false);
+    }
+    let func: extern "C" fn() = core::mem::transmute(entry as *const ());
+    jump_to_thread_stack(top, func);
+}
+
+#[cfg(test)]
+unsafe fn probe_thread_jump<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    // Host covers the triple+gate parity shape (no live RSP swap).
+    let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+    let jump_addr = 0x2000u64;
+    let b = Thread::new(2, 0x2000_0000, 8192, jump_addr).unwrap();
+    let (id, top, entry) = match swap_target(&[a, b], 1) {
+        Ok(t) => t,
+        Err(_) => {
+            write_thread_jump_line::<E>(false, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    if id != 2 || !check_jump_entry(top, entry) {
+        write_thread_jump_line::<E>(false, 0, emit)?;
+        return Ok(false);
+    }
+    write_thread_jump_line::<E>(true, id, emit)?;
     Ok(true)
 }
 
@@ -1633,6 +1742,12 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // S06 slice18: minimal scheduler-driven switch — SCHED-SWITCH
             // ok=1 from=1 to=2 (fail-loud on dispatch/triple mismatch).
             let _ = probe_sched_switch::<Infallible>(&mut emit);
+            // S06 slice22: live `jmp`-entry switch — THREAD-JUMP-RUN +
+            // THREAD-JUMP ok=1 from the new stack, then the entry chains to
+            // bring-up (PF/EXC) there and never returns. On refusal the
+            // probe emits THREAD-JUMP ok=0 and returns, falling through to
+            // the legacy bring-up (failure evidence, never silent).
+            let _ = probe_thread_jump::<Infallible>(&mut emit);
             baseos_kernel::bring_up_cpu_and_prove_exception();
         }
         // EBS failed: still own boot services — park fail-loud (e2e sees
@@ -2555,6 +2670,46 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "SCHED-SWITCH ok=0 from=1 to=2\n"
         );
+    }
+
+    #[test]
+    fn jump_probe_parity_host() {
+        // S06 slice22 guest/host parity: the jmp-entry probe must resolve
+        // the `swap_target` triple AND the supplemental `check_jump_entry`
+        // gate on the same pair and emit `THREAD-JUMP ok=1 id=2` on the
+        // host too (live RSP jmp is e2e-only; QEMU proves the live path).
+        let mut out: Vec<u8> = Vec::new();
+        let ok = unsafe {
+            probe_thread_jump::<core::convert::Infallible>(&mut |b| {
+                out.push(b);
+                Ok(())
+            })
+        }
+        .unwrap();
+        assert!(ok);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("THREAD-JUMP ok=1 id=2"));
+    }
+
+    #[test]
+    fn jump_fail_closed_line_shape() {
+        // S06 slice22 ok=0 funnel: every refusal emits the same
+        // `THREAD-JUMP ok=0 id=0` shape the ps1 gates on — pin the writer
+        // directly (all probe refusals funnel through it).
+        let mut out: Vec<u8> = Vec::new();
+        write_thread_jump_line::<core::convert::Infallible>(false, 0, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "THREAD-JUMP ok=0 id=0\n");
+        let mut out: Vec<u8> = Vec::new();
+        write_thread_jump_line::<core::convert::Infallible>(true, 2, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "THREAD-JUMP ok=1 id=2\n");
     }
 
     #[test]

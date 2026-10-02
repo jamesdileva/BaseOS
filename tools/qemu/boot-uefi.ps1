@@ -213,6 +213,8 @@ if ($serialText -and $serialText.Contains($marker)) {
   $threadPong = "THREAD-PONG ok=1"
   $threadPongRun = "THREAD-PONG-RUN id=1"
   $schedSwitch = "SCHED-SWITCH ok=1 from=1 to=2"
+  $threadJump = "THREAD-JUMP ok=1 id=2"
+  $threadJumpRun = "THREAD-JUMP-RUN id=2"
   $exc = "EXC ok=1 vector=0"
   # S04 #168n6 live-#PF (REVIEW #229 cheapest disconfirm): the guest touches
   # the unmapped PF_PROBE_ADDR guard, so the PF stub must emit
@@ -270,11 +272,13 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasThreadPong = $serialText.Contains($threadPong)
   $hasThreadPongRun = $serialText.Contains($threadPongRun)
   $hasSchedSwitch = $serialText.Contains($schedSwitch)
+  $hasThreadJump = $serialText.Contains($threadJump)
+  $hasThreadJumpRun = $serialText.Contains($threadJumpRun)
   $hasPf = [regex]::IsMatch($serialText, $pfPat)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasPf -and $hasExc) {
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasThreadJump -and $hasThreadJumpRun -and $hasPf -and $hasExc) {
     Write-Output ("Boot summary: FOUND (" + $bootinfo + " + " + $memmap + " + " + $notrunc + " + " + $mapsize + " + " + $descsize + " + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + PF ok=1 vector=14 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + PF ok=1 vector=14 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -298,6 +302,8 @@ if ($serialText -and $serialText.Contains($marker)) {
       "THREAD-PONG ok=1 present=$hasThreadPong, " +
       "THREAD-PONG-RUN id=1 present=$hasThreadPongRun, " +
       "SCHED-SWITCH ok=1 from=1 to=2 present=$hasSchedSwitch, " +
+      "THREAD-JUMP ok=1 id=2 present=$hasThreadJump, " +
+      "THREAD-JUMP-RUN id=2 present=$hasThreadJumpRun, " +
       "PF ok=1 vector=14-shape present=$hasPf, " +
       "EXC ok=1 vector=0 present=$hasExc; " +
       "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/frame-alloc/#PF/#DE path failed " +

@@ -3,12 +3,12 @@
 Review before each work segment. Keep ≤20 lines, compact.
 
 - Goal: perf-first x86-64 UEFI desktop OS, Rust-first; docs in repo root.
-- Now: S06 slice18 done (154 green
-  21+19+104+4+4+2, fmt/clippy clean, QEMU PASS 1189B
-  SCHED-SWITCH ok=1 from=1 to=2, guest 104448B).
-  REVIEW #336 accepted 17d close-out; slice18 wires
-  Scheduler dispatch == swap_target triple in guest.
-  TOCTOU preempt documented-not-tested in sched.rs.
+- Now: S06 slice22 done (161 green 21+22+108+4+4+2,
+  fmt clean, clippy kernel+boot-tests clean, gates 41/41,
+  QEMU PASS 1232B THREAD-JUMP ok=1 id=2 + RUN id=2,
+  guest 105984B, PF/EXC chained from jumped stack).
+  Triple AND gate pinned; thin-test disproof on-tree.
+  REVIEW #358 accepts 1-4 met on-measure.
 - Next: fuller context switch (jump entry/multi-dispatch)
   + #9 retitle slice1->slice17 owed via #11. #9 active.
 - Board: #9 active (S06 threads). OK per human #79/#80.
