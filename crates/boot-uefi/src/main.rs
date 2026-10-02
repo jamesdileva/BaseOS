@@ -1184,11 +1184,12 @@ fn write_thread_line<E>(
 }
 
 /// Emit the one-line `SCHED-SWITCH` diagnostic (S06 slice18, minimal
-/// guest-switch wiring): `SCHED-SWITCH ok=<0|1> from=<n> to=<m>` — `ok`
+/// guest-switch wiring, slice19 persistent two-hop): `SCHED-SWITCH ok=<0|1> from=<n> to=<m>` — `ok`
 /// is 1 only when a `Scheduler` table (boot 1 + thread 2) dispatched
 /// 1->2, the `swap_target` triple for the same pair agreed on id 2, and
-/// the triple entry ran on the target stack and returned. First-dispatch
-/// parks nothing (boot stays `Ready`), so the line pins guest/host parity:
+/// the triple entry ran on the target stack and returned, plus a second
+/// 2->1 dispatch/triple agreement on the same table (resolved only).
+/// First-dispatch parks nothing (boot stays `Ready`), so the line pins guest/host parity:
 /// scheduler pick == swap-gate pick == executed entry.
 fn write_sched_line<E>(
     ok: bool,
@@ -1212,6 +1213,12 @@ fn write_sched_line<E>(
 /// triple entry on the target stack, and emit the `SCHED-SWITCH` line.
 /// Fail-closed (`ok=0`) on any spawn/dispatch/triple mismatch — never runs
 /// a disagreeing entry. Never panics.
+///
+/// S06 slice19 (REVIEW #338 R1): the table is persistent, not one-shot —
+/// after the live 1->2 hop a second `dispatch` must return 2->1 with the
+/// B->A `swap_target` triple agreeing on id 1 (resolved only, not
+/// executed: thread-1 entry `0x1000` is a placeholder, not a callable fn).
+/// The emitted line is unchanged (`ok=1 from=1 to=2` covers the live hop).
 ///
 /// # Safety
 /// Post-EBS only, same contract as [`probe_thread_swap`]: owns the static
@@ -1262,6 +1269,25 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
     }
     let func: extern "C" fn() = core::mem::transmute(entry as *const ());
     run_on_thread_stack(top, func);
+    // Persistent-table proof: second hop 2->1 agrees with the B->A triple.
+    let next2 = match sched.dispatch() {
+        Ok(n) => n,
+        Err(_) => {
+            write_sched_line::<E>(false, 1, next, emit)?;
+            return Ok(false);
+        }
+    };
+    let (id2, _, _) = match swap_target(&[a, b], 2) {
+        Ok(t) => t,
+        Err(_) => {
+            write_sched_line::<E>(false, 1, next, emit)?;
+            return Ok(false);
+        }
+    };
+    if next2 != 1 || id2 != 1 {
+        write_sched_line::<E>(false, 1, next, emit)?;
+        return Ok(false);
+    }
     write_sched_line::<E>(true, 1, next, emit)?;
     Ok(true)
 }
@@ -1293,6 +1319,25 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
     };
     if next != id || next != 2 || entry == 0 {
         write_sched_line::<E>(false, 1, id, emit)?;
+        return Ok(false);
+    }
+    // Persistent-table proof (slice19): second hop 2->1, same as guest.
+    let next2 = match sched.dispatch() {
+        Ok(n) => n,
+        Err(_) => {
+            write_sched_line::<E>(false, 1, next, emit)?;
+            return Ok(false);
+        }
+    };
+    let (id2, _, _) = match swap_target(&[a, b], 2) {
+        Ok(t) => t,
+        Err(_) => {
+            write_sched_line::<E>(false, 1, next, emit)?;
+            return Ok(false);
+        }
+    };
+    if next2 != 1 || id2 != 1 {
+        write_sched_line::<E>(false, 1, next, emit)?;
         return Ok(false);
     }
     write_sched_line::<E>(true, 1, next, emit)?;
@@ -2478,6 +2523,28 @@ mod tests {
         assert!(ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("SCHED-SWITCH ok=1 from=1 to=2"));
+    }
+
+    #[test]
+    fn sched_switch_fail_closed_line_shape() {
+        // S06 slice19 (REVIEW #338 R4): the fail-closed `ok=0` paths must
+        // emit the same `SCHED-SWITCH ok=0 from=<n> to=<m>` shape the ps1
+        // gates on — pin the writer directly (spawn/dispatch/triple
+        // mismatches all funnel through `write_sched_line(false, ..)`).
+        let mut out: Vec<u8> = Vec::new();
+        write_sched_line::<core::convert::Infallible>(false, 1, 0, &mut |b| Ok(out.push(b)))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SCHED-SWITCH ok=0 from=1 to=0\n"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        write_sched_line::<core::convert::Infallible>(false, 1, 2, &mut |b| Ok(out.push(b)))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SCHED-SWITCH ok=0 from=1 to=2\n"
+        );
     }
 
     #[test]

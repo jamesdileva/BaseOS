@@ -262,6 +262,56 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_two_hops_persistent_and_refusals_leave_table_untouched() {
+        // S06 slice19 (REVIEW #338 R1+R4): the scheduler table is
+        // persistent across dispatches (not one-shot) and every
+        // fail-closed refusal leaves `current` and all states untouched.
+        // First hop 1->2 parks nothing (boot stays Ready); second hop
+        // 2->1 parks the previous Running thread — the guest probe pins
+        // the same two-hop agreement live.
+        fn mk2(id: u64, base: u64) -> Thread {
+            Thread::new(id, base, 8192, 0x1000 + id).unwrap()
+        }
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk2(1, 0x1000_0000)));
+        assert!(s.spawn(mk2(2, 0x2000_0000)));
+        assert_eq!(s.dispatch(), Ok(2));
+        assert_eq!(s.current(), 2);
+        assert_eq!(s.state_of(1), Some(ThreadState::Ready));
+        assert_eq!(s.state_of(2), Some(ThreadState::Running));
+        assert_eq!(s.dispatch(), Ok(1));
+        assert_eq!(s.current(), 1);
+        assert_eq!(s.state_of(1), Some(ThreadState::Running));
+        assert_eq!(s.state_of(2), Some(ThreadState::Ready));
+        // Refusals: empty table, unknown current, and nothing-Ready all
+        // fail closed with no mutation (pins the guest ok=0 paths' host
+        // logic — the serial `ok=0` shape itself is pinned in boot-uefi).
+        let mut e = Scheduler::new(NULL_THREAD);
+        assert_eq!(e.pick_next(), Err(SwitchError::Unknown));
+        assert_eq!(e.dispatch(), Err(SwitchError::Unknown));
+        assert_eq!(e.current(), NULL_THREAD);
+        let mut u = Scheduler::new(99);
+        assert!(u.spawn(mk2(1, 0x1000_0000)));
+        assert_eq!(u.dispatch(), Err(SwitchError::Unknown));
+        assert_eq!(u.current(), 99);
+        assert_eq!(u.state_of(1), Some(ThreadState::Ready));
+        // Nothing Ready: sole thread Running (parked past first hop).
+        let mut n = Scheduler::new(1);
+        assert!(n.spawn(mk2(1, 0x1000_0000)));
+        assert!(n.spawn(mk2(2, 0x2000_0000)));
+        assert_eq!(n.dispatch(), Ok(2));
+        assert_eq!(n.dispatch(), Ok(1));
+        // Cancel both to Done via direct state moves is outside the
+        // scheduler; instead drive to NotReady: mark all non-current
+        // Done through a fresh table where only current is Ready.
+        let mut solo = Scheduler::new(1);
+        assert!(solo.spawn(mk2(1, 0x1000_0000)));
+        assert_eq!(solo.dispatch(), Err(SwitchError::NoSwitch));
+        assert_eq!(solo.current(), 1);
+        assert_eq!(solo.state_of(1), Some(ThreadState::Ready));
+    }
+
+    #[test]
     fn duplicate_and_full_refused_no_mutation() {
         let mut s = Scheduler::new(1);
         assert!(s.spawn(mk(1, 0x1000_0000)));
