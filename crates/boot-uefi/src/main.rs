@@ -2517,9 +2517,13 @@ mod tests {
         // `SCHED-SWITCH ok=1 from=1 to=2` line on the host too (live RSP
         // swap is a no-op stub here; the QEMU boot proves the live path).
         let mut out: Vec<u8> = Vec::new();
-        let ok =
-            unsafe { probe_sched_switch::<core::convert::Infallible>(&mut |b| Ok(out.push(b))) }
-                .unwrap();
+        let ok = unsafe {
+            probe_sched_switch::<core::convert::Infallible>(&mut |b| {
+                out.push(b);
+                Ok(())
+            })
+        }
+        .unwrap();
         assert!(ok);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("SCHED-SWITCH ok=1 from=1 to=2"));
@@ -2532,15 +2536,21 @@ mod tests {
         // gates on — pin the writer directly (spawn/dispatch/triple
         // mismatches all funnel through `write_sched_line(false, ..)`).
         let mut out: Vec<u8> = Vec::new();
-        write_sched_line::<core::convert::Infallible>(false, 1, 0, &mut |b| Ok(out.push(b)))
-            .unwrap();
+        write_sched_line::<core::convert::Infallible>(false, 1, 0, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "SCHED-SWITCH ok=0 from=1 to=0\n"
         );
         let mut out: Vec<u8> = Vec::new();
-        write_sched_line::<core::convert::Infallible>(false, 1, 2, &mut |b| Ok(out.push(b)))
-            .unwrap();
+        write_sched_line::<core::convert::Infallible>(false, 1, 2, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "SCHED-SWITCH ok=0 from=1 to=2\n"
