@@ -325,12 +325,22 @@ mod tests {
     /// boundary (the `r`/`b` must not follow `[0-9A-Za-z_]`, so `bar"#"`
     /// lexes as ident `bar` + normal string, never a raw open — without
     /// this `bar#"fake" Cell<` false-opens a 1-hash raw and blanks the
-    /// real `Cell<` to EOF). `rb` handled symmetrically with `br` (not
-    /// valid Rust, but blanked the same way a normal string would be, so
-    /// the pin is a superset either way). Known doc-only limits: multi-byte
-    /// char literals (`'é'`) fall back to lifetime-shape (single-char body
-    /// can never hide `Cell<`, so no pin bypass) and an unterminated raw
-    /// blanks to EOF (unterminated is a compile error — no real code after
+    /// real `Cell<` to EOF).
+    ///
+    /// Slice 17d (REVIEW #332 risk 1 — measured): only `br` is a valid
+    /// Rust raw-byte prefix; `rb` is two tokens (ident `rb` + normal
+    /// string). `br"x"` compiles (`rustc 1.98.0` exit 0 as `&[u8]`);
+    /// `rb"x"` fails (`expected one of ... found "x"` — `rb` parsed as
+    /// ident, issue #332 disproof). The lexer therefore opens raw only
+    /// on `r` / `br`, never `rb` — `rb` bodies blank as a normal string
+    /// (correct), and critically `rb#"fake" Cell<` keeps the trailing
+    /// `Cell<` (a symmetric-`rb` raw open would look for a `"#` close,
+    /// miss, and blank to EOF). Known doc-only limits: multi-byte
+    /// char literals (`'é'`, bytes `27 C3 A9 27`) fall back to
+    /// lifetime-shape (pinned by test: `'é' Cell<` keeps `Cell<`, so no
+    /// pin bypass — a single-char body can never spell `Cell<`) and an
+    /// unterminated raw blanks to EOF (unterminated is a compile error,
+    /// `rustc E0748 unterminated raw string` — no real code after
     /// matters).
     #[cfg(test)]
     fn strip_code(src: &str) -> String {
@@ -354,9 +364,10 @@ mod tests {
                 }
                 continue;
             }
-            // Raw string open: `[b]r#*"`. Hash count pins the close
+            // Raw string open: `[br]#*"`. Hash count pins the close
             // (`"` + that many `#`); content is raw (no escapes).
-            // Slice 17c: ident-boundary + `rb` symmetry (REVIEW #330).
+            // Slice 17c: ident-boundary (REVIEW #330). Slice 17d: `br`
+            // only, never `rb` (REVIEW #332: `rb` is ident + string).
             let prev_ident = i > 0
                 && matches!(
                     bytes[i - 1],
@@ -364,11 +375,6 @@ mod tests {
                 );
             let r_pos = if prev_ident {
                 None
-            } else if bytes[i] == b'r' && i + 1 < bytes.len() && bytes[i + 1] == b'b' {
-                // `rb#*"` (not valid Rust; blanked symmetrically with `br`
-                // so the pin stays a superset — the `rb` body would blank
-                // as a normal string either way).
-                Some(i + 1)
             } else if bytes[i] == b'r' {
                 Some(i)
             } else if bytes[i] == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'r' {
@@ -521,18 +527,38 @@ mod tests {
         // Sanity: real char literals still blank.
         assert!(!strip_code("'C'").contains("Cell<"));
         assert!(strip_code("'C' Cell<").contains("Cell<"));
-        // REVIEW #330 cheapest disproof (slice 17c): `rb` blanks like `br`
-        // (superset — would blank as a normal string either way), and a raw
-        // prefix glued to an ident never opens (else `bar#"fake" Cell<`
-        // false-opens a 1-hash raw with no `"#` close and blanks the real
-        // `Cell<` to EOF, while the correct ident + normal-string lex keeps
-        // it).
-        let rb = strip_code("rb\"/*Cell*/\" Cell<");
-        assert!(rb.contains("Cell<"));
-        assert!(!rb.contains("/*"));
+        // REVIEW #330 cheapest disproof (slice 17c): a raw prefix glued
+        // to an ident never opens (else `bar#"fake" Cell<` false-opens a
+        // 1-hash raw with no `"#` close and blanks the real `Cell<` to
+        // EOF, while the correct ident + normal-string lex keeps it).
+        // REVIEW #332 slice 17d: `br` is the only valid raw-byte prefix
+        // (`br"x"` compiles as `&[u8]`); `rb` is ident + normal string
+        // (`rb"x"` fails `expected ... found "x"`), so `rb#"fake"`
+        // must lex ident `rb` + `#` + normal string — trailing `Cell<`
+        // survives. A symmetric-`rb` raw open would seek a `"#` close,
+        // miss, and blank to EOF (over-blank of valid Rust).
+        // Boundary (REVIEW #332 risk 2): `r` at offset 0 (no prev char)
+        // IS a raw open; `_r` (`_` is an ident char) is NOT.
+        // Multibyte (REVIEW #332 risk 3): `'é'` (bytes `27 C3 A9 27`)
+        // falls back to lifetime-shape yet keeps the trailing token.
         let br = strip_code("br\"/*Cell*/\" Cell<");
         assert!(br.contains("Cell<"));
         assert!(!br.contains("/*"));
+        let rb_plain = strip_code("rb\"/*Cell*/\" Cell<");
+        assert!(rb_plain.contains("Cell<"));
+        assert!(!rb_plain.contains("/*"));
+        let rb_hash = strip_code("rb#\"fake\" Cell<");
+        assert!(rb_hash.contains("Cell<"));
+        let start_raw = strip_code("r\"/*Cell*/\" Cell<");
+        assert!(start_raw.contains("Cell<"));
+        assert!(!start_raw.contains("/*"));
+        assert!(!strip_code("r\"Cell<\"").contains("Cell<"));
+        let under_r = strip_code("_r\"/*Cell*/\" Cell<");
+        assert!(under_r.contains("Cell<"));
+        assert!(!under_r.contains("/*"));
+        let multi = strip_code("'é' Cell<");
+        assert!(multi.contains("Cell<"));
+        assert!(!strip_code("'é'").contains("Cell<"));
         let glued = strip_code("bar#\"fake\" Cell<");
         assert!(glued.contains("Cell<"));
         let glued_br = strip_code("foobarbr#\"fake\" Cell<");
