@@ -39,6 +39,17 @@ pub const MIN_STACK: u64 = 4096;
 /// is the documented follow-up if the hot path ever grows past this).
 pub const MAX_THREADS: usize = 16;
 
+/// Single-source callee-saved sentinel values (S06 hardening slice):
+/// the five distinct patterns the `callee_saved_survives*` proofs set in
+/// (`rbx`, `r12`-`r15`) around one live stack switch. Defined once here so
+/// the three proof bodies cannot drift across copies (previously each body
+/// declared its own `S_RBX`/`S_R12*...` literals with the same values).
+const SENT_RBX: u64 = 0x1B1B_1B1B_1B1B_1B1B;
+const SENT_R12: u64 = 0x1212_1212_1212_1212;
+const SENT_R13: u64 = 0x1313_1313_1313_1313;
+const SENT_R14: u64 = 0x1414_1414_1414_1414;
+const SENT_R15: u64 = 0x1515_1515_1515_1515;
+
 /// Thread lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
@@ -420,6 +431,44 @@ pub const fn check_jump_entry(new_top: u64, entry: u64) -> bool {
     true
 }
 
+/// Shared `RSP`-refusal predicate for the live `jmp` switch (S06 hardening
+/// slice): true when `new_top` must NOT be loaded as `RSP` (zero, the
+/// `stack_top()` fail-loud `u64::MAX` sentinel, or 16-byte-misaligned).
+/// The guest [`jump_to_thread_stack`] parks (`hlt` loop) on true; the
+/// predicate is `const` + host-testable so the park DECISION is pinned
+/// without executing `mov rsp, ...` on the host. `check_jump_entry` keeps
+/// its `(top, entry)` shape for the call sites that own both halves; this
+/// is the top-only half the asm guard enforces after the entry half has
+/// already been resolved through [`swap_target`] + [`entry_as_func`].
+#[must_use]
+pub const fn jump_rsp_refuses(new_top: u64) -> bool {
+    new_top == 0 || new_top == u64::MAX || new_top & 0xF != 0
+}
+
+/// Nonzero-only `entry` -> `extern "C" fn()` gate (S06 hardening slice):
+/// the single place a `swap_target` triple `entry` half becomes callable.
+/// Returns `None` on a null entry (fail-closed, no `transmute`), `Some(f)`
+/// otherwise. Every guest `transmute(entry as *const ())` site must route
+/// through this function AFTER resolving the triple, so a future site
+/// cannot forget the null check — the check lives at the transmute, not
+/// just at the construction site.
+///
+/// The `Some` value is still only as trustworthy as the triple behind it
+/// (nonzero is necessary, not sufficient, for valid code); callers must
+/// resolve through [`swap_target`] first, never gate-alone.
+#[must_use]
+pub fn entry_as_func(entry: u64) -> Option<extern "C" fn()> {
+    if entry == 0 {
+        return None;
+    }
+    // SAFETY: the caller resolved `entry` through `swap_target` (nonzero
+    // entry half of a validated descriptor); null is refused above, so
+    // this never materializes a null fn pointer. Validity of the target
+    // (executable code) is the caller's contract — a bad address faults
+    // loudly instead of passing silently.
+    Some(unsafe { core::mem::transmute::<*const (), extern "C" fn()>(entry as *const ()) })
+}
+
 /// Live `jmp`-entry switch (S06 slice22): load `new_top` as `RSP`, then
 /// `jmp func` — no return address is pushed, so `func` MUST NEVER `ret`
 /// (park, fault-chain, or switch stacks explicitly; the guest
@@ -442,7 +491,11 @@ pub const fn check_jump_entry(new_top: u64, entry: u64) -> bool {
 /// host harness must never execute `mov rsp, ...`).
 #[cfg(not(test))]
 pub unsafe fn jump_to_thread_stack(new_top: u64, func: extern "C" fn()) -> ! {
-    if new_top == 0 || new_top == u64::MAX || new_top & 0xF != 0 {
+    // Fail-closed: the shared refusal predicate decides the `hlt` park, so
+    // the host pin on `jump_rsp_refuses` covers this branch (a bad `RSP`
+    // parks instead of triple-faulting silently; e2e fails on the missing
+    // `THREAD-JUMP` lines either way).
+    if jump_rsp_refuses(new_top) {
         core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
         loop {
             core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
@@ -457,15 +510,22 @@ pub unsafe fn jump_to_thread_stack(new_top: u64, func: extern "C" fn()) -> ! {
     );
 }
 
-/// Host-test stub: same fail-closed shape without touching registers —
-/// valid values are a no-op that returns (so host tests stay alive), bad
-/// values park-spin is NOT replicated (host returns too; live `jmp` proof
-/// is e2e-only). The guard shape (which values refuse) is what host pins.
+/// Host-test stub: same never-return shape as the guest (`-> !`, diverging),
+/// so the `unsafe fn ... -> !` contract is pinned at compile time instead
+/// of diverging as `-> ()` on the host (S06 hardening slice closes the
+/// `cfg(test)` divergence). Never returns: parks on the host spin loop
+/// (never touches registers); never invoked by tests (live `jmp` proof is
+/// e2e-only).
 ///
 /// # Safety
-/// Host `cargo test` only: no-op.
+/// Host `cargo test` only: spins forever, never touches hardware. The
+/// real guest body (`cfg(not(test))`) carries the full post-EBS contract.
 #[cfg(test)]
-pub unsafe fn jump_to_thread_stack(_new_top: u64, _func: extern "C" fn()) {}
+pub unsafe fn jump_to_thread_stack(_new_top: u64, _func: extern "C" fn()) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
 
 /// Live RSP swap probe (S06 slices 7-10): run `func` on `new_top`, then
 /// restore the caller stack.
@@ -790,22 +850,17 @@ pub unsafe fn swap_stacks_via_slots(old_save: *mut u64, new_rsp: u64, _func: ext
 /// to a stub returning `true` (never touches registers).
 #[cfg(not(test))]
 pub unsafe fn callee_saved_survives(new_top: u64, func: extern "C" fn()) -> bool {
-    const S_RBX: u64 = 0x1B1B_1B1B_1B1B_1B1B;
-    const S_R12: u64 = 0x1212_1212_1212_1212;
-    const S_R13: u64 = 0x1313_1313_1313_1313;
-    const S_R14: u64 = 0x1414_1414_1414_1414;
-    const S_R15: u64 = 0x1515_1515_1515_1515;
     core::arch::asm!(
         "mov rbx, {s_rbx}",
         "mov r12, {s_r12}",
         "mov r13, {s_r13}",
         "mov r14, {s_r14}",
         "mov r15, {s_r15}",
-        s_rbx = in(reg) S_RBX,
-        s_r12 = in(reg) S_R12,
-        s_r13 = in(reg) S_R13,
-        s_r14 = in(reg) S_R14,
-        s_r15 = in(reg) S_R15,
+        s_rbx = in(reg) SENT_RBX,
+        s_r12 = in(reg) SENT_R12,
+        s_r13 = in(reg) SENT_R13,
+        s_r14 = in(reg) SENT_R14,
+        s_r15 = in(reg) SENT_R15,
         out("r12") _,
         out("r13") _,
         out("r14") _,
@@ -827,7 +882,11 @@ pub unsafe fn callee_saved_survives(new_top: u64, func: extern "C" fn()) -> bool
         v_r15 = out(reg) v_r15,
         options(nomem, nostack, preserves_flags),
     );
-    v_rbx == S_RBX && v_r12 == S_R12 && v_r13 == S_R13 && v_r14 == S_R14 && v_r15 == S_R15
+    v_rbx == SENT_RBX
+        && v_r12 == SENT_R12
+        && v_r13 == SENT_R13
+        && v_r14 == SENT_R14
+        && v_r15 == SENT_R15
 }
 
 /// Host stub: preservation proof is e2e-only; always `true` so host tests
@@ -907,22 +966,17 @@ pub unsafe fn callee_saved_survives_with_save(
     new_top: u64,
     func: extern "C" fn(),
 ) -> bool {
-    const S_RBX: u64 = 0x1B1B_1B1B_1B1B_1B1B;
-    const S_R12: u64 = 0x1212_1212_1212_1212;
-    const S_R13: u64 = 0x1313_1313_1313_1313;
-    const S_R14: u64 = 0x1414_1414_1414_1414;
-    const S_R15: u64 = 0x1515_1515_1515_1515;
     core::arch::asm!(
         "mov rbx, {s_rbx}",
         "mov r12, {s_r12}",
         "mov r13, {s_r13}",
         "mov r14, {s_r14}",
         "mov r15, {s_r15}",
-        s_rbx = in(reg) S_RBX,
-        s_r12 = in(reg) S_R12,
-        s_r13 = in(reg) S_R13,
-        s_r14 = in(reg) S_R14,
-        s_r15 = in(reg) S_R15,
+        s_rbx = in(reg) SENT_RBX,
+        s_r12 = in(reg) SENT_R12,
+        s_r13 = in(reg) SENT_R13,
+        s_r14 = in(reg) SENT_R14,
+        s_r15 = in(reg) SENT_R15,
         out("r12") _,
         out("r13") _,
         out("r14") _,
@@ -944,7 +998,11 @@ pub unsafe fn callee_saved_survives_with_save(
         v_r15 = out(reg) v_r15,
         options(nomem, nostack, preserves_flags),
     );
-    v_rbx == S_RBX && v_r12 == S_R12 && v_r13 == S_R13 && v_r14 == S_R14 && v_r15 == S_R15
+    v_rbx == SENT_RBX
+        && v_r12 == SENT_R12
+        && v_r13 == SENT_R13
+        && v_r14 == SENT_R14
+        && v_r15 == SENT_R15
 }
 
 /// Host stub: preservation proof is e2e-only; always `true`.
@@ -1015,22 +1073,17 @@ pub unsafe fn callee_saved_survives_via_slots(
     new_rsp: u64,
     func: extern "C" fn(),
 ) -> bool {
-    const S_RBX: u64 = 0x1B1B_1B1B_1B1B_1B1B;
-    const S_R12: u64 = 0x1212_1212_1212_1212;
-    const S_R13: u64 = 0x1313_1313_1313_1313;
-    const S_R14: u64 = 0x1414_1414_1414_1414;
-    const S_R15: u64 = 0x1515_1515_1515_1515;
     core::arch::asm!(
         "mov rbx, {s_rbx}",
         "mov r12, {s_r12}",
         "mov r13, {s_r13}",
         "mov r14, {s_r14}",
         "mov r15, {s_r15}",
-        s_rbx = in(reg) S_RBX,
-        s_r12 = in(reg) S_R12,
-        s_r13 = in(reg) S_R13,
-        s_r14 = in(reg) S_R14,
-        s_r15 = in(reg) S_R15,
+        s_rbx = in(reg) SENT_RBX,
+        s_r12 = in(reg) SENT_R12,
+        s_r13 = in(reg) SENT_R13,
+        s_r14 = in(reg) SENT_R14,
+        s_r15 = in(reg) SENT_R15,
         out("r12") _,
         out("r13") _,
         out("r14") _,
@@ -1052,7 +1105,11 @@ pub unsafe fn callee_saved_survives_via_slots(
         v_r15 = out(reg) v_r15,
         options(nomem, nostack, preserves_flags),
     );
-    v_rbx == S_RBX && v_r12 == S_R12 && v_r13 == S_R13 && v_r14 == S_R14 && v_r15 == S_R15
+    v_rbx == SENT_RBX
+        && v_r12 == SENT_R12
+        && v_r13 == SENT_R13
+        && v_r14 == SENT_R14
+        && v_r15 == SENT_R15
 }
 
 /// Host stub: preservation proof is e2e-only; always `true`.
@@ -1592,11 +1649,11 @@ mod tests {
 
     #[test]
     fn jump_to_thread_stack_is_never_return_shape() {
-        // S06 slice22: the live `jmp` switch must stay `unsafe fn -> !`
-        // (raw `mov rsp, ...` + indirect `jmp`, no return address pushed).
-        // Host stub returns `()` so tests stay alive; bind the guest shape
-        // via a function-pointer type check that `!` coerces (diverging
-        // entry never returns to the caller).
+        // S06 slice22 (+hardening: stub is now `-> !` like the guest, so
+        // the host/guest `cfg(test)` divergence is closed): the live `jmp`
+        // switch must stay `unsafe fn -> !` (raw `mov rsp, ...` + indirect
+        // `jmp`, no return address pushed). Bind the diverging shape — an
+        // `-> ()` stub or body would not coerce here.
         extern "C" fn diverging() {
             loop {
                 core::hint::spin_loop();
@@ -1605,7 +1662,7 @@ mod tests {
         let entry: extern "C" fn() = diverging;
         let _ = entry;
         // Guard shape host half: the stub exists and links (live proof e2e).
-        let jump: unsafe fn(u64, extern "C" fn()) = jump_to_thread_stack;
+        let jump: unsafe fn(u64, extern "C" fn()) -> ! = jump_to_thread_stack;
         let _ = jump;
     }
 
@@ -1631,6 +1688,81 @@ mod tests {
             assert_eq!(top & 0xF, 0);
             assert_ne!(entry, 0);
             current = id;
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn entry_as_func_refuses_null_and_round_trips() {
+        // S06 hardening (transmute nonzero-only): null never transmutes
+        // (fail-closed `None`); a real fn address round-trips and stays
+        // callable (called here on the host stack — no RSP swap — to prove
+        // the gate shape, mirroring `swap_entry_round_trips_through_u64`
+        // through the single gate all guest sites must use).
+        assert!(entry_as_func(0).is_none());
+        extern "C" fn probe_entry() {}
+        let addr = probe_entry as *const () as u64;
+        assert_ne!(addr, 0);
+        let back = entry_as_func(addr).expect("nonzero entry must convert");
+        back();
+        // And the `swap_target` triple entry converts through the same gate:
+        // store a real fn address as the entry and resolve it back.
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        let b = Thread::new(2, 0x2000_0000, 8192, addr).unwrap();
+        let (id, _top, entry) = swap_target(&[a, b], 1).unwrap();
+        assert_eq!(id, 2);
+        let back2 = entry_as_func(entry).expect("triple entry must convert");
+        back2();
+    }
+
+    #[test]
+    fn jump_rsp_refuses_matches_check_jump_entry_top_half() {
+        // S06 hardening (hlt-park decision pin): the shared predicate the
+        // guest `jump_to_thread_stack` parks on must refuse exactly the
+        // top-half `check_jump_entry` refuses (zero / u64::MAX sentinel /
+        // misaligned) and accept aligned live tops — including the real
+        // `swap_target` triple tops. A future guard edit that weakens one
+        // side fails here.
+        for bad in [0u64, u64::MAX, 0x2000_0001, 0x1000_0000 + 8191] {
+            assert!(jump_rsp_refuses(bad), "must refuse {bad:#x}");
+            assert!(!check_jump_entry(bad, 0x2000), "gate must agree {bad:#x}");
+        }
+        for good in [0x1000_0000 + 8192, 0x2000_0000 + 8192, 0x10] {
+            assert!(!jump_rsp_refuses(good), "must accept {good:#x}");
+            assert!(check_jump_entry(good, 0x2000), "gate must agree {good:#x}");
+        }
+        // Live triple tops agree on both sides.
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        let b = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
+        let (_, top_a, entry_a) = swap_target(&[a, b], 2).unwrap();
+        let (_, top_b, entry_b) = swap_target(&[a, b], 1).unwrap();
+        assert!(!jump_rsp_refuses(top_a));
+        assert!(!jump_rsp_refuses(top_b));
+        assert!(check_jump_entry(top_a, entry_a));
+        assert!(check_jump_entry(top_b, entry_b));
+    }
+
+    #[test]
+    fn sentinel_values_are_single_sourced_and_distinct() {
+        // S06 hardening (fragile literals): the five proof sentinels live
+        // once at module scope — pin their exact values plus distinctness
+        // and nonzeroness so a silent edit (typo, overlap with the clobber
+        // trash `0xDEAD...`/`0xBEEF...` patterns is intentional, but two
+        // sentinels colliding would weaken the pop-order proof) fails here.
+        assert_eq!(SENT_RBX, 0x1B1B_1B1B_1B1B_1B1B);
+        assert_eq!(SENT_R12, 0x1212_1212_1212_1212);
+        assert_eq!(SENT_R13, 0x1313_1313_1313_1313);
+        assert_eq!(SENT_R14, 0x1414_1414_1414_1414);
+        assert_eq!(SENT_R15, 0x1515_1515_1515_1515);
+        let all = [SENT_RBX, SENT_R12, SENT_R13, SENT_R14, SENT_R15];
+        let mut i = 0;
+        while i < all.len() {
+            assert_ne!(all[i], 0);
+            let mut j = i + 1;
+            while j < all.len() {
+                assert_ne!(all[i], all[j], "sentinels must be distinct");
+                j += 1;
+            }
             i += 1;
         }
     }

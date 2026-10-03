@@ -43,6 +43,9 @@ use baseos_kernel::page_table::{
 };
 use baseos_kernel::sched::Scheduler;
 use baseos_kernel::thread::check_jump_entry;
+use baseos_kernel::thread::entry_as_func;
+#[cfg(not(test))]
+use baseos_kernel::thread::jump_rsp_refuses;
 #[cfg(not(test))]
 use baseos_kernel::thread::jump_to_thread_stack;
 #[cfg(not(test))]
@@ -968,7 +971,17 @@ unsafe fn probe_thread_save<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Re
         write_thread_save_line::<E>(false, 0, emit)?;
         return Ok(false);
     }
-    let func: extern "C" fn() = core::mem::transmute(entry as *const ());
+    // Nonzero-only gate at the transmute (S06 hardening): the `entry == 0`
+    // check above stays as the first fail-closed layer; `entry_as_func`
+    // re-enforces it where the fn pointer materializes, so a future edit
+    // cannot drop the check without the transmute refusing.
+    let func = match entry_as_func(entry) {
+        Some(f) => f,
+        None => {
+            write_thread_save_line::<E>(false, 0, emit)?;
+            return Ok(false);
+        }
+    };
     let slot = core::ptr::addr_of_mut!(THREAD_RSP_SAVE);
     // Fail-closed: zero the slot first so a no-save path prints ok=0
     // instead of a stale nonzero value.
@@ -1042,7 +1055,10 @@ extern "C" fn thread_b_pingpong_entry() {
         if entry_a == 0 {
             return;
         }
-        let pong: extern "C" fn() = core::mem::transmute(entry_a as *const ());
+        let pong = match entry_as_func(entry_a) {
+            Some(f) => f,
+            None => return,
+        };
         swap_stacks_via_slots(core::ptr::addr_of_mut!(THREAD_RSP_SAVE_B), boot_rsp, pong);
     }
 }
@@ -1121,7 +1137,13 @@ unsafe fn probe_thread_pingpong<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -
     // instead of a stale nonzero value (same guard as `probe_thread_save`).
     core::ptr::write_volatile(slot_a, 0);
     core::ptr::write_volatile(slot_b, 0);
-    let func_b: extern "C" fn() = core::mem::transmute(entry_b as *const ());
+    let func_b = match entry_as_func(entry_b) {
+        Some(f) => f,
+        None => {
+            write_thread_pong_line::<E>(false, 0, 0, emit)?;
+            return Ok(false);
+        }
+    };
     run_on_thread_stack_with_save(slot_a, top, func_b);
     let saved_a = core::ptr::read_volatile(slot_a);
     let saved_b = core::ptr::read_volatile(slot_b);
@@ -1270,7 +1292,13 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
         write_sched_line::<E>(false, 1, id, emit)?;
         return Ok(false);
     }
-    let func: extern "C" fn() = core::mem::transmute(entry as *const ());
+    let func = match entry_as_func(entry) {
+        Some(f) => f,
+        None => {
+            write_sched_line::<E>(false, 1, id, emit)?;
+            return Ok(false);
+        }
+    };
     run_on_thread_stack(top, func);
     // Persistent-table proof: second hop 2->1 agrees with the B->A triple.
     let next2 = match sched.dispatch() {
@@ -1424,11 +1452,21 @@ unsafe fn probe_thread_jump<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Re
             return Ok(false);
         }
     };
-    if id != 2 || !check_jump_entry(top, entry) {
+    // Triple AND shared `RSP`-refusal predicate (S06 hardening): the
+    // `jump_rsp_refuses` conjunct is redundant with `check_jump_entry`'s
+    // top half by construction, wiring the host-pinned park decision into
+    // the live path so a future gate edit cannot silently drop it.
+    if id != 2 || !check_jump_entry(top, entry) || jump_rsp_refuses(top) {
         write_thread_jump_line::<E>(false, 0, emit)?;
         return Ok(false);
     }
-    let func: extern "C" fn() = core::mem::transmute(entry as *const ());
+    let func = match entry_as_func(entry) {
+        Some(f) => f,
+        None => {
+            write_thread_jump_line::<E>(false, 0, emit)?;
+            return Ok(false);
+        }
+    };
     jump_to_thread_stack(top, func);
 }
 
@@ -1546,7 +1584,13 @@ unsafe fn probe_thread_swap<E>(
         write_thread_line::<E>(false, 0, 0, 0, emit)?;
         return Ok((false, 0, 0, 0));
     }
-    let func: extern "C" fn() = core::mem::transmute(entry as *const ());
+    let func = match entry_as_func(entry) {
+        Some(f) => f,
+        None => {
+            write_thread_line::<E>(false, 0, 0, 0, emit)?;
+            return Ok((false, 0, 0, 0));
+        }
+    };
     run_on_thread_stack(top, func);
     write_thread_line::<E>(true, id, top, entry, emit)?;
     Ok((true, id, top, entry))
@@ -1606,7 +1650,15 @@ unsafe fn probe_thread_callee_saved<E>(
             write_thread_cs_line::<E>(false, 0, emit)?;
             return Ok(false);
         }
-        let clobber: extern "C" fn() = unsafe { core::mem::transmute(clobber_ptr) };
+        // Same nonzero-only gate (the null check above stays as the first
+        // layer; the helper refuses it again at the transmute).
+        let clobber = match entry_as_func(clobber_ptr as u64) {
+            Some(f) => f,
+            None => {
+                write_thread_cs_line::<E>(false, 0, emit)?;
+                return Ok(false);
+            }
+        };
         let mut k = 0;
         while k < 16 {
             run_on_thread_stack(top, clobber);
@@ -2889,5 +2941,44 @@ mod tests {
         assert_eq!(GET_MAP_MAX_ATTEMPTS, 4);
         assert_eq!(GET_MAP_POOL_SLACK, 4096);
         assert_eq!(STRUCTURAL_FAIL, usize::MAX);
+    }
+
+    #[test]
+    fn thread_entry_transmutes_route_through_nonzero_gate() {
+        // S06 hardening (transmute nonzero-only + live-path wiring): every
+        // thread-entry transmute site (entry u64 -> fn pointer) must route
+        // through `entry_as_func`, and the live jump probe must enforce the
+        // shared `jump_rsp_refuses` predicate. The firmware slot loaders
+        // (`ExitBootServicesFn`/`GetMemoryMapFn`/`AllocatePoolFn`/
+        // `LocateProtocolFn`) keep their own typed transmutes and are out
+        // of scope — this pin covers the `entry` domain only.
+        // NOTE: the raw needle is built via concat so this test's own
+        // source cannot self-match it through `include_str!`.
+        const SRC: &str = include_str!("main.rs");
+        const NEEDLE: &str = concat!("transmute", "(entry");
+        assert!(
+            !SRC.contains(NEEDLE),
+            "no raw entry transmute may remain outside entry_as_func"
+        );
+        assert!(
+            SRC.contains("entry_as_func(entry)"),
+            "thread probes must convert the triple entry via entry_as_func"
+        );
+        assert!(
+            SRC.contains("entry_as_func(entry_a)"),
+            "nested B->A hop must convert via entry_as_func"
+        );
+        assert!(
+            SRC.contains("entry_as_func(entry_b)"),
+            "ping-pong outer entry must convert via entry_as_func"
+        );
+        assert!(
+            SRC.contains("entry_as_func(clobber_ptr as u64)"),
+            "clobber stub must convert via entry_as_func"
+        );
+        assert!(
+            SRC.contains("jump_rsp_refuses(top)"),
+            "live jump probe must enforce the shared RSP-refusal predicate"
+        );
     }
 }
