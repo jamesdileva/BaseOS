@@ -853,15 +853,23 @@ unsafe fn probe_rmbz(info: &BootInfo) -> (bool, bool, usize, usize, usize) {
     )
 }
 
-/// S06 slice 7 live-RSP probe: two 8 KiB stacks, 16-byte aligned so
+/// S06 slice 7 live-RSP probe: three 8 KiB stacks, 16-byte aligned so
 /// `Thread::new` accepts them. Static (not stack) so the boot stack stays
-/// small; single-threaded boot owns them exclusively post-EBS.
+/// small; single-threaded boot owns them exclusively post-EBS. Slice26
+/// adds `THREAD_STACK_C` for the guest 1->2->3->1 multi-hop (live jmp
+/// multi-hop itself is the next slice; this slice pins the layout +
+/// host dispatch parity so the guest cannot smuggle an overlapping or
+/// misaligned third stack).
 #[repr(align(16))]
 #[allow(dead_code)]
 struct AlignedStack([u8; 8192]);
 
 static mut THREAD_STACK_A: AlignedStack = AlignedStack([0; 8192]);
 static mut THREAD_STACK_B: AlignedStack = AlignedStack([0; 8192]);
+// Slice26a: live multi-hop consumes C next slice; allow dead_code on the
+// UEFI target until then (host tests already pin the layout + parity).
+#[allow(dead_code)]
+static mut THREAD_STACK_C: AlignedStack = AlignedStack([0; 8192]);
 
 /// Caller-owned two-way save slot (S06 slice 12): `run_on_thread_stack_
 /// with_save` spills the boot `RSP` here before switching, so the save
@@ -2783,6 +2791,72 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "SCHED-SWITCH ok=0 from=1 to=2\n"
         );
+    }
+
+    #[test]
+    fn three_stacks_dispatch_parity_host() {
+        // S06 slice26a: third stack layout + 3-thread dispatch parity.
+        // The guest 1->2->3->1 live multi-hop needs STACK_C to be a
+        // Thread-acceptable, non-overlapping 8 KiB stack BEFORE any live
+        // jmp touches it, and the Scheduler dispatch path must agree with
+        // the swap_target triple on every leg (live-state-aware, mirroring
+        // the slice25 sched.rs pin — static all-Ready would hide Running).
+        // Live multi-hop jmp itself is the next slice; this pins the floor.
+        let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
+        let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
+        let base_c = core::ptr::addr_of!(THREAD_STACK_C) as u64;
+        for base in [base_a, base_b, base_c] {
+            assert_ne!(base, 0);
+            assert_eq!(base & 0xF, 0, "static stacks stay 16-byte aligned");
+        }
+        assert!(base_a != base_b && base_b != base_c && base_a != base_c);
+        // 8 KiB ranges must not overlap (linker could pack them adjacently,
+        // never overlapping — overlap would make Thread::new refuse below).
+        for (x, y) in [(base_a, base_b), (base_b, base_c), (base_a, base_c)] {
+            let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+            assert!(lo.saturating_add(8192) <= hi, "stacks must not overlap");
+        }
+        let a = Thread::new(1, base_a, 8192, 0x1000).unwrap();
+        let b = Thread::new(2, base_b, 8192, 0x2000).unwrap();
+        let c = Thread::new(3, base_c, 8192, 0x3000).unwrap();
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(a));
+        assert!(s.spawn(b));
+        assert!(s.spawn(c));
+        for current in [1u64, 2, 3] {
+            let expect = if current == 3 { 1 } else { current + 1 };
+            assert_eq!(s.current(), current);
+            assert_eq!(s.pick_next(), Ok(expect));
+            // Live snapshot: mirror scheduler states (Running appears
+            // after the first dispatch; static all-Ready would hide it).
+            fn live_as(t: Thread, st: baseos_kernel::thread::ThreadState) -> Thread {
+                let mut m = t;
+                if m.state() != st {
+                    assert!(m.set_state(st), "live snapshot must reach scheduler state");
+                }
+                m
+            }
+            let live = [
+                live_as(
+                    Thread::new(1, base_a, 8192, 0x1000).unwrap(),
+                    s.state_of(1).unwrap(),
+                ),
+                live_as(
+                    Thread::new(2, base_b, 8192, 0x2000).unwrap(),
+                    s.state_of(2).unwrap(),
+                ),
+                live_as(
+                    Thread::new(3, base_c, 8192, 0x3000).unwrap(),
+                    s.state_of(3).unwrap(),
+                ),
+            ];
+            let (id, top, entry) = swap_target(&live, s.current()).unwrap();
+            assert_eq!(id, expect);
+            assert!(check_jump_entry(top, entry));
+            assert!(entry_as_func(entry).is_some());
+            assert_eq!(s.dispatch(), Ok(expect));
+            assert_eq!(s.current(), expect);
+        }
     }
 
     #[test]
