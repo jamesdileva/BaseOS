@@ -262,6 +262,36 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_three_thread_jump_chain_parity() {
+        // S06 slice24: scheduler-driven multi-dispatch must agree with the
+        // live-jump contract (swap_target triple AND check_jump_entry AND
+        // entry_as_func, never gate-alone) on every leg 1->2->3->1. The
+        // thread-level rotation (slice23) proves the picker order; this
+        // proves the Scheduler dispatch path the guest multi-hop jmp needs
+        // picks the same ids with jump-valid triples.
+        use crate::thread::{check_jump_entry, entry_as_func, jump_rsp_refuses, swap_target};
+        let a = mk(1, 0x1000_0000);
+        let b = mk(2, 0x2000_0000);
+        let c = mk(3, 0x3000_0000);
+        let table = [a, b, c];
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(a));
+        assert!(s.spawn(b));
+        assert!(s.spawn(c));
+        for current in [1u64, 2, 3] {
+            let expect = if current == 3 { 1 } else { current + 1 };
+            assert_eq!(s.pick_next(), Ok(expect));
+            let (id, top, entry) = swap_target(&table, current).unwrap();
+            assert_eq!(id, expect);
+            assert!(check_jump_entry(top, entry));
+            assert!(!jump_rsp_refuses(top));
+            assert!(entry_as_func(entry).is_some());
+            assert_eq!(s.dispatch(), Ok(expect));
+            assert_eq!(s.current(), expect);
+        }
+    }
+
+    #[test]
     fn dispatch_two_hops_persistent_and_refusals_leave_table_untouched() {
         // S06 slice19 (REVIEW #338 R1+R4): the scheduler table is
         // persistent across dispatches (not one-shot) and every
