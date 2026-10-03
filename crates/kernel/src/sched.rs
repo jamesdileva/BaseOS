@@ -269,25 +269,57 @@ mod tests {
         // thread-level rotation (slice23) proves the picker order; this
         // proves the Scheduler dispatch path the guest multi-hop jmp needs
         // picks the same ids with jump-valid triples.
+        //
+        // REVIEW #393 finding 1 (slice25 fix): the slice24 version fed
+        // swap_target a STATIC all-Ready table while Scheduler states
+        // mutated to Running across legs — picker-order parity only, not
+        // live state-aware parity. A future gate that checked Running vs
+        // Ready would stay green here while the guest diverged. This
+        // version rebuilds a LIVE snapshot mirroring s.state_of() every
+        // leg and feeds swap_target the live states + s.current(), so a
+        // state-sensitive divergence goes red.
         use crate::thread::{check_jump_entry, entry_as_func, jump_rsp_refuses, swap_target};
+        fn live_as(t: Thread, st: ThreadState) -> Thread {
+            let mut m = t;
+            if m.state() != st {
+                assert!(m.set_state(st), "live snapshot must reach scheduler state");
+            }
+            m
+        }
         let a = mk(1, 0x1000_0000);
         let b = mk(2, 0x2000_0000);
         let c = mk(3, 0x3000_0000);
-        let table = [a, b, c];
         let mut s = Scheduler::new(1);
         assert!(s.spawn(a));
         assert!(s.spawn(b));
         assert!(s.spawn(c));
         for current in [1u64, 2, 3] {
             let expect = if current == 3 { 1 } else { current + 1 };
+            // Live current must track the loop leg (order pin).
+            assert_eq!(s.current(), current);
             assert_eq!(s.pick_next(), Ok(expect));
-            let (id, top, entry) = swap_target(&table, current).unwrap();
+            // Live snapshot: mirror scheduler states (Running appears
+            // after the first dispatch; static all-Ready would hide it).
+            let live = [
+                live_as(a, s.state_of(1).unwrap()),
+                live_as(b, s.state_of(2).unwrap()),
+                live_as(c, s.state_of(3).unwrap()),
+            ];
+            // Static-shape sanity: after leg 1 the live table is NOT
+            // all-Ready (proves this test can see what slice24 could not).
+            if current != 1 {
+                assert!(live.iter().any(|t| t.state() == ThreadState::Running));
+            }
+            let (id, top, entry) = swap_target(&live, s.current()).unwrap();
             assert_eq!(id, expect);
             assert!(check_jump_entry(top, entry));
             assert!(!jump_rsp_refuses(top));
             assert!(entry_as_func(entry).is_some());
             assert_eq!(s.dispatch(), Ok(expect));
             assert_eq!(s.current(), expect);
+            // Post-dispatch: scheduler states mirror the live snapshot
+            // transition (picked Running, previous Running parked Ready).
+            assert_eq!(s.state_of(expect), Some(ThreadState::Running));
         }
     }
 
