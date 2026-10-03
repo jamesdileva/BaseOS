@@ -1453,15 +1453,44 @@ unsafe fn probe_thread_jump<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Re
     Ok(true)
 }
 
-/// Forced-refusal demo (S06 slice22 R2): proves the `THREAD-JUMP ok=0 id=0`
-/// funnel shape live in QEMU. Builds a deliberately bad triple (null entry,
-/// so `Thread::new` refuses; plus a `check_jump_entry` refusal on a zero
-/// top) and funnels both through the same `write_thread_jump_line(false, 0)`
-/// refusal path the live probe uses. Emits exactly one
-/// `THREAD-JUMP ok=0 id=0` line and returns `Ok(false)`; the caller falls
+/// Refusal-demo outcome funnel (S06 slice22 R3, REVIEW #368 fix): the
+/// single place the `THREAD-JUMP ok=0 id=0` shape is emitted vs the
+/// fail-loud gate-accept marker. `refused=true` (both bad values refused)
+/// emits exactly `THREAD-JUMP ok=0 id=0` and returns `Ok(false)` (caller
+/// falls through, PF/EXC still fire downstream). `refused=false` (a gate
+/// accepted a corrupt value — regressed gate) emits the DISTINCT marker
+/// `THREAD-JUMP-REFUSAL-FAIL gate_accepted=1` — never the `ok=0` shape —
+/// and returns `Ok(true)` (divergent return so host tests and `efi_main`
+/// can tell accept from refuse). The distinct marker plus the missing
+/// `ok=0` line makes `boot-uefi.ps1` fail visibly (negative
+/// `THREAD-JUMP-REFUSAL-FAIL` gate + required `THREAD-JUMP ok=0 id=0`
+/// gate); `efi_main` additionally skips the live jump on `Ok(true)` so
+/// the `ok=1` line goes missing too. Never panics.
+fn emit_refusal_demo_result<E>(
+    refused: bool,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<bool, E> {
+    if refused {
+        write_thread_jump_line::<E>(false, 0, emit)?;
+        return Ok(false);
+    }
+    write_str(emit, "THREAD-JUMP-REFUSAL-FAIL gate_accepted=1\n")?;
+    Ok(true)
+}
+
+/// Forced-refusal demo (S06 slice22 R2, hardened R3 per REVIEW #368):
+/// proves the `THREAD-JUMP ok=0 id=0` funnel shape live in QEMU. Builds a
+/// deliberately bad triple (null entry, so `Thread::new` refuses; plus a
+/// `check_jump_entry` refusal on a zero top) and funnels the outcome
+/// through [`emit_refusal_demo_result`]: healthy gates emit exactly one
+/// `THREAD-JUMP ok=0 id=0` line and return `Ok(false)`; the caller falls
 /// through (PF/EXC still fire downstream), so the serial proves refusal
-/// does not hang or skip the fault chain. Runs BEFORE the live jump probe
-/// so one boot shows both `ok=0` (refusal shape) and `ok=1` (live jump).
+/// does not hang or skip the fault chain. A regressed gate (either bad
+/// value accepted) emits `THREAD-JUMP-REFUSAL-FAIL gate_accepted=1` and
+/// returns `Ok(true)` — never the `ok=0` shape — so the `ok=0` serial line
+/// actually proves refusal (the old R2 code emitted `ok=0` on both
+/// branches, a tautology REVIEW #368). Runs BEFORE the live jump probe so
+/// one healthy boot shows both `ok=0` (refusal shape) and `ok=1` (live jump).
 fn probe_thread_jump_refusal_demo<E>(
     emit: &mut impl FnMut(u8) -> Result<(), E>,
 ) -> Result<bool, E> {
@@ -1469,14 +1498,8 @@ fn probe_thread_jump_refusal_demo<E>(
     let bad_entry = Thread::new(1, 0x1000_0000, 8192, 0);
     // Corrupt top: zero top refuses at the supplemental gate.
     let bad_top_gate = check_jump_entry(0, 0x2000);
-    if bad_entry.is_err() && !bad_top_gate {
-        write_thread_jump_line::<E>(false, 0, emit)?;
-        return Ok(false);
-    }
-    // Unreachable on a correct gate: if either bad value passed, that is a
-    // gate failure — still emit the refusal shape (fail-loud, never silent).
-    write_thread_jump_line::<E>(false, 0, emit)?;
-    Ok(false)
+    let refused = bad_entry.is_err() && !bad_top_gate;
+    emit_refusal_demo_result::<E>(refused, emit)
 }
 
 /// Live thread-stack swap post-`ExitBootServices`: build two descriptors
@@ -1771,13 +1794,21 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // S06 slice22 R2: forced-refusal demo first — emits
             // `THREAD-JUMP ok=0 id=0` through the refusal funnel on a corrupt
             // triple, then falls through (PF/EXC still fire downstream).
-            let _ = probe_thread_jump_refusal_demo::<Infallible>(&mut emit);
+            // R3 (REVIEW #368): a regressed gate emits
+            // `THREAD-JUMP-REFUSAL-FAIL` with Ok(true) instead of ok=0 —
+            // skip the live jump so the `ok=1` line goes missing too and
+            // e2e fails on two missing lines plus the FAIL marker, never
+            // on a silent same-shape pass.
+            let demo_gate_failed =
+                probe_thread_jump_refusal_demo::<Infallible>(&mut emit).unwrap_or(true);
             // S06 slice22: live `jmp`-entry switch — THREAD-JUMP-RUN +
             // THREAD-JUMP ok=1 from the new stack, then the entry chains to
             // bring-up (PF/EXC) there and never returns. On refusal the
             // probe emits THREAD-JUMP ok=0 and returns, falling through to
             // the legacy bring-up (failure evidence, never silent).
-            let _ = probe_thread_jump::<Infallible>(&mut emit);
+            if !demo_gate_failed {
+                let _ = probe_thread_jump::<Infallible>(&mut emit);
+            }
             baseos_kernel::bring_up_cpu_and_prove_exception();
         }
         // EBS failed: still own boot services — park fail-loud (e2e sees
@@ -2758,6 +2789,47 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text, "THREAD-JUMP ok=0 id=0\n");
         assert!(!text.contains("THREAD-JUMP ok=1 id=2"));
+    }
+
+    #[test]
+    fn jump_refusal_demo_accept_path_is_fail_loud() {
+        // S06 slice22 R3 (REVIEW #368): the accept path — a regressed gate
+        // that lets a corrupt value through — must NOT emit the `ok=0`
+        // shape (the R2 tautology: both branches printed ok=0, so a broken
+        // gate still PASSed). It emits the distinct
+        // `THREAD-JUMP-REFUSAL-FAIL` marker and returns Ok(true)
+        // (divergent from the refuse path's Ok(false)), so the serial
+        // shape differs and boot-uefi.ps1 fails on the missing ok=0 plus
+        // the FAIL marker. Pinned through the same
+        // `emit_refusal_demo_result` funnel the guest uses.
+        let mut out: Vec<u8> = Vec::new();
+        let ok = emit_refusal_demo_result::<core::convert::Infallible>(false, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert!(ok, "accept path must diverge from the refuse path");
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "THREAD-JUMP-REFUSAL-FAIL gate_accepted=1\n");
+        assert!(
+            !text.contains("THREAD-JUMP ok=0"),
+            "accept path must never emit the refusal shape"
+        );
+        assert!(
+            !text.contains("THREAD-JUMP ok=1 id=2"),
+            "accept path must never emit the live-jump shape"
+        );
+        // Refuse path through the same funnel: exact ok=0 shape, Ok(false).
+        let mut out: Vec<u8> = Vec::new();
+        let ok = emit_refusal_demo_result::<core::convert::Infallible>(true, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!ok);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "THREAD-JUMP ok=0 id=0\n");
+        assert!(!text.contains("REFUSAL-FAIL"));
     }
 
     #[test]
