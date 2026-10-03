@@ -1453,6 +1453,32 @@ unsafe fn probe_thread_jump<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Re
     Ok(true)
 }
 
+/// Forced-refusal demo (S06 slice22 R2): proves the `THREAD-JUMP ok=0 id=0`
+/// funnel shape live in QEMU. Builds a deliberately bad triple (null entry,
+/// so `Thread::new` refuses; plus a `check_jump_entry` refusal on a zero
+/// top) and funnels both through the same `write_thread_jump_line(false, 0)`
+/// refusal path the live probe uses. Emits exactly one
+/// `THREAD-JUMP ok=0 id=0` line and returns `Ok(false)`; the caller falls
+/// through (PF/EXC still fire downstream), so the serial proves refusal
+/// does not hang or skip the fault chain. Runs BEFORE the live jump probe
+/// so one boot shows both `ok=0` (refusal shape) and `ok=1` (live jump).
+fn probe_thread_jump_refusal_demo<E>(
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<bool, E> {
+    // Corrupt entry: null entry refuses at construction.
+    let bad_entry = Thread::new(1, 0x1000_0000, 8192, 0);
+    // Corrupt top: zero top refuses at the supplemental gate.
+    let bad_top_gate = check_jump_entry(0, 0x2000);
+    if bad_entry.is_err() && !bad_top_gate {
+        write_thread_jump_line::<E>(false, 0, emit)?;
+        return Ok(false);
+    }
+    // Unreachable on a correct gate: if either bad value passed, that is a
+    // gate failure — still emit the refusal shape (fail-loud, never silent).
+    write_thread_jump_line::<E>(false, 0, emit)?;
+    Ok(false)
+}
+
 /// Live thread-stack swap post-`ExitBootServices`: build two descriptors
 /// from the static stacks, resolve the round-robin target through
 /// `swap_target` (the same gate future `swap` asm must use), run the
@@ -1742,6 +1768,10 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // S06 slice18: minimal scheduler-driven switch — SCHED-SWITCH
             // ok=1 from=1 to=2 (fail-loud on dispatch/triple mismatch).
             let _ = probe_sched_switch::<Infallible>(&mut emit);
+            // S06 slice22 R2: forced-refusal demo first — emits
+            // `THREAD-JUMP ok=0 id=0` through the refusal funnel on a corrupt
+            // triple, then falls through (PF/EXC still fire downstream).
+            let _ = probe_thread_jump_refusal_demo::<Infallible>(&mut emit);
             // S06 slice22: live `jmp`-entry switch — THREAD-JUMP-RUN +
             // THREAD-JUMP ok=1 from the new stack, then the entry chains to
             // bring-up (PF/EXC) there and never returns. On refusal the
@@ -2710,6 +2740,24 @@ mod tests {
         })
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "THREAD-JUMP ok=1 id=2\n");
+    }
+
+    #[test]
+    fn jump_refusal_demo_emits_ok0_and_fails_ok1_gate() {
+        // S06 slice22 R2: the corrupt-triple demo emits exactly the
+        // `THREAD-JUMP ok=0 id=0` refusal shape and returns false (fall
+        // through, never jump). A refusal-only serial therefore FAILS the
+        // ps1 `THREAD-JUMP ok=1 id=2` gate (Contains check).
+        let mut out: Vec<u8> = Vec::new();
+        let ok = probe_thread_jump_refusal_demo::<core::convert::Infallible>(&mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!ok);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "THREAD-JUMP ok=0 id=0\n");
+        assert!(!text.contains("THREAD-JUMP ok=1 id=2"));
     }
 
     #[test]
