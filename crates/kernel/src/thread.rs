@@ -1743,6 +1743,31 @@ mod tests {
     }
 
     #[test]
+    fn swap_target_three_thread_jump_chain_rotates() {
+        // S06 slice23: fuller multi-dispatch pin — three Ready threads must
+        // rotate 1->2->3->1 through the full live-jump contract (swap_target
+        // triple AND check_jump_entry gate AND entry_as_func gate, never
+        // gate-alone). The two-thread ping-pong stress proves stability;
+        // this proves the third-thread wrap leg the guest multi-dispatch
+        // needs next (slice-order RR, not lowest-id).
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
+        let b = Thread::new(2, 0x2000_0000, 8192, 0x2000).unwrap();
+        let c = Thread::new(3, 0x3000_0000, 8192, 0x3000).unwrap();
+        let table = [a, b, c];
+        let (id2, top2, entry2) = swap_target(&table, 1).unwrap();
+        assert_eq!((id2, top2, entry2), (2, 0x2000_0000 + 8192, 0x2000));
+        let (id3, top3, entry3) = swap_target(&table, 2).unwrap();
+        assert_eq!((id3, top3, entry3), (3, 0x3000_0000 + 8192, 0x3000));
+        let (id1, top1, entry1) = swap_target(&table, 3).unwrap();
+        assert_eq!((id1, top1, entry1), (1, 0x1000_0000 + 8192, 0x1000));
+        for (top, entry) in [(top2, entry2), (top3, entry3), (top1, entry1)] {
+            assert!(check_jump_entry(top, entry));
+            assert!(!jump_rsp_refuses(top));
+            assert!(entry_as_func(entry).is_some());
+        }
+    }
+
+    #[test]
     fn sentinel_values_are_single_sourced_and_distinct() {
         // S06 hardening (fragile literals): the five proof sentinels live
         // once at module scope — pin their exact values plus distinctness
