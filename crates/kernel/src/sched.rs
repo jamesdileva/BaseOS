@@ -53,6 +53,16 @@ use crate::thread::{validate_threads, SwitchError, Thread, ThreadState, MAX_THRE
 /// the S08 research harness once a timer source exists.
 pub const TRACE_CAP: usize = 8;
 
+/// S07 slice 5 — logical quantum length in timer ticks: each successful
+/// `dispatch` / `exit_current` resume arms `ticks_left = QUANTUM_TICKS`;
+/// each [`Scheduler::tick`] consumes one tick and reports expiry
+/// (`ticks_left == 0` means the quantum is spent and the caller should
+/// `dispatch` again). No real IRQ yet — the future PIT/APIC handler calls
+/// `tick_gated` under the `IrqGuard` gate, then `dispatch_gated` on expiry
+/// (same gated pick as the coop path). Small integer keeps the QEMU probe
+/// (4 ticks + 1 resched dispatch) one segment.
+pub const QUANTUM_TICKS: u64 = 4;
+
 /// Cooperative scheduler: owns up to `MAX_THREADS` descriptors plus the
 /// current-thread id. No `Cell`, no atomics — `&mut self` for mutation,
 /// `&self` for picks.
@@ -78,12 +88,19 @@ pub const TRACE_CAP: usize = 8;
 /// `exit_current` resume) appends the resumed id to `trace` while
 /// `trace_len < TRACE_CAP` (see [`Scheduler::trace_at`]). The serial
 /// `SCHED-TRACE` probe emits the first 3 entries (`t0=2 t1=3 t2=1`).
+///
+/// S07 slice 5 — quantum: `ticks_left` counts the remaining timer ticks in
+/// the current quantum (`QUANTUM_TICKS` after every successful dispatch /
+/// exit resume, `0` when idle or after the last exit parks `NULL`). The
+/// counter is global (one running thread at a time under coop yield); a
+/// future per-thread budget rides with priorities in a later slice.
 #[derive(Debug, Clone)]
 pub struct Scheduler {
     table: [Option<Thread>; MAX_THREADS],
     runs: [u64; MAX_THREADS],
     trace: [u64; TRACE_CAP],
     trace_len: usize,
+    ticks_left: u64,
     len: usize,
     current: u64,
 }
@@ -109,6 +126,7 @@ impl Scheduler {
             runs: [0; MAX_THREADS],
             trace: [0; TRACE_CAP],
             trace_len: 0,
+            ticks_left: 0,
             len: 0,
             current,
         }
@@ -223,6 +241,35 @@ impl Scheduler {
         }
     }
 
+    /// Remaining timer ticks in the current quantum (`QUANTUM_TICKS` right
+    /// after a successful `dispatch` / `exit_current` resume, `0` when idle
+    /// or after the last exit parks `NULL`). Read-only, never mutates.
+    #[must_use]
+    pub const fn quantum_left(&self) -> u64 {
+        self.ticks_left
+    }
+
+    /// Consume one timer tick; returns `true` when the quantum is spent
+    /// (`ticks_left == 0`, caller should `dispatch` again). Saturating
+    /// countdown (never wraps); idle (`ticks_left == 0`) reports expired
+    /// so an un-armed scheduler asks for a dispatch rather than spinning.
+    /// Never panics; refusals never reach here (no pick involved).
+    pub fn tick(&mut self) -> bool {
+        if self.ticks_left > 0 {
+            self.ticks_left -= 1;
+        }
+        self.ticks_left == 0
+    }
+
+    /// IRQ-gated tick (S07 slice 5 timer-quantum gate): identical countdown
+    /// to [`Scheduler::tick`], but the caller proves the `cli` critical
+    /// section with `&IrqGuard` — the future PIT/APIC handler calls this
+    /// under the gate, then [`Scheduler::dispatch_gated`] on expiry (same
+    /// serialized pick + state-mark the coop probe holds today).
+    pub fn tick_gated(&mut self, _gate: &IrqGuard) -> bool {
+        self.tick()
+    }
+
     /// Record one quantum while capacity remains (refusals never reach here;
     /// saturation keeps the prefix deterministic instead of wrapping).
     fn record_trace(&mut self, id: u64) {
@@ -307,7 +354,9 @@ impl Scheduler {
     /// picker's `Err` with no mutation. First-dispatch note: when the
     /// scheduler was built with `new(current)` the ex-current descriptor
     /// is still `Ready`, so nothing is parked on the first success (only
-    /// the picked next flips to `Running`).
+    /// the picked next flips to `Running`). On success arms a fresh
+    /// quantum (`ticks_left = QUANTUM_TICKS`); on refusal leaves the
+    /// counter untouched.
     pub fn dispatch(&mut self) -> Result<u64, SwitchError> {
         let next = self.pick_next()?;
         let mut i = 0;
@@ -327,6 +376,7 @@ impl Scheduler {
         }
         self.record_trace(next);
         self.current = next;
+        self.ticks_left = QUANTUM_TICKS;
         Ok(next)
     }
 
@@ -359,7 +409,10 @@ impl Scheduler {
     /// `cli`/atomic gate instead of the coop caller). Returns the resumed
     /// id. When nothing remains `Ready`, `current` parks on `NULL_THREAD`
     /// and returns the picker's `Err` (joiners observe `Done` via
-    /// [`Scheduler::join`]); the `Done` mark is kept either way.
+    /// [`Scheduler::join`]); the `Done` mark is kept either way. A resumed
+    /// thread arms a fresh quantum (`ticks_left = QUANTUM_TICKS`); parking
+    /// on `NULL` disarms it (`ticks_left = 0`); a refused exit (`Unknown`)
+    /// leaves the counter untouched.
     pub fn exit_current(&mut self) -> Result<u64, SwitchError> {
         let mut i = 0;
         let mut marked = false;
@@ -398,10 +451,12 @@ impl Scheduler {
                 }
                 self.record_trace(next);
                 self.current = next;
+                self.ticks_left = QUANTUM_TICKS;
                 Ok(next)
             }
             Err(e) => {
                 self.current = NULL_THREAD;
+                self.ticks_left = 0;
                 Err(e)
             }
         }
@@ -1183,6 +1238,85 @@ mod tests {
         assert_eq!(u.exit_current(), Err(SwitchError::Unknown));
         assert_eq!(u.trace_len(), 0);
         assert_eq!(u.trace_at(0), None);
+    }
+
+    #[test]
+    fn quantum_tick_counts_down_and_rearms_on_dispatch() {
+        // S07 slice 5: dispatch arms QUANTUM_TICKS; the first QUANTUM-1
+        // ticks report not-expired, the last reports expired; the next
+        // dispatch rearms. Idle ticks report expired (needs a dispatch).
+        assert_eq!(QUANTUM_TICKS, 4);
+        let mut idle = Scheduler::new(NULL_THREAD);
+        assert_eq!(idle.quantum_left(), 0);
+        assert!(idle.tick());
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert!(s.spawn(mk(3, 0x3000_0000)));
+        assert_eq!(s.quantum_left(), 0);
+        assert_eq!(s.dispatch(), Ok(2));
+        assert_eq!(s.quantum_left(), QUANTUM_TICKS);
+        assert!(!s.tick());
+        assert!(!s.tick());
+        assert!(!s.tick());
+        assert_eq!(s.quantum_left(), 1);
+        assert!(s.tick());
+        assert_eq!(s.quantum_left(), 0);
+        // Expired stays expired (saturating, never wraps).
+        assert!(s.tick());
+        assert_eq!(s.quantum_left(), 0);
+        // Resched dispatch rearms the next quantum.
+        assert_eq!(s.dispatch(), Ok(3));
+        assert_eq!(s.quantum_left(), QUANTUM_TICKS);
+        // Refused dispatch leaves the counter untouched (still armed).
+        let mut solo = Scheduler::new(1);
+        assert!(solo.spawn(mk(1, 0x1000_0000)));
+        assert!(solo.dispatch().is_err());
+        assert_eq!(solo.quantum_left(), 0);
+        // Exit resume rearms; final exit disarms to 0.
+        let mut e = Scheduler::new(1);
+        assert!(e.spawn(mk(1, 0x1000_0000)));
+        assert!(e.spawn(mk(2, 0x2000_0000)));
+        assert_eq!(e.dispatch(), Ok(2));
+        assert_eq!(e.quantum_left(), QUANTUM_TICKS);
+        assert_eq!(e.exit_current(), Ok(1));
+        assert_eq!(e.quantum_left(), QUANTUM_TICKS);
+        assert_eq!(e.exit_current(), Err(SwitchError::NotReady));
+        assert_eq!(e.quantum_left(), 0);
+        // Refused exit leaves the counter untouched.
+        let mut u = Scheduler::new(99);
+        assert!(u.spawn(mk(1, 0x1000_0000)));
+        assert_eq!(u.exit_current(), Err(SwitchError::Unknown));
+        assert_eq!(u.quantum_left(), 0);
+    }
+
+    #[test]
+    fn quantum_gated_tick_agrees_with_ungated() {
+        // S07 slice 5 gate parity: gated ticks match ungated tick-for-tick,
+        // and the timer-IRQ shape (gated ticks then gated dispatch on
+        // expiry, all under one guard) reschedules exactly like coop.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut g = Scheduler::new(1);
+        assert!(g.spawn(mk(1, 0x1000_0000)));
+        assert!(g.spawn(mk(2, 0x2000_0000)));
+        assert!(g.spawn(mk(3, 0x3000_0000)));
+        let mut u = Scheduler::new(1);
+        assert!(u.spawn(mk(1, 0x1000_0000)));
+        assert!(u.spawn(mk(2, 0x2000_0000)));
+        assert!(u.spawn(mk(3, 0x3000_0000)));
+        assert_eq!(g.dispatch_gated(&gate), Ok(2));
+        assert_eq!(u.dispatch(), Ok(2));
+        let mut n = 1u64;
+        while n < QUANTUM_TICKS {
+            assert_eq!(g.tick_gated(&gate), u.tick());
+            assert_eq!(g.quantum_left(), u.quantum_left());
+            n += 1;
+        }
+        assert!(g.tick_gated(&gate));
+        assert!(u.tick());
+        assert_eq!(g.dispatch_gated(&gate), Ok(3));
+        assert_eq!(u.dispatch(), Ok(3));
+        assert_eq!(g.quantum_left(), u.quantum_left());
     }
 
     #[test]

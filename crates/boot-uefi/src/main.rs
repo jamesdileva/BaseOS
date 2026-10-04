@@ -41,7 +41,7 @@ use baseos_kernel::page_table::{
     guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
     walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
 };
-use baseos_kernel::sched::Scheduler;
+use baseos_kernel::sched::{Scheduler, QUANTUM_TICKS};
 use baseos_kernel::thread::check_jump_entry;
 use baseos_kernel::thread::entry_as_func;
 use baseos_kernel::thread::jump_rsp_refuses;
@@ -1980,6 +1980,94 @@ fn probe_sched_trace_exit<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Resu
     Ok(ok)
 }
 
+/// Emit the `SCHED-TICK` quantum-tick line (S07 slice 5, logical quantum):
+/// `SCHED-TICK ok=<0|1> q=<n> used=<n> expired=<0|1> next=<id>` — one
+/// dispatch arms `q=QUANTUM_TICKS`, `used` gated ticks consume it,
+/// `expired=1` only when the last tick spent the quantum, and `next` is
+/// the resched dispatch target. `ok` is 1 only on
+/// `q=4 used=4 expired=1 next=3`; failure zeroes all fields so a short
+/// count or a missed resched cannot pass.
+fn write_sched_tick_line<E>(
+    ok: bool,
+    q: u64,
+    used: u64,
+    expired: bool,
+    next: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "SCHED-TICK ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " q=")?;
+    write_u64_dec(emit, q)?;
+    write_str(emit, " used=")?;
+    write_u64_dec(emit, used)?;
+    write_str(emit, " expired=")?;
+    write_u64_dec(emit, u64::from(expired))?;
+    write_str(emit, " next=")?;
+    write_u64_dec(emit, next)?;
+    write_str(emit, "\n")
+}
+
+/// Quantum-tick probe (S07 slice 5): drive a fresh `Scheduler` through
+/// dispatch 1->2 under one `IrqGuard`, consume exactly `QUANTUM_TICKS`
+/// gated ticks (first `q-1` must report not-expired, last must report
+/// expired), then `dispatch_gated` to 3 on expiry — the coop model of the
+/// future timer-IRQ shape (`tick_gated` under the gate, resched on
+/// expiry). Emits the line from the counter values (not the dispatch
+/// returns alone), so e2e proves the tick path live. Ps1 hard-requires
+/// `SCHED-TICK ok=1 q=4 used=4 expired=1 next=3`. Never panics.
+fn probe_sched_tick<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    let (a, b, c) = match (
+        Thread::new(1, 0x1000_0000, 8192, 0x3001),
+        Thread::new(2, 0x2000_0000, 8192, 0x3002),
+        Thread::new(3, 0x3000_0000, 8192, 0x3003),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => {
+            write_sched_tick_line::<E>(false, 0, 0, false, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let mut sched = Scheduler::new(1);
+    if !sched.spawn(a) || !sched.spawn(b) || !sched.spawn(c) {
+        write_sched_tick_line::<E>(false, 0, 0, false, 0, emit)?;
+        return Ok(false);
+    }
+    let gate = unsafe { IrqGuard::enter() };
+    if sched.dispatch_gated(&gate) != Ok(2) {
+        write_sched_tick_line::<E>(false, 0, 0, false, 0, emit)?;
+        return Ok(false);
+    }
+    if sched.quantum_left() != QUANTUM_TICKS {
+        write_sched_tick_line::<E>(false, 0, 0, false, 0, emit)?;
+        return Ok(false);
+    }
+    let mut used = 0u64;
+    while used < QUANTUM_TICKS {
+        let expired = sched.tick_gated(&gate);
+        used += 1;
+        let want_expired = used == QUANTUM_TICKS;
+        if expired != want_expired {
+            write_sched_tick_line::<E>(false, 0, 0, false, 0, emit)?;
+            return Ok(false);
+        }
+    }
+    let next = match sched.dispatch_gated(&gate) {
+        Ok(id) => id,
+        Err(_) => {
+            write_sched_tick_line::<E>(false, 0, 0, false, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let ok = QUANTUM_TICKS == 4 && used == 4 && next == 3 && sched.quantum_left() == QUANTUM_TICKS;
+    if ok {
+        write_sched_tick_line::<E>(true, QUANTUM_TICKS, used, true, next, emit)?;
+    } else {
+        write_sched_tick_line::<E>(false, 0, 0, false, 0, emit)?;
+    }
+    Ok(ok)
+}
+
 /// Resolve the `from` leg on the CARRIED cursor and `jmp` (S06 slice27b,
 /// guest-only): earlier legs already advanced the static cursor on the
 /// stacks below us, so there is NO replay loop — leg `from` resolves
@@ -2538,6 +2626,9 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // S07 slice 4: exit-path trace — SCHED-TRACE-X ok=1 n=2
             // t0=2 t1=3 (fail-loud when the exit resume is unrecorded).
             let _ = probe_sched_trace_exit::<Infallible>(&mut emit);
+            // S07 slice 5: logical quantum tick — SCHED-TICK ok=1 q=4
+            // used=4 expired=1 next=3 (fail-loud on short count/expiry).
+            let _ = probe_sched_tick::<Infallible>(&mut emit);
             // S06 slice26b: live 1->2->3->1 multi-hop `jmp` chain — hop 2
             // emits the legacy THREAD-JUMP-RUN + THREAD-JUMP ok=1 id=2
             // shapes (leg 1->2 IS the retired slice22 probe, same
@@ -3870,6 +3961,34 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "SCHED-TRACE-X ok=0 n=0 t0=0 t1=0\n"
+        );
+    }
+
+    #[test]
+    fn sched_tick_probe_shape() {
+        // S07 slice 5 quantum-tick shapes: the same `probe_sched_tick`
+        // the guest runs must emit exactly
+        // `SCHED-TICK ok=1 q=4 used=4 expired=1 next=3` and true.
+        let mut out: Vec<u8> = Vec::new();
+        let ok = probe_sched_tick::<core::convert::Infallible>(&mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert!(ok);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SCHED-TICK ok=1 q=4 used=4 expired=1 next=3\n"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        write_sched_tick_line::<core::convert::Infallible>(false, 0, 0, false, 0, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SCHED-TICK ok=0 q=0 used=0 expired=0 next=0\n"
         );
     }
 
