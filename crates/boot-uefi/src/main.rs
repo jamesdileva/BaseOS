@@ -1762,6 +1762,83 @@ fn probe_sched_stat<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<boo
     Ok(ok)
 }
 
+/// Emit the `SCHED-FAIR` fairness-sweep line (S07 slice 2, equal-quantum
+/// fairness): `SCHED-FAIR ok=<0|1> total=<n> r1=<n> r2=<n> r3=<n>
+/// spread=<n>` — per-thread dispatch counts after ten 1->2->3->1 rounds
+/// (30 equal quanta; each `dispatch` is one quantum until the timer slice).
+/// `ok` is 1 only when total=30 with 10/10/10 and spread=0; failure zeroes
+/// all counts so a short/skewed sweep cannot pass.
+fn write_sched_fair_line<E>(
+    ok: bool,
+    total: u64,
+    r1: u64,
+    r2: u64,
+    r3: u64,
+    spread: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "SCHED-FAIR ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " total=")?;
+    write_u64_dec(emit, total)?;
+    write_str(emit, " r1=")?;
+    write_u64_dec(emit, r1)?;
+    write_str(emit, " r2=")?;
+    write_u64_dec(emit, r2)?;
+    write_str(emit, " r3=")?;
+    write_u64_dec(emit, r3)?;
+    write_str(emit, " spread=")?;
+    write_u64_dec(emit, spread)?;
+    write_str(emit, "\n")
+}
+
+/// Fairness-sweep probe (S07 slice 2): drive a fresh `Scheduler` through
+/// ten 1->2->3->1 rounds (30 gated dispatches) and emit the `SCHED-FAIR`
+/// line. Same host/guest pure-logic shape as `probe_sched_stat`; ps1
+/// hard-requires `SCHED-FAIR ok=1 total=30 r1=10 r2=10 r3=10 spread=0`.
+/// A mid-sweep refusal fails loud (zeroed line). Never panics.
+fn probe_sched_fair<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    let (a, b, c) = match (
+        Thread::new(1, 0x1000_0000, 8192, 0x3001),
+        Thread::new(2, 0x2000_0000, 8192, 0x3002),
+        Thread::new(3, 0x3000_0000, 8192, 0x3003),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => {
+            write_sched_fair_line::<E>(false, 0, 0, 0, 0, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let mut sched = Scheduler::new(1);
+    if !sched.spawn(a) || !sched.spawn(b) || !sched.spawn(c) {
+        write_sched_fair_line::<E>(false, 0, 0, 0, 0, 0, emit)?;
+        return Ok(false);
+    }
+    let gate = unsafe { IrqGuard::enter() };
+    let mut n = 0;
+    while n < 30 {
+        if sched.dispatch_gated(&gate).is_err() {
+            write_sched_fair_line::<E>(false, 0, 0, 0, 0, 0, emit)?;
+            return Ok(false);
+        }
+        n += 1;
+    }
+    let (r1, r2, r3) = (
+        sched.runs_of(1).unwrap_or(0),
+        sched.runs_of(2).unwrap_or(0),
+        sched.runs_of(3).unwrap_or(0),
+    );
+    let total = sched.total_dispatches();
+    let spread = sched.fairness_spread();
+    let ok = total == 30 && r1 == 10 && r2 == 10 && r3 == 10 && spread == 0;
+    if ok {
+        write_sched_fair_line::<E>(true, total, r1, r2, r3, spread, emit)?;
+    } else {
+        write_sched_fair_line::<E>(false, 0, 0, 0, 0, 0, emit)?;
+    }
+    Ok(ok)
+}
+
 /// Resolve the `from` leg on the CARRIED cursor and `jmp` (S06 slice27b,
 /// guest-only): earlier legs already advanced the static cursor on the
 /// stacks below us, so there is NO replay loop — leg `from` resolves
@@ -2311,6 +2388,9 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // S07 slice 1: scheduler CPU accounting — SCHED-STAT ok=1
             // total=3 r1=1 r2=1 r3=1 (fail-loud on short round).
             let _ = probe_sched_stat::<Infallible>(&mut emit);
+            // S07 slice 2: equal-quantum fairness sweep — SCHED-FAIR ok=1
+            // total=30 r1=10 r2=10 r3=10 spread=0 (fail-loud on short/skew).
+            let _ = probe_sched_fair::<Infallible>(&mut emit);
             // S06 slice26b: live 1->2->3->1 multi-hop `jmp` chain — hop 2
             // emits the legacy THREAD-JUMP-RUN + THREAD-JUMP ok=1 id=2
             // shapes (leg 1->2 IS the retired slice22 probe, same
@@ -3559,6 +3639,34 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "SCHED-STAT ok=0 total=0 r1=0 r2=0 r3=0\n"
+        );
+    }
+
+    #[test]
+    fn sched_fair_probe_shape() {
+        // S07 slice 2 fairness-sweep shapes: the same `probe_sched_fair`
+        // the guest runs must emit exactly
+        // `SCHED-FAIR ok=1 total=30 r1=10 r2=10 r3=10 spread=0` and true.
+        let mut out: Vec<u8> = Vec::new();
+        let ok = probe_sched_fair::<core::convert::Infallible>(&mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert!(ok);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SCHED-FAIR ok=1 total=30 r1=10 r2=10 r3=10 spread=0\n"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        write_sched_fair_line::<core::convert::Infallible>(false, 0, 0, 0, 0, 0, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SCHED-FAIR ok=0 total=0 r1=0 r2=0 r3=0 spread=0\n"
         );
     }
 

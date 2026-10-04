@@ -53,6 +53,18 @@ use crate::thread::{validate_threads, SwitchError, Thread, ThreadState, MAX_THRE
 /// table slot (parallel to `table`), unit of fairness/throughput baseline.
 /// Saturating increments only on success (pick refusal mutates nothing);
 /// read-only `runs_of` / `total_dispatches` for host tests + guest line.
+///
+/// Slot-index invariant (REVIEW #431 F1): `runs[i]` belongs to the thread
+/// in `table[i]`; `spawn` appends at `len` and zeroes `runs[len]`, and no
+/// removal/compaction API exists, so slots never shift. If a future
+/// remove/compact API is added it MUST shift `runs` with `table` (or the
+/// counts misattribute); the sweep test below would go red on misalignment.
+///
+/// S07 slice 2 — fairness: each successful `dispatch` is one equal quantum
+/// (no timer/preempt yet — preempt IRQ rides with a future timer slice and
+/// reuses the same gated pick). Fairness over N rounds is `max - min` of
+/// `runs` (see [`Scheduler::fairness_spread`]): a balanced round-robin
+/// sweep holds spread <= 1.
 #[derive(Debug, Clone)]
 pub struct Scheduler {
     table: [Option<Thread>; MAX_THREADS],
@@ -147,6 +159,32 @@ impl Scheduler {
             i += 1;
         }
         total
+    }
+
+    /// Fairness spread over spawned slots: `max(runs) - min(runs)`.
+    /// `0` when empty (no threads) or when all counts tie; a balanced
+    /// round-robin sweep of whole rounds holds `<= 1` (each thread gets
+    /// one quantum per round). Read-only, never mutates. Saturating
+    /// subtraction (counts only grow via saturating adds, so `max >= min`
+    /// always holds; still saturating for fail-closed symmetry).
+    #[must_use]
+    pub fn fairness_spread(&self) -> u64 {
+        if self.len == 0 {
+            return 0;
+        }
+        let mut min = self.runs[0];
+        let mut max = self.runs[0];
+        let mut i = 1;
+        while i < self.len {
+            if self.runs[i] < min {
+                min = self.runs[i];
+            }
+            if self.runs[i] > max {
+                max = self.runs[i];
+            }
+            i += 1;
+        }
+        max.saturating_sub(min)
     }
 
     /// Live table as a packed array copy for the picker. Packed (no holes):
@@ -986,6 +1024,50 @@ mod tests {
         assert!(s.dispatch().is_err());
         assert_eq!(s.runs_of(1), Some(0));
         assert_eq!(s.total_dispatches(), 0);
+    }
+
+    #[test]
+    fn fairness_sweep_ten_rounds_spread_zero() {
+        // S07 slice 2: ten full 1->2->3->1 rounds (30 equal quanta) hold
+        // spread 0 with exactly 10 per thread; empty/singleton edges 0.
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert!(s.spawn(mk(3, 0x3000_0000)));
+        assert_eq!(s.fairness_spread(), 0);
+        let mut n = 0;
+        while n < 30 {
+            assert!(s.dispatch().is_ok());
+            n += 1;
+        }
+        assert_eq!(s.runs_of(1), Some(10));
+        assert_eq!(s.runs_of(2), Some(10));
+        assert_eq!(s.runs_of(3), Some(10));
+        assert_eq!(s.total_dispatches(), 30);
+        assert_eq!(s.fairness_spread(), 0);
+    }
+
+    #[test]
+    fn fairness_spread_partial_round_bounded_by_one_and_empty_zero() {
+        // Mid-round imbalance never exceeds one quantum; refusals and the
+        // empty table hold spread 0.
+        let e = Scheduler::new(NULL_THREAD);
+        assert_eq!(e.fairness_spread(), 0);
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert!(s.spawn(mk(3, 0x3000_0000)));
+        assert_eq!(s.dispatch(), Ok(2));
+        assert_eq!(s.fairness_spread(), 1);
+        assert_eq!(s.dispatch(), Ok(3));
+        assert_eq!(s.fairness_spread(), 1);
+        assert_eq!(s.dispatch(), Ok(1));
+        assert_eq!(s.fairness_spread(), 0);
+        // Refusal mutates nothing, spread unchanged (still 0 here).
+        let mut solo = Scheduler::new(1);
+        assert!(solo.spawn(mk(1, 0x1000_0000)));
+        assert!(solo.dispatch().is_err());
+        assert_eq!(solo.fairness_spread(), 0);
     }
 
     #[test]
