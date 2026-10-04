@@ -223,6 +223,15 @@ if ($serialText -and $serialText.Contains($marker)) {
   # the FAIL marker (no ok=0) and skips the live jump (no ok=1 either).
   $threadJumpRefusal = "THREAD-JUMP ok=0 id=0"
   $refusalFail = "THREAD-JUMP-REFUSAL-FAIL"
+  # S06 slice26b (multi-hop 1->2->3->1 live jmp chain): each live `jmp`
+  # landing prints its hop before resolving the next leg, so the serial
+  # must carry hop=2 then hop=3 then hop=1 IN ORDER plus the terminal
+  # `THREAD-JUMP-CHAIN ok=1 chain=1231` line. Order matters: a 1->3->2
+  # scramble must fail even though all three hop lines are present.
+  $chainHop2 = "THREAD-JUMP-CHAIN hop=2"
+  $chainHop3 = "THREAD-JUMP-CHAIN hop=3"
+  $chainHop1 = "THREAD-JUMP-CHAIN hop=1"
+  $chainOk = "THREAD-JUMP-CHAIN ok=1 chain=1231"
   $exc = "EXC ok=1 vector=0"
   # S04 #168n6 live-#PF (REVIEW #229 cheapest disconfirm): the guest touches
   # the unmapped PF_PROBE_ADDR guard, so the PF stub must emit
@@ -284,11 +293,19 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasThreadJumpRun = $serialText.Contains($threadJumpRun)
   $hasThreadJumpRefusal = $serialText.Contains($threadJumpRefusal)
   $noRefusalFail = -not $serialText.Contains($refusalFail)
+  $hasChainOk = $serialText.Contains($chainOk)
+  $chainOrderOk = $false
+  $ci2 = $serialText.IndexOf($chainHop2)
+  $ci3 = $serialText.IndexOf($chainHop3)
+  if ($ci2 -ge 0 -and $ci3 -gt $ci2) {
+    $ci1 = $serialText.IndexOf($chainHop1, $ci3)
+    $chainOrderOk = ($ci1 -gt $ci3) -and $hasChainOk
+  }
   $hasPf = [regex]::IsMatch($serialText, $pfPat)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasThreadJump -and $hasThreadJumpRun -and $hasThreadJumpRefusal -and $noRefusalFail -and $hasPf -and $hasExc) {
+  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasThreadJump -and $hasThreadJumpRun -and $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasPf -and $hasExc) {
     Write-Output ("Boot summary: FOUND (" + $bootinfo + " + " + $memmap + " + " + $notrunc + " + " + $mapsize + " + " + $descsize + " + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + PF ok=1 vector=14 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + PF ok=1 vector=14 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -316,6 +333,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "THREAD-JUMP-RUN id=2 present=$hasThreadJumpRun, " +
       "THREAD-JUMP ok=0 id=0 present=$hasThreadJumpRefusal, " +
       "no REFUSAL-FAIL present=$noRefusalFail, " +
+      "CHAIN hop=2/3/1 in-order + ok=1 chain=1231 present=$chainOrderOk, " +
       "PF ok=1 vector=14-shape present=$hasPf, " +
       "EXC ok=1 vector=0 present=$hasExc; " +
       "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/frame-alloc/#PF/#DE path failed " +

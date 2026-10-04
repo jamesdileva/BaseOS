@@ -44,7 +44,6 @@ use baseos_kernel::page_table::{
 use baseos_kernel::sched::Scheduler;
 use baseos_kernel::thread::check_jump_entry;
 use baseos_kernel::thread::entry_as_func;
-#[cfg(not(test))]
 use baseos_kernel::thread::jump_rsp_refuses;
 #[cfg(not(test))]
 use baseos_kernel::thread::jump_to_thread_stack;
@@ -57,7 +56,7 @@ use baseos_kernel::thread::{
     callee_saved_survives_via_slots, callee_saved_survives_with_save, rbp_preserved_via_slots,
     rbp_preserved_with_save,
 };
-use baseos_kernel::thread::{run_on_thread_stack, swap_target, Thread};
+use baseos_kernel::thread::{run_on_thread_stack, swap_target, Thread, ThreadState};
 use baseos_kernel::uart::{com1_write_byte, uart_init};
 use baseos_serial_marker::write_marker;
 #[cfg(not(test))]
@@ -855,20 +854,16 @@ unsafe fn probe_rmbz(info: &BootInfo) -> (bool, bool, usize, usize, usize) {
 
 /// S06 slice 7 live-RSP probe: three 8 KiB stacks, 16-byte aligned so
 /// `Thread::new` accepts them. Static (not stack) so the boot stack stays
-/// small; single-threaded boot owns them exclusively post-EBS. Slice26
-/// adds `THREAD_STACK_C` for the guest 1->2->3->1 multi-hop (live jmp
-/// multi-hop itself is the next slice; this slice pins the layout +
-/// host dispatch parity so the guest cannot smuggle an overlapping or
-/// misaligned third stack).
+/// small; single-threaded boot owns them exclusively post-EBS. Slice26b
+/// consumes `THREAD_STACK_C` as the third hop of the guest 1->2->3->1 live
+/// multi-hop `jmp` chain (layout + host dispatch parity were pinned in
+/// slice26a; this slice jumps it live).
 #[repr(align(16))]
 #[allow(dead_code)]
 struct AlignedStack([u8; 8192]);
 
 static mut THREAD_STACK_A: AlignedStack = AlignedStack([0; 8192]);
 static mut THREAD_STACK_B: AlignedStack = AlignedStack([0; 8192]);
-// Slice26a: live multi-hop consumes C next slice; allow dead_code on the
-// UEFI target until then (host tests already pin the layout + parity).
-#[allow(dead_code)]
 static mut THREAD_STACK_C: AlignedStack = AlignedStack([0; 8192]);
 
 /// Caller-owned two-way save slot (S06 slice 12): `run_on_thread_stack_
@@ -1382,20 +1377,246 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
     Ok(true)
 }
 
-/// Never-return jump entry (S06 slice22): runs ON the jumped-to stack (no
-/// return address was pushed — `jmp`, not `call`), so this function MUST
-/// NEVER `ret`. Emits the `THREAD-JUMP-RUN` proof line plus the
-/// `THREAD-JUMP ok=1` line from the new stack, then chains into
-/// `bring_up_cpu_and_prove_exception` (GDT/IDT + live `#PF` touch, which
-/// emits `PF ok=1` then chains `#DE` → `EXC ok=1`) — the boot never
-/// resumes on the old stack by construction (the caller `RSP` was already
-/// proven through the save-slot probes; loss is intended here).
+/// Live-state snapshot mirror (S06 slice26b): rebuild a `Thread` at the
+/// scheduler-observed lifecycle state, from a base (all-`Ready`)
+/// descriptor. Transitions from base are only `Ready`->`Running` or a
+/// same-state no-op, so the gate below always succeeds on a healthy
+/// replay; a mismatch fails closed (`None`) instead of feeding
+/// `swap_target` a divergent table (slice25 rule: static all-`Ready`
+/// would hide `Running`).
+fn chain_live_as(t: Thread, st: ThreadState) -> Option<Thread> {
+    let mut m = t;
+    if m.state() != st && (!m.set_state(st) || m.state() != st) {
+        return None;
+    }
+    Some(m)
+}
+
+/// Emit one `THREAD-JUMP-CHAIN hop=<n>` leg line (S06 slice26b): each live
+/// `jmp` landing prints its hop before resolving the next leg, so the
+/// serial proves the never-return order 2 then 3 then 1.
+fn write_chain_hop_line<E>(hop: u64, emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<(), E> {
+    write_str(emit, "THREAD-JUMP-CHAIN hop=")?;
+    write_u64_dec(emit, hop)?;
+    write_str(emit, "\n")
+}
+
+/// Emit the terminal `THREAD-JUMP-CHAIN` line (S06 slice26b):
+/// `THREAD-JUMP-CHAIN ok=1 chain=1231` only when all three legs resolved
+/// (dispatch + live triple + gate + entry) and the serial already carries
+/// hop=2, hop=3, hop=1 in order; any refusal emits
+/// `THREAD-JUMP-CHAIN ok=0 chain=0000` and never jumps.
+fn write_thread_jump_chain_line<E>(
+    ok: bool,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "THREAD-JUMP-CHAIN ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    if ok {
+        write_str(emit, " chain=1231\n")
+    } else {
+        write_str(emit, " chain=0000\n")
+    }
+}
+
+/// Resolve one chain leg through scheduler + live triple + gates (S06
+/// slice26b, shared by the guest hops and the host parity stub): the leg
+/// re-derives the same three descriptors the probe built (entries ARE the
+/// hop fn addresses, so the triple `entry` half is the function actually
+/// jumped to — no hardcoded transmute), requires `Scheduler::dispatch`
+/// pick == live `swap_target` triple == expected next AND
+/// `check_jump_entry` AND `!jump_rsp_refuses` AND the triple entry equals
+/// the expected hop address, and returns the `(top, func)` to jump with.
+/// Any refusal returns `None` with no register or stack touch.
+fn chain_leg(
+    sched: &mut Scheduler,
+    a0: Thread,
+    b0: Thread,
+    c0: Thread,
+    leg: u64,
+    want_entry: u64,
+) -> Option<(u64, extern "C" fn())> {
+    let expect = if leg == 3 { 1 } else { leg + 1 };
+    if sched.current() != leg {
+        return None;
+    }
+    if sched.pick_next() != Ok(expect) {
+        return None;
+    }
+    let (st1, st2, st3) = match (sched.state_of(1), sched.state_of(2), sched.state_of(3)) {
+        (Some(x), Some(y), Some(z)) => (x, y, z),
+        _ => return None,
+    };
+    let live = match (
+        chain_live_as(a0, st1),
+        chain_live_as(b0, st2),
+        chain_live_as(c0, st3),
+    ) {
+        (Some(a), Some(b), Some(c)) => [a, b, c],
+        _ => return None,
+    };
+    let (id, top, entry) = swap_target(&live, sched.current()).ok()?;
+    if id != expect || entry != want_entry {
+        return None;
+    }
+    if !check_jump_entry(top, entry) || jump_rsp_refuses(top) {
+        return None;
+    }
+    let func = entry_as_func(entry)?;
+    if sched.dispatch() != Ok(expect) {
+        return None;
+    }
+    Some((top, func))
+}
+
+/// Resolve chain legs 1..=`from` and `jmp` on the `from` leg (S06 slice26b,
+/// guest-only): legs before `from` re-verify (their jumps already happened
+/// on the stacks below us — targets dropped, dispatch agreement kept),
+/// the `from` leg jumps and never returns. Any refusal returns `false`
+/// with no register or stack touch.
+///
+/// # Safety
+/// Post-EBS only, same contract as [`probe_thread_swap`]: owns the static
+/// stacks, `cli` in effect, COM1 exclusive.
 #[cfg(not(test))]
-extern "C" fn thread_jump_entry() -> ! {
+unsafe fn chain_resolve_and_jump(from: u64) -> bool {
+    let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
+    let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
+    let base_c = core::ptr::addr_of!(THREAD_STACK_C) as u64;
+    let hop1 = thread_jump_chain_hop1 as *const () as u64;
+    let hop2 = thread_jump_chain_hop2 as *const () as u64;
+    let hop3 = thread_jump_chain_hop3 as *const () as u64;
+    let (a0, b0, c0) = match (
+        Thread::new(1, base_a, 8192, hop1),
+        Thread::new(2, base_b, 8192, hop2),
+        Thread::new(3, base_c, 8192, hop3),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => return false,
+    };
+    let mut sched = Scheduler::new(1);
+    if !sched.spawn(a0) || !sched.spawn(b0) || !sched.spawn(c0) {
+        return false;
+    }
+    let want = |leg: u64| {
+        if leg == 3 {
+            hop1
+        } else if leg == 2 {
+            hop3
+        } else {
+            hop2
+        }
+    };
+    let mut leg = 1u64;
+    while leg < from {
+        // Replay only: the jump for this leg already happened below us.
+        if chain_leg(&mut sched, a0, b0, c0, leg, want(leg)).is_none() {
+            return false;
+        }
+        leg += 1;
+    }
+    match chain_leg(&mut sched, a0, b0, c0, from, want(from)) {
+        Some((top, func)) => jump_to_thread_stack(top, func),
+        None => false,
+    }
+}
+
+/// Re-verify the full 1->2->3->1 chain without jumping (S06 slice26b,
+/// guest-only): the final hop runs this to prove the re-derived scheduler
+/// landed back on 1 with every leg's dispatch + live triple + gate
+/// agreeing, then emits the terminal ok=1 line and chains to bring-up.
+///
+/// # Safety
+/// Same contract as [`chain_resolve_and_jump`].
+#[cfg(not(test))]
+unsafe fn chain_verify_full() -> bool {
+    let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
+    let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
+    let base_c = core::ptr::addr_of!(THREAD_STACK_C) as u64;
+    let hop1 = thread_jump_chain_hop1 as *const () as u64;
+    let hop2 = thread_jump_chain_hop2 as *const () as u64;
+    let hop3 = thread_jump_chain_hop3 as *const () as u64;
+    let (a0, b0, c0) = match (
+        Thread::new(1, base_a, 8192, hop1),
+        Thread::new(2, base_b, 8192, hop2),
+        Thread::new(3, base_c, 8192, hop3),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => return false,
+    };
+    let mut sched = Scheduler::new(1);
+    if !sched.spawn(a0) || !sched.spawn(b0) || !sched.spawn(c0) {
+        return false;
+    }
+    let want = |leg: u64| {
+        if leg == 3 {
+            hop1
+        } else if leg == 2 {
+            hop3
+        } else {
+            hop2
+        }
+    };
+    let mut leg = 1u64;
+    while leg <= 3 {
+        if chain_leg(&mut sched, a0, b0, c0, leg, want(leg)).is_none() {
+            return false;
+        }
+        leg += 1;
+    }
+    sched.current() == 1
+}
+
+/// Chain hop 2 (S06 slice26b): runs ON thread-B's stack (no return address
+/// was pushed — `jmp`, not `call`), so this function MUST NEVER `ret`.
+/// Emits the legacy single-hop shapes (`THREAD-JUMP-RUN id=2` +
+/// `THREAD-JUMP ok=1 id=2`: leg 1->2 IS the retired slice22 probe, same
+/// triple+gate, so its serial evidence is preserved) plus the chain
+/// `hop=2` line, then resolves leg 2->3 and jumps to hop 3. On refusal
+/// emits `CHAIN ok=0` and chains to bring-up from here (PF/EXC still fire
+/// — e2e fails on the missing ok=1, never on a silent hang).
+#[cfg(not(test))]
+extern "C" fn thread_jump_chain_hop2() -> ! {
     let mut emit = com1_emit;
     let _ = write_str(&mut emit, "THREAD-JUMP-RUN id=2\n");
     let _ = write_thread_jump_line::<core::convert::Infallible>(true, 2, &mut emit);
+    let _ = write_chain_hop_line::<core::convert::Infallible>(2, &mut emit);
     unsafe {
+        let _ = chain_resolve_and_jump(2);
+        let _ = write_thread_jump_chain_line::<core::convert::Infallible>(false, &mut emit);
+        baseos_kernel::bring_up_cpu_and_prove_exception();
+    }
+}
+
+/// Chain hop 3 (S06 slice26b): runs ON thread-C's stack, MUST NEVER `ret`.
+/// Emits `hop=3`, resolves leg 3->1, jumps to hop 1; refusal funnels to
+/// bring-up like hop 2.
+#[cfg(not(test))]
+extern "C" fn thread_jump_chain_hop3() -> ! {
+    let mut emit = com1_emit;
+    let _ = write_chain_hop_line::<core::convert::Infallible>(3, &mut emit);
+    unsafe {
+        let _ = chain_resolve_and_jump(3);
+        let _ = write_thread_jump_chain_line::<core::convert::Infallible>(false, &mut emit);
+        baseos_kernel::bring_up_cpu_and_prove_exception();
+    }
+}
+
+/// Chain hop 1, terminal (S06 slice26b): runs back ON the boot-stack
+/// region's thread-A descriptor (`THREAD_STACK_A`), MUST NEVER `ret`.
+/// Emits `hop=1`, re-verifies the full chain deterministically (every leg
+/// re-derived, scheduler back on 1), emits the terminal
+/// `THREAD-JUMP-CHAIN ok=1 chain=1231` line, then chains into
+/// `bring_up_cpu_and_prove_exception` (GDT/IDT + live `#PF` touch, which
+/// emits `PF ok=1` then chains `#DE` → `EXC ok=1`) — the boot never
+/// resumes on any earlier stack by construction.
+#[cfg(not(test))]
+extern "C" fn thread_jump_chain_hop1() -> ! {
+    let mut emit = com1_emit;
+    let _ = write_chain_hop_line::<core::convert::Infallible>(1, &mut emit);
+    unsafe {
+        let ok = chain_verify_full();
+        let _ = write_thread_jump_chain_line::<core::convert::Infallible>(ok, &mut emit);
         baseos_kernel::bring_up_cpu_and_prove_exception();
     }
 }
@@ -1421,81 +1642,65 @@ fn write_thread_jump_line<E>(
     write_str(emit, "\n")
 }
 
-/// Live `jmp`-entry probe (S06 slice22): build the same two descriptors
-/// the `THREAD` probe uses (B entry IS `thread_jump_entry`), resolve the
-/// `swap_target` triple for A->B, AND the supplemental
-/// [`check_jump_entry`] gate on the same `(top, entry)` BEFORE loading
-/// `RSP` (never gate-alone — the top-only gate passes lethal stacks the
-/// triple refuses, pinned host-side). On any refusal emit
-/// `THREAD-JUMP ok=0 id=0` and return `Ok(false)` (caller falls through
-/// to the legacy bring-up — failure evidence, never silent). On success
-/// `jmp` to the entry and never return (the entry chains to bring-up
-/// from the new stack).
+/// Live 1->2->3->1 multi-hop `jmp`-entry probe (S06 slice26b): build the
+/// three descriptors from the static stacks (entries ARE the hop fn
+/// addresses), resolve leg 1->2 through [`chain_leg`] (dispatch + live
+/// triple + gate + entry, never gate-alone) and `jmp` to hop 2 — the hops
+/// continue the chain (2->3, 3->1) and hop 1 terminals with ok=1 plus the
+/// bring-up chain. Success never returns. On any refusal emit
+/// `THREAD-JUMP-CHAIN ok=0 chain=0000` and return `Ok(false)` (caller falls
+/// through to the legacy bring-up — failure evidence, never silent).
 ///
 /// # Safety
 /// Post-EBS only, same contract as [`probe_thread_swap`]: owns the static
 /// stacks, `cli` in effect, COM1 exclusive.
 ///
-/// Host `cargo test` builds cover the triple+gate parity shape only (no
-/// live `RSP` swap — same pattern as `probe_sched_switch`).
+/// Host `cargo test` builds cover the 3-leg parity shape only (no live
+/// `RSP` swap — same pattern as `probe_sched_switch`).
 #[cfg(not(test))]
-unsafe fn probe_thread_jump<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
-    let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
-    let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
-    let entry_b = thread_jump_entry as *const () as u64;
-    let (a, b) = match (
-        Thread::new(1, base_a, 8192, 0x1000),
-        Thread::new(2, base_b, 8192, entry_b),
-    ) {
-        (Ok(a), Ok(b)) => (a, b),
-        _ => {
-            write_thread_jump_line::<E>(false, 0, emit)?;
-            return Ok(false);
-        }
-    };
-    let (id, top, entry) = match swap_target(&[a, b], 1) {
-        Ok(t) => t,
-        Err(_) => {
-            write_thread_jump_line::<E>(false, 0, emit)?;
-            return Ok(false);
-        }
-    };
-    // Triple AND shared `RSP`-refusal predicate (S06 hardening): the
-    // `jump_rsp_refuses` conjunct is redundant with `check_jump_entry`'s
-    // top half by construction, wiring the host-pinned park decision into
-    // the live path so a future gate edit cannot silently drop it.
-    if id != 2 || !check_jump_entry(top, entry) || jump_rsp_refuses(top) {
-        write_thread_jump_line::<E>(false, 0, emit)?;
-        return Ok(false);
-    }
-    let func = match entry_as_func(entry) {
-        Some(f) => f,
-        None => {
-            write_thread_jump_line::<E>(false, 0, emit)?;
-            return Ok(false);
-        }
-    };
-    jump_to_thread_stack(top, func);
+unsafe fn probe_thread_jump_chain<E>(
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<bool, E> {
+    // Success jumps to hop 2 and never returns; reaching the line below
+    // means the leg-1 resolve refused.
+    let _ = chain_resolve_and_jump(1);
+    write_thread_jump_chain_line::<E>(false, emit)?;
+    Ok(false)
 }
 
 #[cfg(test)]
-unsafe fn probe_thread_jump<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
-    // Host covers the triple+gate parity shape (no live RSP swap).
-    let a = Thread::new(1, 0x1000_0000, 8192, 0x1000).unwrap();
-    let jump_addr = 0x2000u64;
-    let b = Thread::new(2, 0x2000_0000, 8192, jump_addr).unwrap();
-    let (id, top, entry) = match swap_target(&[a, b], 1) {
-        Ok(t) => t,
-        Err(_) => {
-            write_thread_jump_line::<E>(false, 0, emit)?;
-            return Ok(false);
-        }
-    };
-    if id != 2 || !check_jump_entry(top, entry) {
-        write_thread_jump_line::<E>(false, 0, emit)?;
+unsafe fn probe_thread_jump_chain<E>(
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<bool, E> {
+    // Host covers the 3-leg dispatch + live-triple + gate parity shape
+    // (no live RSP swap): the same descriptors the guest builds must
+    // resolve through `chain_leg` on every leg 1->2->3->1.
+    let a = Thread::new(1, 0x1000_0000, 8192, 0x3001).unwrap();
+    let b = Thread::new(2, 0x2000_0000, 8192, 0x3002).unwrap();
+    let c = Thread::new(3, 0x3000_0000, 8192, 0x3003).unwrap();
+    let mut sched = Scheduler::new(1);
+    if !sched.spawn(a) || !sched.spawn(b) || !sched.spawn(c) {
+        write_thread_jump_chain_line::<E>(false, emit)?;
         return Ok(false);
     }
-    write_thread_jump_line::<E>(true, id, emit)?;
+    let mut leg = 1u64;
+    while leg <= 3 {
+        let expect = if leg == 3 { 1 } else { leg + 1 };
+        let want = if leg == 3 {
+            0x3001
+        } else if leg == 2 {
+            0x3003
+        } else {
+            0x3002
+        };
+        if chain_leg(&mut sched, a, b, c, leg, want).is_none() {
+            write_thread_jump_chain_line::<E>(false, emit)?;
+            return Ok(false);
+        }
+        write_chain_hop_line::<E>(expect, emit)?;
+        leg += 1;
+    }
+    write_thread_jump_chain_line::<E>(true, emit)?;
     Ok(true)
 }
 
@@ -1861,13 +2066,16 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // on a silent same-shape pass.
             let demo_gate_failed =
                 probe_thread_jump_refusal_demo::<Infallible>(&mut emit).unwrap_or(true);
-            // S06 slice22: live `jmp`-entry switch — THREAD-JUMP-RUN +
-            // THREAD-JUMP ok=1 from the new stack, then the entry chains to
-            // bring-up (PF/EXC) there and never returns. On refusal the
-            // probe emits THREAD-JUMP ok=0 and returns, falling through to
-            // the legacy bring-up (failure evidence, never silent).
+            // S06 slice26b: live 1->2->3->1 multi-hop `jmp` chain — hop 2
+            // emits the legacy THREAD-JUMP-RUN + THREAD-JUMP ok=1 id=2
+            // shapes (leg 1->2 IS the retired slice22 probe, same
+            // triple+gate), then hop=2/3/1 + CHAIN ok=1 chain=1231, then
+            // hop 1 chains to bring-up (PF/EXC) there and never returns.
+            // On refusal the probe emits CHAIN ok=0 chain=0000 and
+            // returns, falling through to the legacy bring-up (failure
+            // evidence, never silent).
             if !demo_gate_failed {
-                let _ = probe_thread_jump::<Infallible>(&mut emit);
+                let _ = probe_thread_jump_chain::<Infallible>(&mut emit);
             }
             baseos_kernel::bring_up_cpu_and_prove_exception();
         }
@@ -2860,14 +3068,15 @@ mod tests {
     }
 
     #[test]
-    fn jump_probe_parity_host() {
-        // S06 slice22 guest/host parity: the jmp-entry probe must resolve
-        // the `swap_target` triple AND the supplemental `check_jump_entry`
-        // gate on the same pair and emit `THREAD-JUMP ok=1 id=2` on the
-        // host too (live RSP jmp is e2e-only; QEMU proves the live path).
+    fn jump_chain_parity_host() {
+        // S06 slice26b guest/host parity: the 1->2->3->1 chain probe must
+        // resolve dispatch + live triple + gate on every leg and emit
+        // hop=2, hop=3, hop=1 in order plus
+        // `THREAD-JUMP-CHAIN ok=1 chain=1231` (live RSP jmp is e2e-only;
+        // QEMU proves the live path).
         let mut out: Vec<u8> = Vec::new();
         let ok = unsafe {
-            probe_thread_jump::<core::convert::Infallible>(&mut |b| {
+            probe_thread_jump_chain::<core::convert::Infallible>(&mut |b| {
                 out.push(b);
                 Ok(())
             })
@@ -2875,7 +3084,46 @@ mod tests {
         .unwrap();
         assert!(ok);
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("THREAD-JUMP ok=1 id=2"));
+        assert!(text.contains("THREAD-JUMP-CHAIN hop=2"));
+        assert!(text.contains("THREAD-JUMP-CHAIN hop=3"));
+        assert!(text.contains("THREAD-JUMP-CHAIN hop=1"));
+        assert!(text.contains("THREAD-JUMP-CHAIN ok=1 chain=1231"));
+        // Order pin: the never-return chain lands 2 then 3 then 1.
+        let p2 = text.find("hop=2").unwrap();
+        let p3 = text.find("hop=3").unwrap();
+        let p1 = text.find("hop=1").unwrap();
+        assert!(p2 < p3 && p3 < p1);
+    }
+
+    #[test]
+    fn jump_chain_line_shapes() {
+        // S06 slice26b serial shapes the ps1 gates on: hop legs plus the
+        // terminal ok=1 chain=1231 / refusal ok=0 chain=0000 pair.
+        let mut out: Vec<u8> = Vec::new();
+        write_chain_hop_line::<core::convert::Infallible>(3, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "THREAD-JUMP-CHAIN hop=3\n");
+        let mut out: Vec<u8> = Vec::new();
+        write_thread_jump_chain_line::<core::convert::Infallible>(true, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "THREAD-JUMP-CHAIN ok=1 chain=1231\n");
+        assert!(text.contains("THREAD-JUMP-CHAIN ok=1 chain=1231"));
+        let mut out: Vec<u8> = Vec::new();
+        write_thread_jump_chain_line::<core::convert::Infallible>(false, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "THREAD-JUMP-CHAIN ok=0 chain=0000\n");
+        assert!(!text.contains("chain=1231"));
     }
 
     #[test]
