@@ -1634,6 +1634,32 @@ fn write_sched_join_line<E>(
     write_str(emit, "\n")
 }
 
+/// Emit the `SCHED-STAT` accounting line (S07 slice 1, first measurable
+/// scheduler): `SCHED-STAT ok=<0|1> total=<n> r1=<n> r2=<n> r3=<n>` —
+/// per-thread dispatch counts after a 1->2->3->1 round. `ok` is 1 only
+/// when the round completes with total 3 and each count 1 (fairness
+/// baseline); failure zeroes all counts so a short round cannot pass.
+fn write_sched_stat_line<E>(
+    ok: bool,
+    total: u64,
+    r1: u64,
+    r2: u64,
+    r3: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "SCHED-STAT ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " total=")?;
+    write_u64_dec(emit, total)?;
+    write_str(emit, " r1=")?;
+    write_u64_dec(emit, r1)?;
+    write_str(emit, " r2=")?;
+    write_u64_dec(emit, r2)?;
+    write_str(emit, " r3=")?;
+    write_u64_dec(emit, r3)?;
+    write_str(emit, "\n")
+}
+
 /// Live join/exit probe (S06 slice27b, closes REVIEW #421 gap 1): drive a
 /// real `Scheduler` through dispatch 1->2, `exit_current` (2 `Done`,
 /// resume 3), and `join` observation — the exact primitives the chain
@@ -1689,6 +1715,51 @@ fn probe_sched_join_exit<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Resul
     }
     write_sched_join_line::<E>(true, 2, emit)?;
     Ok(true)
+}
+
+/// Accounting probe (S07 slice 1): drive a fresh `Scheduler` through one
+/// 1->2->3->1 round under the IRQ gate and emit the `SCHED-STAT` line.
+/// Pure scheduler logic (no `RSP` swap), same host/guest shape as the
+/// join/exit probe; ps1 hard-requires `SCHED-STAT ok=1 total=3 r1=1 r2=1
+/// r3=1`. Never panics.
+fn probe_sched_stat<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    let (a, b, c) = match (
+        Thread::new(1, 0x1000_0000, 8192, 0x3001),
+        Thread::new(2, 0x2000_0000, 8192, 0x3002),
+        Thread::new(3, 0x3000_0000, 8192, 0x3003),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => {
+            write_sched_stat_line::<E>(false, 0, 0, 0, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let mut sched = Scheduler::new(1);
+    if !sched.spawn(a) || !sched.spawn(b) || !sched.spawn(c) {
+        write_sched_stat_line::<E>(false, 0, 0, 0, 0, emit)?;
+        return Ok(false);
+    }
+    let gate = unsafe { IrqGuard::enter() };
+    if sched.dispatch_gated(&gate) != Ok(2)
+        || sched.dispatch_gated(&gate) != Ok(3)
+        || sched.dispatch_gated(&gate) != Ok(1)
+    {
+        write_sched_stat_line::<E>(false, 0, 0, 0, 0, emit)?;
+        return Ok(false);
+    }
+    let (r1, r2, r3) = (
+        sched.runs_of(1).unwrap_or(0),
+        sched.runs_of(2).unwrap_or(0),
+        sched.runs_of(3).unwrap_or(0),
+    );
+    let total = sched.total_dispatches();
+    let ok = total == 3 && r1 == 1 && r2 == 1 && r3 == 1;
+    if ok {
+        write_sched_stat_line::<E>(true, total, r1, r2, r3, emit)?;
+    } else {
+        write_sched_stat_line::<E>(false, 0, 0, 0, 0, emit)?;
+    }
+    Ok(ok)
 }
 
 /// Resolve the `from` leg on the CARRIED cursor and `jmp` (S06 slice27b,
@@ -2237,6 +2308,9 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // exited=2 resumed=3 + SCHED-JOIN ok=1 joined=2 (live join/
             // exit_current primitives; host pins the same shapes).
             let _ = probe_sched_join_exit::<Infallible>(&mut emit);
+            // S07 slice 1: scheduler CPU accounting — SCHED-STAT ok=1
+            // total=3 r1=1 r2=1 r3=1 (fail-loud on short round).
+            let _ = probe_sched_stat::<Infallible>(&mut emit);
             // S06 slice26b: live 1->2->3->1 multi-hop `jmp` chain — hop 2
             // emits the legacy THREAD-JUMP-RUN + THREAD-JUMP ok=1 id=2
             // shapes (leg 1->2 IS the retired slice22 probe, same
@@ -3457,6 +3531,34 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "CHAIN-CURSOR ok=0 legs=1\n"
+        );
+    }
+
+    #[test]
+    fn sched_stat_probe_shape() {
+        // S07 slice 1 accounting shapes: the same `probe_sched_stat` the
+        // guest runs must emit exactly
+        // `SCHED-STAT ok=1 total=3 r1=1 r2=1 r3=1` and return true.
+        let mut out: Vec<u8> = Vec::new();
+        let ok = probe_sched_stat::<core::convert::Infallible>(&mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert!(ok);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SCHED-STAT ok=1 total=3 r1=1 r2=1 r3=1\n"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        write_sched_stat_line::<core::convert::Infallible>(false, 0, 0, 0, 0, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SCHED-STAT ok=0 total=0 r1=0 r2=0 r3=0\n"
         );
     }
 

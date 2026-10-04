@@ -48,9 +48,15 @@ use crate::thread::{validate_threads, SwitchError, Thread, ThreadState, MAX_THRE
 /// Cooperative scheduler: owns up to `MAX_THREADS` descriptors plus the
 /// current-thread id. No `Cell`, no atomics — `&mut self` for mutation,
 /// `&self` for picks.
+///
+/// S07 slice 1 — CPU accounting: `runs` counts successful dispatches per
+/// table slot (parallel to `table`), unit of fairness/throughput baseline.
+/// Saturating increments only on success (pick refusal mutates nothing);
+/// read-only `runs_of` / `total_dispatches` for host tests + guest line.
 #[derive(Debug, Clone)]
 pub struct Scheduler {
     table: [Option<Thread>; MAX_THREADS],
+    runs: [u64; MAX_THREADS],
     len: usize,
     current: u64,
 }
@@ -73,6 +79,7 @@ impl Scheduler {
     pub const fn new(current: u64) -> Self {
         Self {
             table: [None; MAX_THREADS],
+            runs: [0; MAX_THREADS],
             len: 0,
             current,
         }
@@ -112,6 +119,34 @@ impl Scheduler {
             i += 1;
         }
         None
+    }
+
+    /// Dispatch count of one spawned thread (`None` when unknown id).
+    /// Read-only accounting query for S07 fairness/throughput baseline.
+    #[must_use]
+    pub fn runs_of(&self, id: u64) -> Option<u64> {
+        let mut i = 0;
+        while i < self.len {
+            if let Some(t) = self.table[i] {
+                if t.id() == id {
+                    return Some(self.runs[i]);
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Total successful dispatches (saturating sum over spawned slots).
+    #[must_use]
+    pub fn total_dispatches(&self) -> u64 {
+        let mut total = 0u64;
+        let mut i = 0;
+        while i < self.len {
+            total = total.saturating_add(self.runs[i]);
+            i += 1;
+        }
+        total
     }
 
     /// Live table as a packed array copy for the picker. Packed (no holes):
@@ -163,6 +198,7 @@ impl Scheduler {
             i += 1;
         }
         self.table[self.len] = Some(thread);
+        self.runs[self.len] = 0;
         let packed = self.packed();
         if validate_threads(&packed[..self.len + 1]).is_err() {
             self.table[self.len] = None;
@@ -199,6 +235,7 @@ impl Scheduler {
                         return Err(SwitchError::NotReady);
                     }
                     let _ = t.set_state(ThreadState::Running);
+                    self.runs[i] = self.runs[i].saturating_add(1);
                 } else if t.id() == self.current && t.state() == ThreadState::Running {
                     let _ = t.set_state(ThreadState::Ready);
                 }
@@ -270,6 +307,7 @@ impl Scheduler {
                     if let Some(ref mut t) = self.table[j] {
                         if t.id() == next && t.state() == ThreadState::Ready {
                             let _ = t.set_state(ThreadState::Running);
+                            self.runs[j] = self.runs[j].saturating_add(1);
                         }
                     }
                     j += 1;
@@ -914,6 +952,40 @@ mod tests {
         assert!(glued.contains("Cell<"));
         let glued_br = strip_code("foobarbr#\"fake\" Cell<");
         assert!(glued_br.contains("Cell<"));
+    }
+
+    #[test]
+    fn accounting_counts_dispatch_and_exit() {
+        // S07 slice 1: per-thread runs count successful dispatches only.
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert!(s.spawn(mk(3, 0x3000_0000)));
+        assert_eq!(s.runs_of(1), Some(0));
+        assert_eq!(s.total_dispatches(), 0);
+        assert_eq!(s.dispatch(), Ok(2));
+        assert_eq!(s.runs_of(2), Some(1));
+        assert_eq!(s.dispatch(), Ok(3));
+        assert_eq!(s.runs_of(3), Some(1));
+        assert_eq!(s.dispatch(), Ok(1));
+        assert_eq!(s.runs_of(1), Some(1));
+        assert_eq!(s.total_dispatches(), 3);
+        // Exit path resumes 2 and counts it as well.
+        assert_eq!(s.exit_current(), Ok(2));
+        assert_eq!(s.runs_of(2), Some(2));
+        assert_eq!(s.total_dispatches(), 4);
+    }
+
+    #[test]
+    fn accounting_unknown_is_none_and_refusal_counts_nothing() {
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert_eq!(s.runs_of(9), None);
+        assert_eq!(s.total_dispatches(), 0);
+        // Single-thread table: pick refuses (NoSwitch), no count.
+        assert!(s.dispatch().is_err());
+        assert_eq!(s.runs_of(1), Some(0));
+        assert_eq!(s.total_dispatches(), 0);
     }
 
     #[test]
