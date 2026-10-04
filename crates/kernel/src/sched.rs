@@ -202,6 +202,63 @@ impl Scheduler {
         self.current = next;
         Ok(next)
     }
+
+    /// Mark `id` observed-finished (S06 slice27 join): read-only query,
+    /// `true` iff the spawned thread is `Done`. The guest joiner spins or
+    /// parks on this; the exiting thread reaches `Done` via
+    /// [`Scheduler::exit_current`]. Unknown ids report `false` (never a
+    /// phantom join — `state_of` is `None`, not `Done`).
+    #[must_use]
+    pub fn join(&self, id: u64) -> bool {
+        self.state_of(id) == Some(ThreadState::Done)
+    }
+
+    /// Exit the current thread (S06 slice27 join/preempt primitive): move
+    /// `current` to `Done` (Running→Done, or Ready→Done when the boot
+    /// thread exits before its first park), then pick the next `Ready`
+    /// thread round-robin and move it Ready→Running (the preempt/yield
+    /// resume point — a future timer IRQ calls this same pick under a
+    /// `cli`/atomic gate instead of the coop caller). Returns the resumed
+    /// id. When nothing remains `Ready`, `current` parks on `NULL_THREAD`
+    /// and returns the picker's `Err` (joiners observe `Done` via
+    /// [`Scheduler::join`]); the `Done` mark is kept either way.
+    pub fn exit_current(&mut self) -> Result<u64, SwitchError> {
+        let mut i = 0;
+        let mut marked = false;
+        while i < self.len {
+            if let Some(ref mut t) = self.table[i] {
+                if t.id() == self.current
+                    && (t.state() == ThreadState::Running || t.state() == ThreadState::Ready)
+                {
+                    let _ = t.set_state(ThreadState::Done);
+                    marked = true;
+                }
+            }
+            i += 1;
+        }
+        if !marked {
+            return Err(SwitchError::Unknown);
+        }
+        match self.pick_next() {
+            Ok(next) => {
+                let mut j = 0;
+                while j < self.len {
+                    if let Some(ref mut t) = self.table[j] {
+                        if t.id() == next && t.state() == ThreadState::Ready {
+                            let _ = t.set_state(ThreadState::Running);
+                        }
+                    }
+                    j += 1;
+                }
+                self.current = next;
+                Ok(next)
+            }
+            Err(e) => {
+                self.current = NULL_THREAD;
+                Err(e)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -447,6 +504,47 @@ mod tests {
         assert_eq!(s.state_of(2), Some(ThreadState::Ready));
         assert_eq!(s.state_of(1), Some(ThreadState::Running));
         assert_eq!(s.state_of(99), None);
+    }
+
+    #[test]
+    fn exit_current_marks_done_and_join_observes_preempt_resumes_next() {
+        // S06 slice27 done-criteria pin: join semantics = `join(id)` is
+        // true iff that thread is Done; preempt/exit point = `exit_current`
+        // parks current to Done and resumes the next Ready (the coop
+        // `dispatch` yield shape, future timer IRQ calls the same pick).
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert!(s.spawn(mk(3, 0x3000_0000)));
+        assert!(!s.join(2));
+        assert!(!s.join(99));
+        // Rotate to 2 (preempt point: dispatch yield 1->2).
+        assert_eq!(s.dispatch(), Ok(2));
+        assert_eq!(s.current(), 2);
+        // Exit 2: Done, join observes, resume is 3 (Done is skipped).
+        assert_eq!(s.exit_current(), Ok(3));
+        assert_eq!(s.current(), 3);
+        assert_eq!(s.state_of(2), Some(ThreadState::Done));
+        assert!(s.join(2));
+        assert!(!s.join(3));
+        // Dispatch skips Done 2: 3->1, never back to 2.
+        assert_eq!(s.dispatch(), Ok(1));
+        assert_eq!(s.current(), 1);
+        assert!(s.join(2));
+        // Exit 1 then 3: last exit parks current on NULL with the pick
+        // error, both joinable, table length unchanged.
+        assert_eq!(s.exit_current(), Ok(3));
+        assert!(s.join(1));
+        assert_eq!(s.exit_current(), Err(SwitchError::NotReady));
+        assert_eq!(s.current(), NULL_THREAD);
+        assert!(s.join(1));
+        assert!(s.join(3));
+        assert_eq!(s.len(), 3);
+        // Unknown current cannot exit (no phantom Done mark).
+        let mut u = Scheduler::new(99);
+        assert!(u.spawn(mk(1, 0x1000_0000)));
+        assert_eq!(u.exit_current(), Err(SwitchError::Unknown));
+        assert!(!u.join(1));
     }
 
     /// Strip `/* ... */` (nested), `//` line comments, and blank string/char

@@ -3127,6 +3127,64 @@ mod tests {
     }
 
     #[test]
+    fn chain_rsp_and_order_disproof_host() {
+        // S06 slice27 second-seed/disproof hardening (REVIEW #416 risks b/c):
+        // (1) RSP-slot discipline on every leg — the live triple tops that
+        // pass `check_jump_entry` + `!jump_rsp_refuses` must refuse once
+        // flipped misaligned (`top ^ 1`), through BOTH predicates (a gate
+        // that accepted a corrupt RSP would be a silent live-`jmp` fault);
+        // (2) order pin host-side — `chain_leg` with a leg that does not
+        // match `sched.current()` refuses (`None`), so a 1->3->2 scramble
+        // can never resolve even though each triple alone is valid.
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x3001).unwrap();
+        let b = Thread::new(2, 0x2000_0000, 8192, 0x3002).unwrap();
+        let c = Thread::new(3, 0x3000_0000, 8192, 0x3003).unwrap();
+        let mut sched = Scheduler::new(1);
+        assert!(sched.spawn(a));
+        assert!(sched.spawn(b));
+        assert!(sched.spawn(c));
+        // Order disproof: current is 1, leg 2 must refuse.
+        assert!(chain_leg(&mut sched, a, b, c, 2, 0x3003).is_none());
+        assert_eq!(sched.current(), 1);
+        // RSP disproof per leg: resolve the good leg, then corrupt its top.
+        for leg in [1u64, 2, 3] {
+            let want = if leg == 3 {
+                0x3001
+            } else if leg == 2 {
+                0x3003
+            } else {
+                0x3002
+            };
+            let st1 = sched.state_of(1).unwrap();
+            let st2 = sched.state_of(2).unwrap();
+            let st3 = sched.state_of(3).unwrap();
+            fn live_as(t: Thread, st: baseos_kernel::thread::ThreadState) -> Thread {
+                let mut m = t;
+                if m.state() != st {
+                    assert!(m.set_state(st));
+                }
+                m
+            }
+            let live = [live_as(a, st1), live_as(b, st2), live_as(c, st3)];
+            let (id, top, entry) = swap_target(&live, sched.current()).unwrap();
+            assert!(check_jump_entry(top, entry));
+            assert!(!jump_rsp_refuses(top));
+            let bad_top = top ^ 1;
+            assert!(
+                !check_jump_entry(bad_top, entry),
+                "leg {leg} corrupt RSP must refuse"
+            );
+            assert!(
+                jump_rsp_refuses(bad_top),
+                "leg {leg} corrupt RSP must refuse"
+            );
+            assert_eq!(id, if leg == 3 { 1 } else { leg + 1 });
+            assert!(chain_leg(&mut sched, a, b, c, leg, want).is_some());
+        }
+        assert_eq!(sched.current(), 1);
+    }
+
+    #[test]
     fn jump_fail_closed_line_shape() {
         // S06 slice22 ok=0 funnel: every refusal emits the same
         // `THREAD-JUMP ok=0 id=0` shape the ps1 gates on — pin the writer
