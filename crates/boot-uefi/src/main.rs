@@ -1839,6 +1839,78 @@ fn probe_sched_fair<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<boo
     Ok(ok)
 }
 
+/// Emit the `SCHED-TRACE` dispatch-order line (S07 slice 3, first tracing):
+/// `SCHED-TRACE ok=<0|1> n=<n> t0=<id> t1=<id> t2=<id>` — the first three
+/// recorded quanta in dispatch order after one 1->2->3->1 round. `ok` is 1
+/// only on `n=3 t0=2 t1=3 t2=1`; failure zeroes all fields so a short or
+/// reordered round cannot pass. Prefix-only trace (first 8 quanta kept, no
+/// wrap/timestamps yet — those ride with the timer/S08 harness slice).
+fn write_sched_trace_line<E>(
+    ok: bool,
+    n: u64,
+    t0: u64,
+    t1: u64,
+    t2: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "SCHED-TRACE ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " n=")?;
+    write_u64_dec(emit, n)?;
+    write_str(emit, " t0=")?;
+    write_u64_dec(emit, t0)?;
+    write_str(emit, " t1=")?;
+    write_u64_dec(emit, t1)?;
+    write_str(emit, " t2=")?;
+    write_u64_dec(emit, t2)?;
+    write_str(emit, "\n")
+}
+
+/// Trace probe (S07 slice 3): drive a fresh `Scheduler` through one
+/// 1->2->3->1 round under the IRQ gate and emit the `SCHED-TRACE` line
+/// from the recorded ids (not from the dispatch return values, so the
+/// trace path itself is what e2e proves). Ps1 hard-requires
+/// `SCHED-TRACE ok=1 n=3 t0=2 t1=3 t2=1`. Never panics.
+fn probe_sched_trace<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    let (a, b, c) = match (
+        Thread::new(1, 0x1000_0000, 8192, 0x3001),
+        Thread::new(2, 0x2000_0000, 8192, 0x3002),
+        Thread::new(3, 0x3000_0000, 8192, 0x3003),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => {
+            write_sched_trace_line::<E>(false, 0, 0, 0, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let mut sched = Scheduler::new(1);
+    if !sched.spawn(a) || !sched.spawn(b) || !sched.spawn(c) {
+        write_sched_trace_line::<E>(false, 0, 0, 0, 0, emit)?;
+        return Ok(false);
+    }
+    let gate = unsafe { IrqGuard::enter() };
+    if sched.dispatch_gated(&gate) != Ok(2)
+        || sched.dispatch_gated(&gate) != Ok(3)
+        || sched.dispatch_gated(&gate) != Ok(1)
+    {
+        write_sched_trace_line::<E>(false, 0, 0, 0, 0, emit)?;
+        return Ok(false);
+    }
+    let (n, t0, t1, t2) = (
+        sched.trace_len() as u64,
+        sched.trace_at(0).unwrap_or(0),
+        sched.trace_at(1).unwrap_or(0),
+        sched.trace_at(2).unwrap_or(0),
+    );
+    let ok = n == 3 && t0 == 2 && t1 == 3 && t2 == 1;
+    if ok {
+        write_sched_trace_line::<E>(true, n, t0, t1, t2, emit)?;
+    } else {
+        write_sched_trace_line::<E>(false, 0, 0, 0, 0, emit)?;
+    }
+    Ok(ok)
+}
+
 /// Resolve the `from` leg on the CARRIED cursor and `jmp` (S06 slice27b,
 /// guest-only): earlier legs already advanced the static cursor on the
 /// stacks below us, so there is NO replay loop — leg `from` resolves
@@ -2391,6 +2463,9 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // S07 slice 2: equal-quantum fairness sweep — SCHED-FAIR ok=1
             // total=30 r1=10 r2=10 r3=10 spread=0 (fail-loud on short/skew).
             let _ = probe_sched_fair::<Infallible>(&mut emit);
+            // S07 slice 3: dispatch-order trace — SCHED-TRACE ok=1 n=3
+            // t0=2 t1=3 t2=1 (fail-loud on short/reordered round).
+            let _ = probe_sched_trace::<Infallible>(&mut emit);
             // S06 slice26b: live 1->2->3->1 multi-hop `jmp` chain — hop 2
             // emits the legacy THREAD-JUMP-RUN + THREAD-JUMP ok=1 id=2
             // shapes (leg 1->2 IS the retired slice22 probe, same
@@ -3667,6 +3742,34 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "SCHED-FAIR ok=0 total=0 r1=0 r2=0 r3=0 spread=0\n"
+        );
+    }
+
+    #[test]
+    fn sched_trace_probe_shape() {
+        // S07 slice 3 trace shapes: the same `probe_sched_trace` the
+        // guest runs must emit exactly
+        // `SCHED-TRACE ok=1 n=3 t0=2 t1=3 t2=1` and true.
+        let mut out: Vec<u8> = Vec::new();
+        let ok = probe_sched_trace::<core::convert::Infallible>(&mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert!(ok);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SCHED-TRACE ok=1 n=3 t0=2 t1=3 t2=1\n"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        write_sched_trace_line::<core::convert::Infallible>(false, 0, 0, 0, 0, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SCHED-TRACE ok=0 n=0 t0=0 t1=0 t2=0\n"
         );
     }
 

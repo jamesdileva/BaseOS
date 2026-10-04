@@ -3,9 +3,8 @@
 Review before each work segment. Keep ≤20 lines, compact.
 
 - Goal: perf-first x86-64 UEFI desktop OS, Rust-first; docs in repo root.
-- Now: S07 slice2 fairness committed, 184 green (21+32+121+4+4+2), QEMU PASS x2 1536B SCHED-FAIR ok=1 (30/10/10/10/spread 0), tree clean. #20 stays active (timer-quantum/trace owed). Next: S07 slice3 quantum/trace or close per review.
-- Next: S06 preempt-IRQ gate slice (cli/atomic around pick) per #423 residual (b); then S07 scheduler per roadmap.
-- Board: #9 done, #16 done, #17 done (S06 multi-hop chain); resume per #79/#80.
+- Now: S07 slice3 trace committed, 187 green (21+33+123+4+4+2), QEMU PASS x2 1572B SCHED-TRACE ok=1 (n=3 t0=2 t1=3 t2=1), tree clean. #20 stays active (timer-quantum owed; F1 closed via append-only regression). Next: S07 slice4 timer-quantum or close per review.
+- Board: #9 done, #16 done, #17 done (S06 multi-hop chain); #19 preempt-IRQ gate done; S07 #20 active; resume per #79/#80.
 - Conventions: STRUCTURAL_FAIL = usize::MAX; ASCII .ps1; raw EFI;
   ST+96/BS+56/64/232/320 efiapi; 16KiB map+slack 4096; serial hard-req
   BOOTINFO/MEMMAP+budget/GOP/KERNEL/EBS/FRAMEALLOC/EXC=0.

@@ -45,6 +45,14 @@
 use crate::cpu::IrqGuard;
 use crate::thread::{validate_threads, SwitchError, Thread, ThreadState, MAX_THREADS, NULL_THREAD};
 
+/// S07 slice 3 — dispatch trace capacity: the first `TRACE_CAP` successful
+/// dispatches (each one equal quantum, in order) are recorded as thread
+/// ids. Id-keyed (not slot-indexed), so a future remove/compact cannot
+/// misattribute it. Prefix-only by design (no ring/wrap): a fresh probe's
+/// 3-round fits exactly; long-sweep tail tracing with timestamps rides with
+/// the S08 research harness once a timer source exists.
+pub const TRACE_CAP: usize = 8;
+
 /// Cooperative scheduler: owns up to `MAX_THREADS` descriptors plus the
 /// current-thread id. No `Cell`, no atomics — `&mut self` for mutation,
 /// `&self` for picks.
@@ -65,10 +73,17 @@ use crate::thread::{validate_threads, SwitchError, Thread, ThreadState, MAX_THRE
 /// reuses the same gated pick). Fairness over N rounds is `max - min` of
 /// `runs` (see [`Scheduler::fairness_spread`]): a balanced round-robin
 /// sweep holds spread <= 1.
+///
+/// S07 slice 3 — tracing: each successful `dispatch` (and each
+/// `exit_current` resume) appends the resumed id to `trace` while
+/// `trace_len < TRACE_CAP` (see [`Scheduler::trace_at`]). The serial
+/// `SCHED-TRACE` probe emits the first 3 entries (`t0=2 t1=3 t2=1`).
 #[derive(Debug, Clone)]
 pub struct Scheduler {
     table: [Option<Thread>; MAX_THREADS],
     runs: [u64; MAX_THREADS],
+    trace: [u64; TRACE_CAP],
+    trace_len: usize,
     len: usize,
     current: u64,
 }
@@ -92,6 +107,8 @@ impl Scheduler {
         Self {
             table: [None; MAX_THREADS],
             runs: [0; MAX_THREADS],
+            trace: [0; TRACE_CAP],
+            trace_len: 0,
             len: 0,
             current,
         }
@@ -187,6 +204,34 @@ impl Scheduler {
         max.saturating_sub(min)
     }
 
+    /// Number of recorded trace entries (`min(total_dispatches, TRACE_CAP)`).
+    /// Prefix-only: the first `TRACE_CAP` quanta in dispatch order.
+    #[must_use]
+    pub const fn trace_len(&self) -> usize {
+        self.trace_len
+    }
+
+    /// `i`-th dispatched id in record order (`None` when `i >= trace_len`).
+    /// Id-keyed: entries are thread ids, never slot indexes, so they stay
+    /// valid under any future table compaction.
+    #[must_use]
+    pub fn trace_at(&self, i: usize) -> Option<u64> {
+        if i < self.trace_len {
+            Some(self.trace[i])
+        } else {
+            None
+        }
+    }
+
+    /// Record one quantum while capacity remains (refusals never reach here;
+    /// saturation keeps the prefix deterministic instead of wrapping).
+    fn record_trace(&mut self, id: u64) {
+        if self.trace_len < TRACE_CAP {
+            self.trace[self.trace_len] = id;
+            self.trace_len += 1;
+        }
+    }
+
     /// Live table as a packed array copy for the picker. Packed (no holes):
     /// `spawn` appends, never leaves `None` inside `[..len)`. Copies every
     /// populated slot over the full capacity, so a just-written
@@ -280,6 +325,7 @@ impl Scheduler {
             }
             i += 1;
         }
+        self.record_trace(next);
         self.current = next;
         Ok(next)
     }
@@ -350,6 +396,7 @@ impl Scheduler {
                     }
                     j += 1;
                 }
+                self.record_trace(next);
                 self.current = next;
                 Ok(next)
             }
@@ -1068,6 +1115,76 @@ mod tests {
         assert!(solo.spawn(mk(1, 0x1000_0000)));
         assert!(solo.dispatch().is_err());
         assert_eq!(solo.fairness_spread(), 0);
+    }
+
+    #[test]
+    fn trace_records_dispatch_order_and_stops_at_cap() {
+        // S07 slice 3: the first TRACE_CAP quanta record ids in order;
+        // refusals record nothing; saturation keeps the prefix (no wrap).
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert!(s.spawn(mk(3, 0x3000_0000)));
+        assert_eq!(s.trace_len(), 0);
+        assert_eq!(s.trace_at(0), None);
+        assert_eq!(s.dispatch(), Ok(2));
+        assert_eq!(s.dispatch(), Ok(3));
+        assert_eq!(s.dispatch(), Ok(1));
+        assert_eq!(s.trace_len(), 3);
+        assert_eq!(s.trace_at(0), Some(2));
+        assert_eq!(s.trace_at(1), Some(3));
+        assert_eq!(s.trace_at(2), Some(1));
+        assert_eq!(s.trace_at(3), None);
+        // Long sweep: counts keep going, trace pins the 8-prefix.
+        let mut n = 3;
+        while n < 30 {
+            assert!(s.dispatch().is_ok());
+            n += 1;
+        }
+        assert_eq!(s.total_dispatches(), 30);
+        assert_eq!(s.trace_len(), TRACE_CAP);
+        let expect = [2u64, 3, 1, 2, 3, 1, 2, 3];
+        let mut i = 0;
+        while i < TRACE_CAP {
+            assert_eq!(s.trace_at(i), Some(expect[i]));
+            i += 1;
+        }
+        assert_eq!(s.trace_at(TRACE_CAP), None);
+        // Refusal records nothing.
+        let mut solo = Scheduler::new(1);
+        assert!(solo.spawn(mk(1, 0x1000_0000)));
+        assert!(solo.dispatch().is_err());
+        assert_eq!(solo.trace_len(), 0);
+        assert_eq!(solo.trace_at(0), None);
+    }
+
+    #[test]
+    fn slot_index_invariant_append_only_with_id_keyed_trace() {
+        // REVIEW #433 F1 regression: `runs[i]` belongs to `table[i]`
+        // (append-only, no remove/compact exists). Pins two rounds of
+        // per-id attribution plus len/id stability, so a future
+        // remove/compact that shifts `table` without `runs` goes red here.
+        // The trace needs no such pin: entries are ids, not slots.
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert!(s.spawn(mk(3, 0x3000_0000)));
+        let mut n = 0;
+        while n < 6 {
+            assert!(s.dispatch().is_ok());
+            n += 1;
+        }
+        assert_eq!(s.runs_of(1), Some(2));
+        assert_eq!(s.runs_of(2), Some(2));
+        assert_eq!(s.runs_of(3), Some(2));
+        assert_eq!(s.total_dispatches(), 6);
+        assert_eq!(s.fairness_spread(), 0);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.trace_len(), 6);
+        assert_eq!(
+            (s.trace_at(0), s.trace_at(1), s.trace_at(2)),
+            (Some(2), Some(3), Some(1))
+        );
     }
 
     #[test]
