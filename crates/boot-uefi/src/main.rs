@@ -1469,17 +1469,42 @@ fn chain_leg(
     Some((top, func))
 }
 
-/// Resolve chain legs 1..=`from` and `jmp` on the `from` leg (S06 slice26b,
-/// guest-only): legs before `from` re-verify (their jumps already happened
-/// on the stacks below us — targets dropped, dispatch agreement kept),
-/// the `from` leg jumps and never returns. Any refusal returns `false`
-/// with no register or stack touch.
+/// S06 slice27b live-carry cursor (closes REVIEW #421 gap 2 / risk (a)):
+/// the never-return `jmp` chain cannot carry a stack `Scheduler` across
+/// hops, so the cursor lives in `.bss` statics, seeded ONCE by leg 1 and
+/// advanced hop-by-hop with no fresh replay. `CHAIN_CURSOR` holds the
+/// dispatched states + `current`; `CHAIN_CURSOR_SEEDED` refuses a second
+/// seed (a re-seed would reset the carried states); `CHAIN_CURSOR_LEGS`
+/// counts carried legs so the terminal hop proves 3 live advances, not 3
+/// fresh replays. Host `cargo test` covers the same carry shape on a stack
+/// `Scheduler` (seed-once + legs on one table, see
+/// `chain_cursor_carry_host`); the guest proves it live via the
+/// `CHAIN-CURSOR ok=1 legs=3` line the ps1 gates on.
+#[cfg(not(test))]
+static mut CHAIN_CURSOR: Scheduler = Scheduler::new(1);
+#[cfg(not(test))]
+static mut CHAIN_CURSOR_SEEDED: bool = false;
+#[cfg(not(test))]
+static mut CHAIN_CURSOR_LEGS: u64 = 0;
+
+/// Seed the live-carry cursor (S06 slice27b, guest-only): build the same
+/// three descriptors the chain uses (entries ARE the hop fn addresses),
+/// spawn them into the static cursor once. Returns `true` when this call
+/// seeded; `false` when already seeded or any spawn refused (fail-closed,
+/// no partial seed: a half-seeded cursor would replay divergently).
+/// The leg-1 probe calls this; hops 2/3 never seed.
 ///
 /// # Safety
-/// Post-EBS only, same contract as [`probe_thread_swap`]: owns the static
-/// stacks, `cli` in effect, COM1 exclusive.
+/// Post-EBS only: exclusively owns the cursor statics, `cli` in effect.
 #[cfg(not(test))]
-unsafe fn chain_resolve_and_jump(from: u64) -> bool {
+unsafe fn chain_cursor_seed() -> bool {
+    // Raw-pointer access throughout (never name the statics directly):
+    // direct `CHAIN_CURSOR_SEEDED` reads/writes trip
+    // `rust_2024_compatibility static_mut_refs` (shared ref to mutable
+    // static); `addr_of!` keeps the guest build warning-free.
+    if core::ptr::addr_of!(CHAIN_CURSOR_SEEDED).read() {
+        return false;
+    }
     let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
     let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
     let base_c = core::ptr::addr_of!(THREAD_STACK_C) as u64;
@@ -1494,77 +1519,199 @@ unsafe fn chain_resolve_and_jump(from: u64) -> bool {
         (Ok(a), Ok(b), Ok(c)) => (a, b, c),
         _ => return false,
     };
-    let mut sched = Scheduler::new(1);
-    if !sched.spawn(a0) || !sched.spawn(b0) || !sched.spawn(c0) {
+    let cursor = core::ptr::addr_of_mut!(CHAIN_CURSOR);
+    if !(*cursor).spawn(a0) || !(*cursor).spawn(b0) || !(*cursor).spawn(c0) {
         return false;
     }
-    let want = |leg: u64| {
-        if leg == 3 {
-            hop1
-        } else if leg == 2 {
-            hop3
-        } else {
-            hop2
+    core::ptr::addr_of_mut!(CHAIN_CURSOR_SEEDED).write(true);
+    core::ptr::addr_of_mut!(CHAIN_CURSOR_LEGS).write(0);
+    true
+}
+
+/// Advance one carried leg on the static cursor (S06 slice27b, guest-only):
+/// re-derive the descriptors (deterministic from the static stacks + hop
+/// addresses), resolve through [`chain_leg`] against the CARRIED cursor
+/// (no replay of earlier legs), bump the leg counter on success, and
+/// return the `(top, func)` to jump with. Any refusal returns `None` with
+/// no register or stack touch.
+///
+/// # Safety
+/// Post-EBS only: same contract as [`chain_cursor_seed`]; requires the
+/// cursor seeded (leg-1 probe seeds before jumping).
+#[cfg(not(test))]
+unsafe fn chain_cursor_leg(leg: u64) -> Option<(u64, extern "C" fn())> {
+    if !core::ptr::addr_of!(CHAIN_CURSOR_SEEDED).read() {
+        return None;
+    }
+    let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
+    let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
+    let base_c = core::ptr::addr_of!(THREAD_STACK_C) as u64;
+    let hop1 = thread_jump_chain_hop1 as *const () as u64;
+    let hop2 = thread_jump_chain_hop2 as *const () as u64;
+    let hop3 = thread_jump_chain_hop3 as *const () as u64;
+    let (a0, b0, c0) = match (
+        Thread::new(1, base_a, 8192, hop1),
+        Thread::new(2, base_b, 8192, hop2),
+        Thread::new(3, base_c, 8192, hop3),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => return None,
+    };
+    let want = if leg == 3 {
+        hop1
+    } else if leg == 2 {
+        hop3
+    } else {
+        hop2
+    };
+    let cursor = core::ptr::addr_of_mut!(CHAIN_CURSOR);
+    let out = chain_leg(&mut *cursor, a0, b0, c0, leg, want)?;
+    core::ptr::addr_of_mut!(CHAIN_CURSOR_LEGS)
+        .write(core::ptr::addr_of!(CHAIN_CURSOR_LEGS).read() + 1);
+    Some(out)
+}
+
+/// Emit the `CHAIN-CURSOR` terminal (S06 slice27b):
+/// `CHAIN-CURSOR ok=1 legs=3` only when the static cursor carried all
+/// three legs live (seed-once + 3 advances + back on 1); any other shape
+/// emits `CHAIN-CURSOR ok=0 legs=<n>` and the ps1 gate fails.
+fn write_chain_cursor_line<E>(
+    ok: bool,
+    legs: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "CHAIN-CURSOR ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " legs=")?;
+    write_u64_dec(emit, legs)?;
+    write_str(emit, "\n")
+}
+
+/// Emit the `SCHED-EXIT` diagnostic (S06 slice27b guest join/exit proof):
+/// `SCHED-EXIT ok=<0|1> exited=<n> resumed=<m>` — `ok` is 1 only when a
+/// live `Scheduler` (boot 1 + threads 2,3) dispatched 1->2 and
+/// `exit_current` marked 2 `Done` and resumed 3. Failure zeroes both ids.
+fn write_sched_exit_line<E>(
+    ok: bool,
+    exited: u64,
+    resumed: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "SCHED-EXIT ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " exited=")?;
+    write_u64_dec(emit, exited)?;
+    write_str(emit, " resumed=")?;
+    write_u64_dec(emit, resumed)?;
+    write_str(emit, "\n")
+}
+
+/// Emit the `SCHED-JOIN` diagnostic (S06 slice27b guest join/exit proof):
+/// `SCHED-JOIN ok=<0|1> joined=<n>` — `ok` is 1 only when `join(exited)`
+/// observes `Done` after the exit above while `join(resumed)` is still
+/// false (no phantom join). Failure reports `joined=0`.
+fn write_sched_join_line<E>(
+    ok: bool,
+    joined: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "SCHED-JOIN ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " joined=")?;
+    write_u64_dec(emit, joined)?;
+    write_str(emit, "\n")
+}
+
+/// Live join/exit probe (S06 slice27b, closes REVIEW #421 gap 1): drive a
+/// real `Scheduler` through dispatch 1->2, `exit_current` (2 `Done`,
+/// resume 3), and `join` observation — the exact primitives the chain
+/// cursor will use under a future preempt IRQ — and emit the `SCHED-EXIT`
+/// and `SCHED-JOIN` lines. Pure scheduler logic (no `RSP` swap), so the
+/// same function runs on host (`cargo test` pins the shapes) and guest
+/// (QEMU proves it live; ps1 hard-requires both lines). Never panics.
+fn probe_sched_join_exit<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    let (a, b, c) = match (
+        Thread::new(1, 0x1000_0000, 8192, 0x3001),
+        Thread::new(2, 0x2000_0000, 8192, 0x3002),
+        Thread::new(3, 0x3000_0000, 8192, 0x3003),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => {
+            write_sched_exit_line::<E>(false, 0, 0, emit)?;
+            write_sched_join_line::<E>(false, 0, emit)?;
+            return Ok(false);
         }
     };
-    let mut leg = 1u64;
-    while leg < from {
-        // Replay only: the jump for this leg already happened below us.
-        if chain_leg(&mut sched, a0, b0, c0, leg, want(leg)).is_none() {
+    let mut sched = Scheduler::new(1);
+    if !sched.spawn(a) || !sched.spawn(b) || !sched.spawn(c) {
+        write_sched_exit_line::<E>(false, 0, 0, emit)?;
+        write_sched_join_line::<E>(false, 0, emit)?;
+        return Ok(false);
+    }
+    if sched.dispatch() != Ok(2) {
+        write_sched_exit_line::<E>(false, 0, 0, emit)?;
+        write_sched_join_line::<E>(false, 0, emit)?;
+        return Ok(false);
+    }
+    let resumed = match sched.exit_current() {
+        Ok(n) => n,
+        Err(_) => {
+            write_sched_exit_line::<E>(false, 0, 0, emit)?;
+            write_sched_join_line::<E>(false, 0, emit)?;
+            return Ok(false);
+        }
+    };
+    let joined_ok = sched.join(2) && !sched.join(resumed) && resumed == 3;
+    if resumed != 3 {
+        write_sched_exit_line::<E>(false, 2, resumed, emit)?;
+        write_sched_join_line::<E>(false, 0, emit)?;
+        return Ok(false);
+    }
+    write_sched_exit_line::<E>(true, 2, resumed, emit)?;
+    if !joined_ok {
+        write_sched_join_line::<E>(false, 0, emit)?;
+        return Ok(false);
+    }
+    write_sched_join_line::<E>(true, 2, emit)?;
+    Ok(true)
+}
+
+/// Resolve the `from` leg on the CARRIED cursor and `jmp` (S06 slice27b,
+/// guest-only): earlier legs already advanced the static cursor on the
+/// stacks below us, so there is NO replay loop — leg `from` resolves
+/// against the carried states and jumps, never returning. Leg 1 seeds the
+/// cursor first (seed refusal = fail-closed, no jump). Any refusal returns
+/// `false` with no register or stack touch.
+///
+/// # Safety
+/// Post-EBS only, same contract as [`probe_thread_swap`]: owns the static
+/// stacks plus the cursor statics, `cli` in effect, COM1 exclusive.
+#[cfg(not(test))]
+unsafe fn chain_resolve_and_jump(from: u64) -> bool {
+    if from == 1 && !core::ptr::addr_of!(CHAIN_CURSOR_SEEDED).read() {
+        if !chain_cursor_seed() {
             return false;
         }
-        leg += 1;
     }
-    match chain_leg(&mut sched, a0, b0, c0, from, want(from)) {
+    match chain_cursor_leg(from) {
         Some((top, func)) => jump_to_thread_stack(top, func),
         None => false,
     }
 }
 
-/// Re-verify the full 1->2->3->1 chain without jumping (S06 slice26b,
-/// guest-only): the final hop runs this to prove the re-derived scheduler
-/// landed back on 1 with every leg's dispatch + live triple + gate
-/// agreeing, then emits the terminal ok=1 line and chains to bring-up.
+/// Terminal cursor check (S06 slice27b, guest-only): proves the static
+/// cursor carried all three legs live — seeded once, 3 advances, back on
+/// 1 — with NO fresh replay. Returns `(ok, legs)` for the two terminal
+/// lines.
 ///
 /// # Safety
 /// Same contract as [`chain_resolve_and_jump`].
 #[cfg(not(test))]
-unsafe fn chain_verify_full() -> bool {
-    let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
-    let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
-    let base_c = core::ptr::addr_of!(THREAD_STACK_C) as u64;
-    let hop1 = thread_jump_chain_hop1 as *const () as u64;
-    let hop2 = thread_jump_chain_hop2 as *const () as u64;
-    let hop3 = thread_jump_chain_hop3 as *const () as u64;
-    let (a0, b0, c0) = match (
-        Thread::new(1, base_a, 8192, hop1),
-        Thread::new(2, base_b, 8192, hop2),
-        Thread::new(3, base_c, 8192, hop3),
-    ) {
-        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
-        _ => return false,
-    };
-    let mut sched = Scheduler::new(1);
-    if !sched.spawn(a0) || !sched.spawn(b0) || !sched.spawn(c0) {
-        return false;
-    }
-    let want = |leg: u64| {
-        if leg == 3 {
-            hop1
-        } else if leg == 2 {
-            hop3
-        } else {
-            hop2
-        }
-    };
-    let mut leg = 1u64;
-    while leg <= 3 {
-        if chain_leg(&mut sched, a0, b0, c0, leg, want(leg)).is_none() {
-            return false;
-        }
-        leg += 1;
-    }
-    sched.current() == 1
+unsafe fn chain_cursor_terminal() -> (bool, u64) {
+    let legs = core::ptr::addr_of!(CHAIN_CURSOR_LEGS).read();
+    let seeded = core::ptr::addr_of!(CHAIN_CURSOR_SEEDED).read();
+    let current = (*core::ptr::addr_of!(CHAIN_CURSOR)).current();
+    (seeded && legs == 3 && current == 1, legs)
 }
 
 /// Chain hop 2 (S06 slice26b): runs ON thread-B's stack (no return address
@@ -1584,6 +1731,7 @@ extern "C" fn thread_jump_chain_hop2() -> ! {
     unsafe {
         let _ = chain_resolve_and_jump(2);
         let _ = write_thread_jump_chain_line::<core::convert::Infallible>(false, &mut emit);
+        let _ = write_chain_cursor_line::<core::convert::Infallible>(false, 1, &mut emit);
         baseos_kernel::bring_up_cpu_and_prove_exception();
     }
 }
@@ -1598,15 +1746,18 @@ extern "C" fn thread_jump_chain_hop3() -> ! {
     unsafe {
         let _ = chain_resolve_and_jump(3);
         let _ = write_thread_jump_chain_line::<core::convert::Infallible>(false, &mut emit);
+        let _ = write_chain_cursor_line::<core::convert::Infallible>(false, 2, &mut emit);
         baseos_kernel::bring_up_cpu_and_prove_exception();
     }
 }
 
-/// Chain hop 1, terminal (S06 slice26b): runs back ON the boot-stack
-/// region's thread-A descriptor (`THREAD_STACK_A`), MUST NEVER `ret`.
-/// Emits `hop=1`, re-verifies the full chain deterministically (every leg
-/// re-derived, scheduler back on 1), emits the terminal
-/// `THREAD-JUMP-CHAIN ok=1 chain=1231` line, then chains into
+/// Chain hop 1, terminal (S06 slice26b + slice27b live-carry): runs back
+/// ON the boot-stack region's thread-A descriptor (`THREAD_STACK_A`), MUST
+/// NEVER `ret`. Emits `hop=1`, proves the STATIC cursor carried all three
+/// legs live (seed-once + 3 advances + back on 1, no fresh replay) via
+/// [`chain_cursor_terminal`], emits the terminal
+/// `THREAD-JUMP-CHAIN ok=1 chain=1231` line plus the
+/// `CHAIN-CURSOR ok=1 legs=3` carry proof, then chains into
 /// `bring_up_cpu_and_prove_exception` (GDT/IDT + live `#PF` touch, which
 /// emits `PF ok=1` then chains `#DE` → `EXC ok=1`) — the boot never
 /// resumes on any earlier stack by construction.
@@ -1615,8 +1766,9 @@ extern "C" fn thread_jump_chain_hop1() -> ! {
     let mut emit = com1_emit;
     let _ = write_chain_hop_line::<core::convert::Infallible>(1, &mut emit);
     unsafe {
-        let ok = chain_verify_full();
+        let (ok, legs) = chain_cursor_terminal();
         let _ = write_thread_jump_chain_line::<core::convert::Infallible>(ok, &mut emit);
+        let _ = write_chain_cursor_line::<core::convert::Infallible>(ok, legs, &mut emit);
         baseos_kernel::bring_up_cpu_and_prove_exception();
     }
 }
@@ -1665,6 +1817,7 @@ unsafe fn probe_thread_jump_chain<E>(
     // means the leg-1 resolve refused.
     let _ = chain_resolve_and_jump(1);
     write_thread_jump_chain_line::<E>(false, emit)?;
+    write_chain_cursor_line::<E>(false, 0, emit)?;
     Ok(false)
 }
 
@@ -2066,6 +2219,10 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // on a silent same-shape pass.
             let demo_gate_failed =
                 probe_thread_jump_refusal_demo::<Infallible>(&mut emit).unwrap_or(true);
+            // S06 slice27b: guest join/exit proof — SCHED-EXIT ok=1
+            // exited=2 resumed=3 + SCHED-JOIN ok=1 joined=2 (live join/
+            // exit_current primitives; host pins the same shapes).
+            let _ = probe_sched_join_exit::<Infallible>(&mut emit);
             // S06 slice26b: live 1->2->3->1 multi-hop `jmp` chain — hop 2
             // emits the legacy THREAD-JUMP-RUN + THREAD-JUMP ok=1 id=2
             // shapes (leg 1->2 IS the retired slice22 probe, same
@@ -3158,14 +3315,15 @@ mod tests {
             let st1 = sched.state_of(1).unwrap();
             let st2 = sched.state_of(2).unwrap();
             let st3 = sched.state_of(3).unwrap();
-            fn live_as(t: Thread, st: baseos_kernel::thread::ThreadState) -> Thread {
-                let mut m = t;
-                if m.state() != st {
-                    assert!(m.set_state(st));
-                }
-                m
-            }
-            let live = [live_as(a, st1), live_as(b, st2), live_as(c, st3)];
+            // S06 slice27b dedup (REVIEW #421 gap 3): the test-local
+            // `live_as` duplicated `chain_live_as` — a divergence between
+            // the two would let the test pass while the guest snapshot
+            // drifts. Use the guest helper directly (fail-closed `Option`).
+            let live = [
+                chain_live_as(a, st1).unwrap(),
+                chain_live_as(b, st2).unwrap(),
+                chain_live_as(c, st3).unwrap(),
+            ];
             let (id, top, entry) = swap_target(&live, sched.current()).unwrap();
             assert!(check_jump_entry(top, entry));
             assert!(!jump_rsp_refuses(top));
@@ -3182,6 +3340,105 @@ mod tests {
             assert!(chain_leg(&mut sched, a, b, c, leg, want).is_some());
         }
         assert_eq!(sched.current(), 1);
+    }
+
+    #[test]
+    fn chain_cursor_carry_host() {
+        // S06 slice27b live-carry shape (REVIEW #421 risk (a)): ONE table
+        // seeded once carries all three legs 1->2->3->1 with no re-spawn
+        // and no fresh replay — the host mirror of the guest `.bss` cursor
+        // (seed-once + hop-by-hop advance). A second seed attempt (re-spawn
+        // of the same ids) must refuse, proving the cursor cannot reset
+        // mid-chain; a wrong-leg resolve refuses with no mutation.
+        let a = Thread::new(1, 0x1000_0000, 8192, 0x3001).unwrap();
+        let b = Thread::new(2, 0x2000_0000, 8192, 0x3002).unwrap();
+        let c = Thread::new(3, 0x3000_0000, 8192, 0x3003).unwrap();
+        let mut sched = Scheduler::new(1);
+        assert!(sched.spawn(a));
+        assert!(sched.spawn(b));
+        assert!(sched.spawn(c));
+        // Second seed refuses (duplicate ids, no mutation, still len 3).
+        assert!(!sched.spawn(a));
+        assert_eq!(sched.len(), 3);
+        // Wrong-leg refuses with no advance.
+        assert!(chain_leg(&mut sched, a, b, c, 2, 0x3003).is_none());
+        assert_eq!(sched.current(), 1);
+        // Carried legs: same table advances 1->2->3->1.
+        let mut legs = 0u64;
+        for leg in [1u64, 2, 3] {
+            let want = if leg == 3 {
+                0x3001
+            } else if leg == 2 {
+                0x3003
+            } else {
+                0x3002
+            };
+            assert!(chain_leg(&mut sched, a, b, c, leg, want).is_some());
+            legs += 1;
+        }
+        assert_eq!(legs, 3);
+        assert_eq!(sched.current(), 1);
+    }
+
+    #[test]
+    fn sched_join_exit_probe_shapes() {
+        // S06 slice27b guest JOIN/EXIT proof shapes: the same
+        // `probe_sched_join_exit` the guest runs must emit exactly
+        // `SCHED-EXIT ok=1 exited=2 resumed=3` + `SCHED-JOIN ok=1 joined=2`
+        // and return true (ps1 hard-requires both lines live).
+        let mut out: Vec<u8> = Vec::new();
+        let ok = probe_sched_join_exit::<core::convert::Infallible>(&mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert!(ok);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            "SCHED-EXIT ok=1 exited=2 resumed=3\nSCHED-JOIN ok=1 joined=2\n"
+        );
+        // Writer shapes directly (refusal pair the probe funnels through).
+        let mut out: Vec<u8> = Vec::new();
+        write_sched_exit_line::<core::convert::Infallible>(false, 0, 0, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SCHED-EXIT ok=0 exited=0 resumed=0\n"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        write_sched_join_line::<core::convert::Infallible>(false, 0, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SCHED-JOIN ok=0 joined=0\n"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        write_chain_cursor_line::<core::convert::Infallible>(true, 3, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "CHAIN-CURSOR ok=1 legs=3\n"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        write_chain_cursor_line::<core::convert::Infallible>(false, 1, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "CHAIN-CURSOR ok=0 legs=1\n"
+        );
     }
 
     #[test]

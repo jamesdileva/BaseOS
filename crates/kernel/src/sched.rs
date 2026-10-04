@@ -232,6 +232,13 @@ impl Scheduler {
                 {
                     let _ = t.set_state(ThreadState::Done);
                     marked = true;
+                    // S06 slice27b: mark the FIRST match only, then stop.
+                    // `spawn` refuses duplicate ids so a healthy table holds
+                    // one match; marking ALL matches would silently mask a
+                    // duplicate-id smuggle (REVIEW #421 gap 3). Break here so
+                    // a dup-id table leaves the second copy non-Done and any
+                    // state audit can see the divergence.
+                    break;
                 }
             }
             i += 1;
