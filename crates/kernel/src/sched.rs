@@ -1159,6 +1159,33 @@ mod tests {
     }
 
     #[test]
+    fn trace_records_exit_current_resume() {
+        // S07 slice 4 (REVIEW #435 residual): `exit_current` resumes record
+        // the resumed id exactly like `dispatch` (same `record_trace`
+        // path); failed exits record nothing. Dispatch 1->2 records 2,
+        // exit 2 (Done, resume 3) records 3, and the counts agree.
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert!(s.spawn(mk(3, 0x3000_0000)));
+        assert_eq!(s.dispatch(), Ok(2));
+        assert_eq!((s.trace_len(), s.trace_at(0)), (1, Some(2)));
+        assert_eq!(s.exit_current(), Ok(3));
+        assert_eq!(s.trace_len(), 2);
+        assert_eq!(s.trace_at(0), Some(2));
+        assert_eq!(s.trace_at(1), Some(3));
+        assert_eq!(s.trace_at(2), None);
+        assert_eq!(s.runs_of(2), Some(1));
+        assert_eq!(s.runs_of(3), Some(1));
+        // Failed exit (unknown current) records nothing.
+        let mut u = Scheduler::new(99);
+        assert!(u.spawn(mk(1, 0x1000_0000)));
+        assert_eq!(u.exit_current(), Err(SwitchError::Unknown));
+        assert_eq!(u.trace_len(), 0);
+        assert_eq!(u.trace_at(0), None);
+    }
+
+    #[test]
     fn slot_index_invariant_append_only_with_id_keyed_trace() {
         // REVIEW #433 F1 regression: `runs[i]` belongs to `table[i]`
         // (append-only, no remove/compact exists). Pins two rounds of
