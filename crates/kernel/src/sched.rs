@@ -60,7 +60,13 @@ pub const TRACE_CAP: usize = 8;
 /// `dispatch` again). No real IRQ yet — the future PIT/APIC handler calls
 /// `tick_gated` under the `IrqGuard` gate, then `dispatch_gated` on expiry
 /// (same gated pick as the coop path). Small integer keeps the QEMU probe
-/// (4 ticks + 1 resched dispatch) one segment.
+/// (QUANTUM_TICKS ticks + 1 resched dispatch) one segment.
+///
+/// S07 slice 6 (REVIEW #439 residual 3): probe + unit asserts are
+/// const-driven (`used == QUANTUM_TICKS`, looped ticks, `format!` serial
+/// shape), so a quantum change touches only this const plus the ps1
+/// `q=<n>` hard-require literal and the serial doc examples — no hidden
+/// `== 4` gate stays green while the guest diverges.
 pub const QUANTUM_TICKS: u64 = 4;
 
 /// Cooperative scheduler: owns up to `MAX_THREADS` descriptors plus the
@@ -94,6 +100,15 @@ pub const QUANTUM_TICKS: u64 = 4;
 /// exit resume, `0` when idle or after the last exit parks `NULL`). The
 /// counter is global (one running thread at a time under coop yield); a
 /// future per-thread budget rides with priorities in a later slice.
+///
+/// S07 slice 6 (REVIEW #439 residuals 1+2, intended-until-timer contract):
+/// (1) an early yield discards the remainder — `dispatch` rearms to full
+/// `QUANTUM_TICKS` instead of carrying leftover ticks, documented as
+/// intended until per-thread budgets + priorities arrive; (2) an idle or
+/// `NULL`-parked `tick` reports expired (`true`), so the future PIT/APIC
+/// handler MUST NOT re-tick in a tight loop when `current` is `NULL` —
+/// gate the re-tick (only tick when a thread runs) and `dispatch` once on
+/// expiry instead of spinning on `tick() == true`.
 #[derive(Debug, Clone)]
 pub struct Scheduler {
     table: [Option<Thread>; MAX_THREADS],
@@ -254,6 +269,9 @@ impl Scheduler {
     /// countdown (never wraps); idle (`ticks_left == 0`) reports expired
     /// so an un-armed scheduler asks for a dispatch rather than spinning.
     /// Never panics; refusals never reach here (no pick involved).
+    /// Timer-slice rule (slice 6): when `current` is `NULL` (idle) the
+    /// caller must `dispatch` once on `true`, never loop `tick()` — the
+    /// PIT/APIC handler gates the re-tick on a running thread.
     pub fn tick(&mut self) -> bool {
         if self.ticks_left > 0 {
             self.ticks_left -= 1;
@@ -1245,7 +1263,8 @@ mod tests {
         // S07 slice 5: dispatch arms QUANTUM_TICKS; the first QUANTUM-1
         // ticks report not-expired, the last reports expired; the next
         // dispatch rearms. Idle ticks report expired (needs a dispatch).
-        assert_eq!(QUANTUM_TICKS, 4);
+        // Slice 6: loop-driven (no hardcoded tick count) so a quantum
+        // change touches only QUANTUM_TICKS + the ps1 literal.
         let mut idle = Scheduler::new(NULL_THREAD);
         assert_eq!(idle.quantum_left(), 0);
         assert!(idle.tick());
@@ -1256,9 +1275,11 @@ mod tests {
         assert_eq!(s.quantum_left(), 0);
         assert_eq!(s.dispatch(), Ok(2));
         assert_eq!(s.quantum_left(), QUANTUM_TICKS);
-        assert!(!s.tick());
-        assert!(!s.tick());
-        assert!(!s.tick());
+        let mut i = 1u64;
+        while i < QUANTUM_TICKS {
+            assert!(!s.tick());
+            i += 1;
+        }
         assert_eq!(s.quantum_left(), 1);
         assert!(s.tick());
         assert_eq!(s.quantum_left(), 0);

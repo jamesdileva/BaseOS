@@ -1985,7 +1985,8 @@ fn probe_sched_trace_exit<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Resu
 /// dispatch arms `q=QUANTUM_TICKS`, `used` gated ticks consume it,
 /// `expired=1` only when the last tick spent the quantum, and `next` is
 /// the resched dispatch target. `ok` is 1 only on
-/// `q=4 used=4 expired=1 next=3`; failure zeroes all fields so a short
+/// `q=QUANTUM_TICKS used=QUANTUM_TICKS expired=1 next=3` (currently
+/// `q=4 used=4 expired=1 next=3`); failure zeroes all fields so a short
 /// count or a missed resched cannot pass.
 fn write_sched_tick_line<E>(
     ok: bool,
@@ -2015,7 +2016,10 @@ fn write_sched_tick_line<E>(
 /// future timer-IRQ shape (`tick_gated` under the gate, resched on
 /// expiry). Emits the line from the counter values (not the dispatch
 /// returns alone), so e2e proves the tick path live. Ps1 hard-requires
-/// `SCHED-TICK ok=1 q=4 used=4 expired=1 next=3`. Never panics.
+/// `SCHED-TICK ok=1 q=4 used=4 expired=1 next=3` (the `QUANTUM_TICKS=4`
+/// spelling; a quantum change updates this line + ps1 together). Slice 6:
+/// the `ok` gate is const-driven (`used == QUANTUM_TICKS`, no `== 4`
+/// literal). Never panics.
 fn probe_sched_tick<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
     let (a, b, c) = match (
         Thread::new(1, 0x1000_0000, 8192, 0x3001),
@@ -2059,7 +2063,7 @@ fn probe_sched_tick<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<boo
             return Ok(false);
         }
     };
-    let ok = QUANTUM_TICKS == 4 && used == 4 && next == 3 && sched.quantum_left() == QUANTUM_TICKS;
+    let ok = used == QUANTUM_TICKS && next == 3 && sched.quantum_left() == QUANTUM_TICKS;
     if ok {
         write_sched_tick_line::<E>(true, QUANTUM_TICKS, used, true, next, emit)?;
     } else {
@@ -3968,7 +3972,9 @@ mod tests {
     fn sched_tick_probe_shape() {
         // S07 slice 5 quantum-tick shapes: the same `probe_sched_tick`
         // the guest runs must emit exactly
-        // `SCHED-TICK ok=1 q=4 used=4 expired=1 next=3` and true.
+        // `SCHED-TICK ok=1 q=QUANTUM_TICKS used=QUANTUM_TICKS expired=1
+        // next=3` (currently q=4 used=4) and true. Slice 6: const-driven
+        // `format!` so a quantum change touches only QUANTUM_TICKS + ps1.
         let mut out: Vec<u8> = Vec::new();
         let ok = probe_sched_tick::<core::convert::Infallible>(&mut |b| {
             out.push(b);
@@ -3978,7 +3984,10 @@ mod tests {
         assert!(ok);
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "SCHED-TICK ok=1 q=4 used=4 expired=1 next=3\n"
+            format!(
+                "SCHED-TICK ok=1 q={} used={} expired=1 next=3\n",
+                QUANTUM_TICKS, QUANTUM_TICKS
+            )
         );
         let mut out: Vec<u8> = Vec::new();
         write_sched_tick_line::<core::convert::Infallible>(false, 0, 0, false, 0, &mut |b| {
