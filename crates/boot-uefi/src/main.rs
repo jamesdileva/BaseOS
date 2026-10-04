@@ -35,7 +35,7 @@
 #![allow(unsafe_code)]
 
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
-use baseos_kernel::cpu::{cr3_pml4_base, efer_nxe_enabled, read_cr3, read_efer};
+use baseos_kernel::cpu::{cr3_pml4_base, efer_nxe_enabled, read_cr3, read_efer, IrqGuard};
 use baseos_kernel::kernel_entry;
 use baseos_kernel::page_table::{
     guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
@@ -1236,7 +1236,8 @@ fn write_sched_line<E>(
 
 /// Minimal scheduler-driven switch post-`ExitBootServices`: build the same
 /// two descriptors the `THREAD` probe uses, drive the pick through
-/// `Scheduler::dispatch` (not `switch_stub` directly), resolve the live
+/// `Scheduler::dispatch_gated` under `IrqGuard` (`cli` on the guest; not
+/// `switch_stub` directly), resolve the live
 /// `RSP`/`RIP` through `swap_target`, require both picks to agree, run the
 /// triple entry on the target stack, and emit the `SCHED-SWITCH` line.
 /// Fail-closed (`ok=0`) on any spawn/dispatch/triple mismatch — never runs
@@ -1277,7 +1278,9 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
         write_sched_line::<E>(false, 1, 0, emit)?;
         return Ok(false);
     }
-    let next = match sched.dispatch() {
+    // S06 preempt-IRQ gate (task #19): both dispatch picks run under `cli`.
+    let gate = IrqGuard::enter();
+    let next = match sched.dispatch_gated(&gate) {
         Ok(n) => n,
         Err(_) => {
             write_sched_line::<E>(false, 1, 0, emit)?;
@@ -1304,7 +1307,7 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
     };
     run_on_thread_stack(top, func);
     // Persistent-table proof: second hop 2->1 agrees with the B->A triple.
-    let next2 = match sched.dispatch() {
+    let next2 = match sched.dispatch_gated(&gate) {
         Ok(n) => n,
         Err(_) => {
             write_sched_line::<E>(false, 1, next, emit)?;
@@ -1336,7 +1339,9 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
         write_sched_line::<E>(false, 1, 0, emit)?;
         return Ok(false);
     }
-    let next = match sched.dispatch() {
+    // S06 preempt-IRQ gate (task #19, host mirror of the guest `cli` gate).
+    let gate = IrqGuard::enter();
+    let next = match sched.dispatch_gated(&gate) {
         Ok(n) => n,
         Err(_) => {
             write_sched_line::<E>(false, 1, 0, emit)?;
@@ -1355,7 +1360,7 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
         return Ok(false);
     }
     // Persistent-table proof (slice19): second hop 2->1, same as guest.
-    let next2 = match sched.dispatch() {
+    let next2 = match sched.dispatch_gated(&gate) {
         Ok(n) => n,
         Err(_) => {
             write_sched_line::<E>(false, 1, next, emit)?;
@@ -1428,6 +1433,11 @@ fn write_thread_jump_chain_line<E>(
 /// `check_jump_entry` AND `!jump_rsp_refuses` AND the triple entry equals
 /// the expected hop address, and returns the `(top, func)` to jump with.
 /// Any refusal returns `None` with no register or stack touch.
+///
+/// S06 preempt-IRQ gate (task #19): the pick-then-`dispatch_gated` runs
+/// under `&IrqGuard` (`cli` on the guest), so a timer IRQ cannot land
+/// between the pre-check pick and the dispatch mark and double-dispatch
+/// the same target.
 fn chain_leg(
     sched: &mut Scheduler,
     a0: Thread,
@@ -1435,6 +1445,7 @@ fn chain_leg(
     c0: Thread,
     leg: u64,
     want_entry: u64,
+    gate: &IrqGuard,
 ) -> Option<(u64, extern "C" fn())> {
     let expect = if leg == 3 { 1 } else { leg + 1 };
     if sched.current() != leg {
@@ -1463,7 +1474,7 @@ fn chain_leg(
         return None;
     }
     let func = entry_as_func(entry)?;
-    if sched.dispatch() != Ok(expect) {
+    if sched.dispatch_gated(gate) != Ok(expect) {
         return None;
     }
     Some((top, func))
@@ -1565,7 +1576,8 @@ unsafe fn chain_cursor_leg(leg: u64) -> Option<(u64, extern "C" fn())> {
         hop2
     };
     let cursor = core::ptr::addr_of_mut!(CHAIN_CURSOR);
-    let out = chain_leg(&mut *cursor, a0, b0, c0, leg, want)?;
+    let gate = IrqGuard::enter();
+    let out = chain_leg(&mut *cursor, a0, b0, c0, leg, want, &gate)?;
     core::ptr::addr_of_mut!(CHAIN_CURSOR_LEGS)
         .write(core::ptr::addr_of!(CHAIN_CURSOR_LEGS).read() + 1);
     Some(out)
@@ -1648,12 +1660,15 @@ fn probe_sched_join_exit<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Resul
         write_sched_join_line::<E>(false, 0, emit)?;
         return Ok(false);
     }
-    if sched.dispatch() != Ok(2) {
+    // S06 preempt-IRQ gate (task #19): the dispatch + exit picks run under
+    // `cli` (guest) via the guard token — same pick, proven masked.
+    let gate = unsafe { IrqGuard::enter() };
+    if sched.dispatch_gated(&gate) != Ok(2) {
         write_sched_exit_line::<E>(false, 0, 0, emit)?;
         write_sched_join_line::<E>(false, 0, emit)?;
         return Ok(false);
     }
-    let resumed = match sched.exit_current() {
+    let resumed = match sched.exit_current_gated(&gate) {
         Ok(n) => n,
         Err(_) => {
             write_sched_exit_line::<E>(false, 0, 0, emit)?;
@@ -1688,10 +1703,8 @@ fn probe_sched_join_exit<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Resul
 /// stacks plus the cursor statics, `cli` in effect, COM1 exclusive.
 #[cfg(not(test))]
 unsafe fn chain_resolve_and_jump(from: u64) -> bool {
-    if from == 1 && !core::ptr::addr_of!(CHAIN_CURSOR_SEEDED).read() {
-        if !chain_cursor_seed() {
-            return false;
-        }
+    if from == 1 && !core::ptr::addr_of!(CHAIN_CURSOR_SEEDED).read() && !chain_cursor_seed() {
+        return false;
     }
     match chain_cursor_leg(from) {
         Some((top, func)) => jump_to_thread_stack(top, func),
@@ -1846,7 +1859,8 @@ unsafe fn probe_thread_jump_chain<E>(
         } else {
             0x3002
         };
-        if chain_leg(&mut sched, a, b, c, leg, want).is_none() {
+        let gate = IrqGuard::enter();
+        if chain_leg(&mut sched, a, b, c, leg, want, &gate).is_none() {
             write_thread_jump_chain_line::<E>(false, emit)?;
             return Ok(false);
         }
@@ -3301,7 +3315,10 @@ mod tests {
         assert!(sched.spawn(b));
         assert!(sched.spawn(c));
         // Order disproof: current is 1, leg 2 must refuse.
-        assert!(chain_leg(&mut sched, a, b, c, 2, 0x3003).is_none());
+        // S06 preempt-IRQ gate (task #19): host holds the same guard token
+        // the guest `cli` provides, so the gated legs run the gated path.
+        let gate = unsafe { IrqGuard::enter() };
+        assert!(chain_leg(&mut sched, a, b, c, 2, 0x3003, &gate).is_none());
         assert_eq!(sched.current(), 1);
         // RSP disproof per leg: resolve the good leg, then corrupt its top.
         for leg in [1u64, 2, 3] {
@@ -3337,7 +3354,7 @@ mod tests {
                 "leg {leg} corrupt RSP must refuse"
             );
             assert_eq!(id, if leg == 3 { 1 } else { leg + 1 });
-            assert!(chain_leg(&mut sched, a, b, c, leg, want).is_some());
+            assert!(chain_leg(&mut sched, a, b, c, leg, want, &gate).is_some());
         }
         assert_eq!(sched.current(), 1);
     }
@@ -3361,7 +3378,9 @@ mod tests {
         assert!(!sched.spawn(a));
         assert_eq!(sched.len(), 3);
         // Wrong-leg refuses with no advance.
-        assert!(chain_leg(&mut sched, a, b, c, 2, 0x3003).is_none());
+        // S06 preempt-IRQ gate (task #19): same guard token as above.
+        let gate = unsafe { IrqGuard::enter() };
+        assert!(chain_leg(&mut sched, a, b, c, 2, 0x3003, &gate).is_none());
         assert_eq!(sched.current(), 1);
         // Carried legs: same table advances 1->2->3->1.
         let mut legs = 0u64;
@@ -3373,7 +3392,7 @@ mod tests {
             } else {
                 0x3002
             };
-            assert!(chain_leg(&mut sched, a, b, c, leg, want).is_some());
+            assert!(chain_leg(&mut sched, a, b, c, leg, want, &gate).is_some());
             legs += 1;
         }
         assert_eq!(legs, 3);

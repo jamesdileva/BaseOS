@@ -173,6 +173,74 @@ pub const fn efer_nxe_enabled(efer: u64) -> bool {
     super::page_table::efer_nxe_enabled(efer)
 }
 
+/// Mask maskable interrupts on the boot CPU (`cli`, S06 preempt-IRQ gate).
+///
+/// Guest-only contract: post-`ExitBootServices`, CPL0 boot/exception path.
+/// `cli` clears IF (hence NO `preserves_flags` on the asm — same rule as the
+/// `efi_main` cli site). Host builds are a no-op stub (the harness must
+/// never execute `cli`).
+///
+/// # Safety
+/// Same contract as [`read_cr3`]: boot CPU only, post-EBS. Callers that need
+/// a scoped critical section should use [`IrqGuard`] instead of raw `cli`.
+#[cfg(not(test))]
+pub unsafe fn cli() {
+    core::arch::asm!("cli", options(nomem, nostack));
+}
+
+/// Host-test stub: no-op (never touches flags).
+///
+/// # Safety
+/// Host `cargo test` only: no-op.
+#[cfg(test)]
+pub unsafe fn cli() {}
+
+/// Preempt-IRQ gate token (S06 slice28 / task #19): proves the holder runs
+/// with maskable IRQs masked (`cli` in effect) across a scheduler
+/// pick-then-mark critical section (`dispatch` / `exit_current` pick the next
+/// `Ready` thread and flip states — two preempted picks without a gate can
+/// both observe the same `Ready` target and double-dispatch it).
+///
+/// Zero-cost proof token on ALL builds (host and guest): constructing it
+/// executes NO `cli` itself. The live `cli` is established ONCE in
+/// `efi_main` post-EBS (the pre-existing `asm!("cli")` site, still the only
+/// `cli` in the tree); every gated scheduler site runs downstream of it on
+/// the single-threaded boot thread, so holding the token means holding that
+/// critical section. (A token that re-executed `cli` per dispatch would
+/// fault host `cargo test`: `boot-uefi` links `baseos_kernel` as a
+/// dependency, so the dependency's `cfg(test)` no-op never applies there —
+/// the same reason the live-swap stubs stay guest-only. The token must be
+/// asm-free to keep host and guest call sites identical.)
+///
+/// `Drop` is a no-op (never `sti`: post-EBS bring-up has no IRQ handler for
+/// vectors 32+ yet — enabling interrupts here would fault into an unwired
+/// IDT. A future timer slice adds the paired `sti` with the handler wired
+/// first).
+///
+/// Contract: create the guard BEFORE the pick and hold the `&` across the
+/// whole pick + state-mark (`Scheduler::dispatch_gated` /
+/// `exit_current_gated` take `&IrqGuard`, so an ungated call site fails to
+/// compile where the gated path is required).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrqGuard {
+    _private: (),
+}
+
+impl IrqGuard {
+    /// Enter the IRQ-masked critical section: proof token only (no asm on
+    /// any build — see the type docs for why the live `cli` stays in
+    /// `efi_main` instead of here).
+    ///
+    /// # Safety
+    /// Same contract as [`cli`]: boot CPU only, post-EBS on the
+    /// single-threaded boot/exception path with `cli` already in effect
+    /// (established by `efi_main`). Host `cargo test` never executes
+    /// privileged instructions through this token.
+    #[must_use]
+    pub unsafe fn enter() -> Self {
+        Self { _private: () }
+    }
+}
 /// Read the live `CR3` (PML4 base + flags) on the boot CPU (S05 slice 6).
 ///
 /// Moved from `boot-uefi` (D7) so the privileged register read lives
@@ -355,5 +423,22 @@ mod tests {
         let cr3: unsafe fn() -> u64 = read_cr3;
         let efer: unsafe fn() -> u64 = read_efer;
         let _ = (cr3, efer);
+    }
+
+    #[test]
+    fn irq_gate_is_unsafe_enter_and_host_noop() {
+        // S06 preempt-IRQ gate (task #19): `cli` + `IrqGuard::enter` must
+        // stay `unsafe fn` (privileged `cli` on the guest) — bind to the
+        // `unsafe fn` type so a safe-ified signature fails to coerce.
+        // `enter` is a pure token on every build (no asm — the live `cli`
+        // stays once in `efi_main`), so constructing it on the host never
+        // touches flags; the guest runs it downstream of `cli`.
+        let cli_fn: unsafe fn() = cli;
+        let enter: unsafe fn() -> IrqGuard = IrqGuard::enter;
+        let _ = (cli_fn, enter);
+        let gate = unsafe { IrqGuard::enter() };
+        let gate2 = gate;
+        assert_eq!(gate, gate2, "guard is a Copy token on the host");
+        unsafe { cli() };
     }
 }

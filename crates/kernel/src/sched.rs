@@ -26,17 +26,23 @@
 //! mutex stays coop-only fail-closed and guest mutex use is out-of-scope
 //! this slice.
 //!
-//! Preemption TOCTOU (documented-not-tested, S06 slice18): `pick_next` and
+//! Preemption TOCTOU (S06 slice18 doc, slice28 gate): `pick_next` and
 //! `dispatch` read-then-write the table through `&mut self` with no
-//! atomic CAS and no `cli` gate inside this type — the caller must hold
-//! the critical section (post-EBS `cli` single-thread today, a future
-//! atomic/IRQ gate under preemption). Two preempted `dispatch` calls can
-//! both pick the same `Ready` target and both mark it `Running`
-//! (lost-wake/double-dispatch); the coop `ThreadMutex` `Cell` has the same
-//! class (get-then-set double-take). No host test can prove an interrupt
-//! race — the pin is this doc plus the `&mut self` shape (no shared
-//! `Cell`/interior mutability to misuse).
+//! atomic CAS — the caller must hold the [`crate::cpu::IrqGuard`] critical
+//! section across the whole pick + state-mark (the live `cli` is
+//! established once in `efi_main` post-EBS; the guard token proves the call
+//! site runs downstream of it on the single-threaded boot thread).
+//! [`Scheduler::dispatch_gated`] /
+//! [`Scheduler::exit_current_gated`] take `&IrqGuard`, so a gated call site
+//! fails to compile without the guard. Two preempted ungated `dispatch`
+//! calls can both pick the same `Ready` target and both mark it `Running`
+//! (lost-wake/double-dispatch — pinned by the `gated_dispatch_models_race`
+//! test as a cloned-state model, since no host test can fire a real IRQ);
+//! the coop `ThreadMutex` `Cell` has the same class (get-then-set
+//! double-take). Post-EBS `cli` single-thread holds the gate today; a timer
+//! IRQ calls the same gated pick under the gate tomorrow.
 
+use crate::cpu::IrqGuard;
 use crate::thread::{validate_threads, SwitchError, Thread, ThreadState, MAX_THREADS, NULL_THREAD};
 
 /// Cooperative scheduler: owns up to `MAX_THREADS` descriptors plus the
@@ -203,6 +209,17 @@ impl Scheduler {
         Ok(next)
     }
 
+    /// IRQ-gated dispatch (S06 preempt-IRQ gate, task #19): identical
+    /// pick-then-mark to [`Scheduler::dispatch`], but the caller proves the
+    /// `cli` critical section by holding `&IrqGuard` across the whole
+    /// pick + state-mark. A timer IRQ firing between `pick_next` and the
+    /// `Ready`→`Running` mark would otherwise double-dispatch the same
+    /// target; the guard makes the ungated call site a compile error where
+    /// the gated path is required (guest `chain_leg`, join/exit probe).
+    pub fn dispatch_gated(&mut self, _gate: &IrqGuard) -> Result<u64, SwitchError> {
+        self.dispatch()
+    }
+
     /// Mark `id` observed-finished (S06 slice27 join): read-only query,
     /// `true` iff the spawned thread is `Done`. The guest joiner spins or
     /// parks on this; the exiting thread reaches `Done` via
@@ -265,6 +282,15 @@ impl Scheduler {
                 Err(e)
             }
         }
+    }
+
+    /// IRQ-gated exit (S06 preempt-IRQ gate, task #19): identical
+    /// mark-`Done`-then-pick to [`Scheduler::exit_current`], with the same
+    /// `&IrqGuard` proof as [`Scheduler::dispatch_gated`] — the exit pick
+    /// is the same preempt point (a timer IRQ calls this same pick under
+    /// the gate instead of the coop caller).
+    pub fn exit_current_gated(&mut self, _gate: &IrqGuard) -> Result<u64, SwitchError> {
+        self.exit_current()
     }
 }
 
@@ -556,6 +582,76 @@ mod tests {
 
     /// Strip `/* ... */` (nested), `//` line comments, and blank string/char
     /// literal contents so the no-`Cell` pin below scans CODE only.
+    ///
+    #[test]
+    fn gated_dispatch_and_exit_agree_with_ungated() {
+        // S06 preempt-IRQ gate (task #19): gated wrappers must behave
+        // exactly like the ungated primitives on success and on every
+        // refusal (the gate adds IRQ masking, never new pick logic).
+        // Success path: 1->2->3 rotation with states.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut g = Scheduler::new(1);
+        assert!(g.spawn(mk(1, 0x1000_0000)));
+        assert!(g.spawn(mk(2, 0x2000_0000)));
+        assert!(g.spawn(mk(3, 0x3000_0000)));
+        let mut u = Scheduler::new(1);
+        assert!(u.spawn(mk(1, 0x1000_0000)));
+        assert!(u.spawn(mk(2, 0x2000_0000)));
+        assert!(u.spawn(mk(3, 0x3000_0000)));
+        for expect in [2u64, 3, 1] {
+            assert_eq!(g.dispatch_gated(&gate), Ok(expect));
+            assert_eq!(u.dispatch(), Ok(expect));
+            assert_eq!(g.current(), u.current());
+            assert_eq!(g.state_of(expect), u.state_of(expect));
+        }
+        // Exit path: gated exit marks Done, resumes next, join observes.
+        assert_eq!(g.exit_current_gated(&gate), Ok(2));
+        assert_eq!(u.exit_current(), Ok(2));
+        assert_eq!(g.current(), u.current());
+        assert_eq!(g.state_of(1), u.state_of(1));
+        assert!(g.join(1));
+        assert!(u.join(1));
+        // Refusal parity: unknown current refuses both with no mutation.
+        let mut gu = Scheduler::new(99);
+        assert!(gu.spawn(mk(1, 0x1000_0000)));
+        let mut uu = Scheduler::new(99);
+        assert!(uu.spawn(mk(1, 0x1000_0000)));
+        assert_eq!(gu.dispatch_gated(&gate), Err(SwitchError::Unknown));
+        assert_eq!(uu.dispatch(), Err(SwitchError::Unknown));
+        assert_eq!(gu.current(), uu.current());
+        assert_eq!(gu.exit_current_gated(&gate), Err(SwitchError::Unknown));
+        assert_eq!(uu.exit_current(), Err(SwitchError::Unknown));
+        assert!(!gu.join(1));
+        assert!(!uu.join(1));
+    }
+
+    #[test]
+    fn gated_dispatch_models_preempt_race_as_serialized() {
+        // S06 preempt-IRQ gate race model (task #19 cheapest disproof):
+        // no host test can fire a real IRQ, so pin the RACE CLASS on
+        // cloned states — two schedulers cloned BEFORE either dispatches
+        // (an IRQ landing between pick and mark) both pick the same next
+        // id, proving an ungated preempt double-dispatches. Sequential
+        // gated dispatches on ONE table (the `cli` critical section the
+        // guest holds) advance 1->2 then 2->3 and never repeat the target.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut base = Scheduler::new(1);
+        assert!(base.spawn(mk(1, 0x1000_0000)));
+        assert!(base.spawn(mk(2, 0x2000_0000)));
+        assert!(base.spawn(mk(3, 0x3000_0000)));
+        // Preempt model: clone before either marks — both pick 2.
+        let racer_a = base.clone();
+        let racer_b = base.clone();
+        assert_eq!(racer_a.pick_next(), Ok(2));
+        assert_eq!(racer_b.pick_next(), Ok(2));
+        // Gated reality: one table, sequential critical sections.
+        assert_eq!(base.dispatch_gated(&gate), Ok(2));
+        assert_eq!(base.current(), 2);
+        assert_eq!(base.state_of(2), Some(ThreadState::Running));
+        assert_eq!(base.dispatch_gated(&gate), Ok(3));
+        assert_eq!(base.current(), 3);
+        assert_ne!(base.current(), 2);
+    }
     ///
     /// S06 slice 17 (REVIEW #325 gate 1): the slice-16 strip was
     /// block-only, non-nesting, and string-blind — a `"` inside a block
