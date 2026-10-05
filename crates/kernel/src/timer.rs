@@ -6,8 +6,9 @@
 //! returning IRQ0 stub (with EOI + `iretq`) first.
 //!
 //! Contracts pinned here:
-//! - `PIT_BASE_HZ = 1_193_182`, [`pit_divisor`] (integer division, `0` Hz
-//!   fails closed to `0`), [`TIMER_HZ = 100`] + [`TIMER_DIVISOR`].
+//! - `PIT_BASE_HZ = 1_193_182`, [`pit_divisor`] (integer division, fails
+//!   closed to `0` on `hz == 0`, quotient `0`, or quotient `> 0xFFFF`),
+//!   [`TIMER_HZ = 100`] + [`TIMER_DIVISOR`].
 //! - PIC remap bases `PICM_OFFSET = 0x20` / `PICS_OFFSET = 0x28`, so IRQ0
 //!   lands on [`VECTOR_TIMER = 32`] (first maskable vector past the 32
 //!   exception vectors).
@@ -41,15 +42,22 @@ pub const PIT_CMD: u16 = 0x43;
 /// PIT mode byte for channel 0, lobyte/hibyte, mode 3 square-wave.
 pub const PIT_MODE_CH0_SQUARE: u8 = 0x36;
 
-/// Integer PIT divisor for `hz` (`PIT_BASE_HZ / hz`); `0` Hz fails closed
-/// to `0` (caller must refuse a zero divisor — programming it latches
-/// `0x0000` = 65536, not "stop").
+/// Integer PIT divisor for `hz` (`PIT_BASE_HZ / hz`); fails closed to `0`
+/// when the quotient is not programmable: `hz == 0`, quotient `0`
+/// (`hz > PIT_BASE_HZ`), or quotient `> 0xFFFF` (e.g. `hz == 1` gives
+/// 1193182, which must NOT silently truncate to 13534 via `as u16`).
+/// Caller must refuse a zero divisor — programming it latches
+/// `0x0000` = 65536, not "stop".
 #[must_use]
 pub const fn pit_divisor(hz: u32) -> u16 {
     if hz == 0 {
         return 0;
     }
-    (PIT_BASE_HZ / hz) as u16
+    let q = PIT_BASE_HZ / hz;
+    if q == 0 || q > 0xFFFF {
+        return 0;
+    }
+    q as u16
 }
 
 /// Divisor for [`TIMER_HZ`] (1193182 / 100 = 11931).
@@ -57,6 +65,14 @@ pub const TIMER_DIVISOR: u16 = pit_divisor(TIMER_HZ);
 
 /// Saturating HW-tick counter: the future IRQ0 handler calls [`tick`]
 /// once per interrupt; the scheduler drain calls [`take`].
+///
+/// Concurrency gate (REVIEW #442 risk 2): this counter is plain `u64`,
+/// NOT atomic. Until the wiring slice lands, all uses are host-only
+/// single-threaded tests. Once real IRQ0 lands, `tick()` (IRQ context)
+/// vs `take()` (drain context) race and `take()` loses ticks unless the
+/// wiring slice EITHER switches to `AtomicU64` OR gates both sides in a
+/// `cli`-held critical section. The wiring slice MUST NOT program the
+/// PIT/enable IRQ0 until one of those gates is in place.
 ///
 /// [`tick`]: TimerTicks::tick
 /// [`take`]: TimerTicks::take
@@ -84,7 +100,7 @@ impl TimerTicks {
     }
 
     /// Drain pending ticks (returns count, resets to 0).
-    pub fn take(&mut self) -> u64 {
+    pub const fn take(&mut self) -> u64 {
         let n = self.pending;
         self.pending = 0;
         n
@@ -107,6 +123,19 @@ mod tests {
     #[test]
     fn pit_divisor_zero_hz_fails_closed() {
         assert_eq!(pit_divisor(0), 0);
+    }
+
+    #[test]
+    fn pit_divisor_overflow_fails_closed() {
+        // REVIEW #442 risk 1: quotient > u16::MAX must fail closed to 0,
+        // never silently truncate via `as u16` (hz=1 gave 13534 before).
+        assert_eq!(pit_divisor(1), 0);
+        assert_eq!(pit_divisor(2), 0);
+        assert_eq!(pit_divisor(18), 0); // 1193182/18 = 66287 > 65535
+        assert_eq!(pit_divisor(19), 62799); // largest hz still programmable below 18
+        assert_eq!(pit_divisor(20), 59659);
+        assert_eq!(pit_divisor(1193182), 1);
+        assert_eq!(pit_divisor(2_000_000), 0); // quotient 0 also fails closed
     }
 
     #[test]
