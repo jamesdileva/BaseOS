@@ -99,6 +99,15 @@ pub const fn pit_program_bytes(divisor: u16) -> Option<(u8, u8)> {
 /// String-only this slice — no `global_asm!` wiring, no IDT extend, guest
 /// keeps `cli`, so QEMU behavior is unchanged. Host tests pin the shape so
 /// the wiring slice cannot silently drop the EOI or the return.
+///
+/// REVIEW #446 R1 (returning-IRQ frame): unlike `#DE`/`#PF` (never return),
+/// IRQ0 MUST return via `iretq`, so the stub MUST NOT use the destructive
+/// `and rsp, -16` (loses the entry RSP, `iretq` pops the wrong frame ->
+/// triple fault) and MUST preserve caller state. Entry pushes the 7
+/// Win64-volatile regs (`rax rcx rdx r8-r11`), then `sub rsp, 32` only
+/// (no `and`), so `add rsp, 32` + pops restore the exact entry frame.
+/// EOI runs BEFORE the pops (while the saved `rax` still sits on the
+/// stack), so `mov al, 0x20` cannot clobber the caller's `rax`.
 //
 // NOTE: `unused_macros` until the wiring slice consumes this via
 // `global_asm!` (same pattern as the `#DE`/`#PF` stubs, which are consumed
@@ -109,11 +118,25 @@ macro_rules! timer_isr_stub_asm {
         r#"
     .global baseos_isr_timer
     baseos_isr_timer:
-        and rsp, -16
+        push rax
+        push rcx
+        push rdx
+        push r8
+        push r9
+        push r10
+        push r11
         sub rsp, 32
         call timer_irq_rust
+        add rsp, 32
         mov al, 0x20
         out 0x20, al
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rdx
+        pop rcx
+        pop rax
         iretq
     "#
     };
@@ -286,18 +309,33 @@ mod tests {
         // before `call`): the wiring slice must not drop the EOI or the
         // return (a parking stub would hang the timer; a missing EOI
         // would wedge IRQ0 after the first tick).
+        // REVIEW #446 R1: returning-IRQ frame — the stub MUST save/restore
+        // the Win64-volatiles and MUST NOT use destructive `and rsp, -16`
+        // (loses entry RSP, `iretq` pops the wrong frame -> triple fault
+        // on the first tick); EOI must precede the pops so `mov al`
+        // cannot clobber the caller's restored rax.
         let stub = timer_stub_text();
         assert!(
             stub.contains("baseos_isr_timer"),
             "stub must define the timer entry: {stub}"
         );
         assert!(
-            stub.contains("and rsp, -16"),
-            "RSP must be 16-byte aligned before call: {stub}"
+            !stub.contains("and rsp"),
+            "returning IRQ stub must not destroy RSP with and: {stub}"
         );
+        for reg in ["push rax", "push rcx", "push rdx", "push r8", "push r9"] {
+            assert!(stub.contains(reg), "stub must save {reg}: {stub}");
+        }
+        for reg in ["pop rdx", "pop rcx", "pop rax", "pop r8", "pop r9"] {
+            assert!(stub.contains(reg), "stub must restore {reg}: {stub}");
+        }
         assert!(
             stub.contains("sub rsp, 32"),
             "32-byte shadow space required by Win64 ABI: {stub}"
+        );
+        assert!(
+            stub.contains("add rsp, 32"),
+            "shadow space must be released before iretq: {stub}"
         );
         assert!(
             stub.contains("call timer_irq_rust"),
@@ -307,6 +345,13 @@ mod tests {
             stub.contains("out 0x20, al"),
             "stub must EOI the master PIC: {stub}"
         );
+        // EOI (clobbers al) must precede the rax restore.
+        let eoi = stub.find("out 0x20, al").unwrap();
+        let pop_rax = stub.find("pop rax").unwrap();
+        assert!(eoi < pop_rax, "EOI must run before the rax restore: {stub}");
+        let call = stub.find("call timer_irq_rust").unwrap();
+        let add = stub.find("add rsp, 32").unwrap();
+        assert!(call < add && add < eoi, "call/add/EOI order: {stub}");
         assert!(
             stub.contains("iretq"),
             "returning stub must iretq, never park: {stub}"

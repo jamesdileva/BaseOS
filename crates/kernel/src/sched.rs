@@ -290,8 +290,7 @@ impl Scheduler {
     }
 
     /// Drain HW ticks into the quantum (S07 slice 8 wiring-prep): takes the
-    /// pending [`TimerTicks`] count under the `IrqGuard` gate, feeds
-    /// [`Scheduler::tick_gated`] once per HW tick, and reports
+    /// pending [`TimerTicks`] count under the `IrqGuard` gate and reports
     /// `(drained, expired)` — `expired` means the caller should
     /// [`Scheduler::dispatch_gated`] ONCE, never loop `tick()` (slice 6
     /// timer rule: an idle/`NULL`-parked `tick()` reports expired, so a
@@ -300,22 +299,20 @@ impl Scheduler {
     ///
     /// Empty drain (`drained == 0`) reports `expired == false` (nothing to
     /// do) — distinct from a bare `tick()` on an idle scheduler, which
-    /// reports `true`. Saturating: a huge HW backlog (up to `u64::MAX`)
-    /// counts down one `tick_gated` per tick with no wrap; the quantum
-    /// floor holds at 0 either way, so at most one dispatch is owed.
+    /// reports `true`. Saturating bulk accounting, O(1) in the backlog:
+    /// REVIEW #446 R2 — the slice-8 `while i < drained` loop hung the
+    /// handler in O(n) on a `cli`-held flood backlog (drained up to
+    /// `u64::MAX`); with `QUANTUM_TICKS` the result only needs
+    /// `ticks_left.saturating_sub(drained)` plus
+    /// `expired = ticks_left == 0`, so at most one dispatch is owed no
+    /// matter how large the backlog.
     pub fn drain_timer(&mut self, ticks: &mut TimerTicks, gate: &IrqGuard) -> (u64, bool) {
         let drained = ticks.take_gated(gate);
         if drained == 0 {
             return (0, false);
         }
-        let mut expired = false;
-        let mut i = 0;
-        while i < drained {
-            if self.tick_gated(gate) {
-                expired = true;
-            }
-            i += 1;
-        }
+        self.ticks_left = self.ticks_left.saturating_sub(drained);
+        let expired = self.ticks_left == 0;
         (drained, expired)
     }
 
@@ -1419,6 +1416,27 @@ mod tests {
         let mut hw = TimerTicks::new();
         assert_eq!(s.drain_timer(&mut hw, &gate), (0, false));
         assert_eq!(s.quantum_left(), 0);
+    }
+
+    #[test]
+    fn drain_timer_flood_backlog_is_bulk_accounted() {
+        // REVIEW #446 R2: a `cli`-held flood backlog must not hang the
+        // handler in O(n) — bulk `saturating_sub` floors the quantum at 0
+        // with exactly one dispatch owed, however large the backlog.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert_eq!(s.dispatch_gated(&gate), Ok(2));
+        let mut flood = TimerTicks::new();
+        let mut i = 0u64;
+        while i < 100_000 {
+            flood.tick();
+            i += 1;
+        }
+        assert_eq!(s.drain_timer(&mut flood, &gate), (100_000, true));
+        assert_eq!(s.quantum_left(), 0);
+        assert_eq!(flood.pending(), 0);
     }
 
     #[test]
