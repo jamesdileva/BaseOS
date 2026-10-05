@@ -20,6 +20,8 @@
 //!
 //! Failure model: all pure, never panics, `core`-only.
 
+use crate::cpu::IrqGuard;
+
 /// PIT input clock (Intel 8254, 1.193182 MHz).
 pub const PIT_BASE_HZ: u32 = 1_193_182;
 
@@ -42,6 +44,17 @@ pub const PIT_CMD: u16 = 0x43;
 /// PIT mode byte for channel 0, lobyte/hibyte, mode 3 square-wave.
 pub const PIT_MODE_CH0_SQUARE: u8 = 0x36;
 
+/// PIC master command port (EOI target for IRQ0; IRQ0 is master-only).
+pub const PICM_CMD: u16 = 0x20;
+/// PIC master data port (remap/programming path, wiring slice).
+pub const PICM_DATA: u16 = 0x21;
+/// PIC slave command port (remap-programming path only; IRQ0 needs no slave EOI).
+pub const PICS_CMD: u16 = 0xA0;
+/// PIC slave data port (remap-programming path only).
+pub const PICS_DATA: u16 = 0xA1;
+/// PIC end-of-interrupt byte (master; IRQ0 handler issues exactly one).
+pub const PIC_EOI: u8 = 0x20;
+
 /// Integer PIT divisor for `hz` (`PIT_BASE_HZ / hz`); fails closed to `0`
 /// when the quotient is not programmable: `hz == 0`, quotient `0`
 /// (`hz > PIT_BASE_HZ`), or quotient `> 0xFFFF` (e.g. `hz == 1` gives
@@ -62,6 +75,56 @@ pub const fn pit_divisor(hz: u32) -> u16 {
 
 /// Divisor for [`TIMER_HZ`] (1193182 / 100 = 11931).
 pub const TIMER_DIVISOR: u16 = pit_divisor(TIMER_HZ);
+
+/// Split a programmable divisor into the `(lobyte, hibyte)` pair the wiring
+/// slice writes to [`PIT_CH0`] after [`PIT_MODE_CH0_SQUARE`] goes to
+/// [`PIT_CMD`]. Fails closed to `None` on `0` — the caller MUST refuse it:
+///
+/// programming `0x0000` latches 65536, not "stop" (same rule as
+/// [`pit_divisor`]'s fail-closed `0`). Pure `core`-only; the actual `outb`
+/// sequence rides with the guest wiring slice (still `cli` until the IRQ0
+/// stub + EOI + `iretq` land first).
+#[must_use]
+pub const fn pit_program_bytes(divisor: u16) -> Option<(u8, u8)> {
+    if divisor == 0 {
+        return None;
+    }
+    Some((divisor as u8, (divisor >> 8) as u8))
+}
+
+/// Shared IRQ0 ISR stub source (AT&T). Same Win64-ABI contract as the
+/// `#DE`/`#PF` stubs in the parent (`RCX` first arg, 32-byte shadow space,
+/// `RSP` 16-byte aligned before `call`): the handler body is a future
+/// `timer_irq_rust` (tick + single master EOI + `iretq`, never a park).
+/// String-only this slice — no `global_asm!` wiring, no IDT extend, guest
+/// keeps `cli`, so QEMU behavior is unchanged. Host tests pin the shape so
+/// the wiring slice cannot silently drop the EOI or the return.
+//
+// NOTE: `unused_macros` until the wiring slice consumes this via
+// `global_asm!` (same pattern as the `#DE`/`#PF` stubs, which are consumed
+// in the parent). Host tests reach the text through `timer_stub_text`.
+#[allow(unused_macros)]
+macro_rules! timer_isr_stub_asm {
+    () => {
+        r#"
+    .global baseos_isr_timer
+    baseos_isr_timer:
+        and rsp, -16
+        sub rsp, 32
+        call timer_irq_rust
+        mov al, 0x20
+        out 0x20, al
+        iretq
+    "#
+    };
+}
+
+/// Re-export the stub text for host tests (`macro_rules!` is textual scope;
+/// this `const fn` gives tests a plain `&str` without exporting the macro).
+#[cfg(test)]
+pub(crate) const fn timer_stub_text() -> &'static str {
+    timer_isr_stub_asm!()
+}
 
 /// Saturating HW-tick counter: the future IRQ0 handler calls [`tick`]
 /// once per interrupt; the scheduler drain calls [`take`].
@@ -104,6 +167,15 @@ impl TimerTicks {
         let n = self.pending;
         self.pending = 0;
         n
+    }
+
+    /// IRQ-gated drain: identical to [`TimerTicks::take`], but the caller
+    /// proves the `cli` critical section with `&IrqGuard`. Raw `take()` is
+    /// host-only single-threaded; once real IRQ0 lands, `tick()` (IRQ
+    /// context) vs drain (task context) race without the gate. The wiring
+    /// slice MUST NOT program the PIT/enable IRQ0 until both sides hold it.
+    pub fn take_gated(&mut self, _gate: &IrqGuard) -> u64 {
+        self.take()
     }
 }
 
@@ -165,5 +237,79 @@ mod tests {
         t.tick();
         t.tick();
         assert_eq!(t.pending(), u64::MAX);
+    }
+
+    #[test]
+    fn pit_program_bytes_refuses_zero_and_splits_little_endian() {
+        // REVIEW #444 residual: no caller enforced the zero-divisor refusal
+        // (0x0000 latches 65536, not "stop"). The wiring slice must route
+        // through this helper so a 0 can never reach the port.
+        assert_eq!(pit_program_bytes(0), None);
+        assert_eq!(pit_program_bytes(pit_divisor(0)), None);
+        assert_eq!(pit_program_bytes(pit_divisor(1)), None);
+        assert_eq!(pit_program_bytes(TIMER_DIVISOR), Some((0x9B, 0x2E)));
+        assert_eq!(TIMER_DIVISOR, 11931);
+        assert_eq!(pit_program_bytes(1), Some((1, 0)));
+        assert_eq!(pit_program_bytes(0xFFFF), Some((0xFF, 0xFF)));
+    }
+
+    #[test]
+    fn take_gated_agrees_with_take() {
+        // Gated drain adds the IrqGuard proof, never new drain logic.
+        let gate = unsafe { IrqGuard::enter() };
+        let mut g = TimerTicks::new();
+        let mut u = TimerTicks::new();
+        for _ in 0..3 {
+            g.tick();
+            u.tick();
+        }
+        assert_eq!(g.take_gated(&gate), u.take());
+        assert_eq!(g.pending(), u.pending());
+        assert_eq!(g.take_gated(&gate), 0);
+    }
+
+    #[test]
+    fn pic_eoi_ports_pinned_for_irq0() {
+        // IRQ0 is master-only: exactly one EOI byte to the master command
+        // port. Slave ports are remap-path only this slice.
+        assert_eq!(PICM_CMD, 0x20);
+        assert_eq!(PICM_DATA, 0x21);
+        assert_eq!(PICS_CMD, 0xA0);
+        assert_eq!(PICS_DATA, 0xA1);
+        assert_eq!(PIC_EOI, 0x20);
+    }
+
+    #[test]
+    fn timer_isr_stub_pins_win64_eoi_iretq() {
+        // Same Win64-ABI contract as the #DE/#PF stubs (RCX-first-arg
+        // calling convention needs aligned RSP + 32-byte shadow space
+        // before `call`): the wiring slice must not drop the EOI or the
+        // return (a parking stub would hang the timer; a missing EOI
+        // would wedge IRQ0 after the first tick).
+        let stub = timer_stub_text();
+        assert!(
+            stub.contains("baseos_isr_timer"),
+            "stub must define the timer entry: {stub}"
+        );
+        assert!(
+            stub.contains("and rsp, -16"),
+            "RSP must be 16-byte aligned before call: {stub}"
+        );
+        assert!(
+            stub.contains("sub rsp, 32"),
+            "32-byte shadow space required by Win64 ABI: {stub}"
+        );
+        assert!(
+            stub.contains("call timer_irq_rust"),
+            "stub must transfer to the Rust body: {stub}"
+        );
+        assert!(
+            stub.contains("out 0x20, al"),
+            "stub must EOI the master PIC: {stub}"
+        );
+        assert!(
+            stub.contains("iretq"),
+            "returning stub must iretq, never park: {stub}"
+        );
     }
 }

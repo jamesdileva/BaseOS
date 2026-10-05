@@ -44,6 +44,7 @@
 
 use crate::cpu::IrqGuard;
 use crate::thread::{validate_threads, SwitchError, Thread, ThreadState, MAX_THREADS, NULL_THREAD};
+use crate::timer::TimerTicks;
 
 /// S07 slice 3 — dispatch trace capacity: the first `TRACE_CAP` successful
 /// dispatches (each one equal quantum, in order) are recorded as thread
@@ -286,6 +287,36 @@ impl Scheduler {
     /// serialized pick + state-mark the coop probe holds today).
     pub fn tick_gated(&mut self, _gate: &IrqGuard) -> bool {
         self.tick()
+    }
+
+    /// Drain HW ticks into the quantum (S07 slice 8 wiring-prep): takes the
+    /// pending [`TimerTicks`] count under the `IrqGuard` gate, feeds
+    /// [`Scheduler::tick_gated`] once per HW tick, and reports
+    /// `(drained, expired)` — `expired` means the caller should
+    /// [`Scheduler::dispatch_gated`] ONCE, never loop `tick()` (slice 6
+    /// timer rule: an idle/`NULL`-parked `tick()` reports expired, so a
+    /// tight re-tick loop spins forever; the future IRQ handler gates the
+    /// re-tick on a running thread instead).
+    ///
+    /// Empty drain (`drained == 0`) reports `expired == false` (nothing to
+    /// do) — distinct from a bare `tick()` on an idle scheduler, which
+    /// reports `true`. Saturating: a huge HW backlog (up to `u64::MAX`)
+    /// counts down one `tick_gated` per tick with no wrap; the quantum
+    /// floor holds at 0 either way, so at most one dispatch is owed.
+    pub fn drain_timer(&mut self, ticks: &mut TimerTicks, gate: &IrqGuard) -> (u64, bool) {
+        let drained = ticks.take_gated(gate);
+        if drained == 0 {
+            return (0, false);
+        }
+        let mut expired = false;
+        let mut i = 0;
+        while i < drained {
+            if self.tick_gated(gate) {
+                expired = true;
+            }
+            i += 1;
+        }
+        (drained, expired)
     }
 
     /// Record one quantum while capacity remains (refusals never reach here;
@@ -1338,6 +1369,56 @@ mod tests {
         assert_eq!(g.dispatch_gated(&gate), Ok(3));
         assert_eq!(u.dispatch(), Ok(3));
         assert_eq!(g.quantum_left(), u.quantum_left());
+    }
+
+    #[test]
+    fn drain_timer_feeds_quantum_and_reports_expiry_once() {
+        // S07 slice 8 wiring-prep: the drain takes HW ticks under the gate,
+        // feeds tick_gated once per tick, and reports (drained, expired) so
+        // the caller dispatches ONCE on expiry (never a tight re-tick loop).
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert_eq!(s.dispatch_gated(&gate), Ok(2));
+        assert_eq!(s.quantum_left(), QUANTUM_TICKS);
+        // Partial quantum: fewer HW ticks than the quantum, no expiry.
+        let mut hw = TimerTicks::new();
+        hw.tick();
+        hw.tick();
+        assert_eq!(s.drain_timer(&mut hw, &gate), (2, false));
+        assert_eq!(s.quantum_left(), QUANTUM_TICKS - 2);
+        assert_eq!(hw.pending(), 0);
+        // Exact expiry: remaining ticks spend the quantum, one dispatch owed.
+        hw.tick();
+        hw.tick();
+        assert_eq!(s.drain_timer(&mut hw, &gate), (2, true));
+        assert_eq!(s.quantum_left(), 0);
+        assert_eq!(s.dispatch_gated(&gate), Ok(1));
+        assert_eq!(s.quantum_left(), QUANTUM_TICKS);
+        // Backlog past expiry: quantum floors at 0, still one dispatch owed.
+        let mut flood = TimerTicks::new();
+        let mut i = 0u64;
+        while i < QUANTUM_TICKS + 2 {
+            flood.tick();
+            i += 1;
+        }
+        assert_eq!(s.drain_timer(&mut flood, &gate), (QUANTUM_TICKS + 2, true));
+        assert_eq!(s.quantum_left(), 0);
+    }
+
+    #[test]
+    fn drain_timer_empty_reports_nothing_to_do() {
+        // Empty drain must NOT ask for a dispatch: a bare tick() on an idle
+        // scheduler reports expired (true), but drain with zero HW ticks
+        // reports (0, false) so the IRQ handler never dispatches on silence.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        let mut hw = TimerTicks::new();
+        assert_eq!(s.drain_timer(&mut hw, &gate), (0, false));
+        assert_eq!(s.quantum_left(), 0);
     }
 
     #[test]
