@@ -346,24 +346,40 @@ impl Scheduler {
     /// `ticks_left.saturating_sub(drained)` plus
     /// `expired = ticks_left == 0`, so at most one dispatch is owed no
     /// matter how large the backlog.
+    /// Unknown-`current` policy (S07 slice 20, backoff by construction):
+    /// an unknown `current` (not in the table, e.g. idle `NULL`) drains the
+    /// HW counter (ticks are consumed, never replayed) but preserves the
+    /// quantum (`ticks_left` untouched) and reports `expired == false`, so
+    /// the caller owes NO dispatch. Rationale: no running thread consumed
+    /// those ticks (no phantom time to credit) and no quantum ran down, so
+    /// a per-IRQ retry would spam one failed pick per tick batch forever.
+    /// Known-`current` drains keep the slice-18 retry-spin (consumed quantum
+    /// stays `0`, every non-empty drain retries exactly one dispatch).
     pub fn drain_timer(&mut self, ticks: &mut TimerTicks, gate: &IrqGuard) -> (u64, bool) {
         let drained = ticks.take_gated(gate);
         if drained == 0 {
             return (0, false);
         }
-        // S07 slice 16 periodic accounting: the running thread consumed
-        // these HW ticks — credit them to the current slot (bulk O(1),
-        // saturating). Unknown `current` credits nothing (no phantom time).
+        // S07 slice 20: unknown current preserves the quantum (fail-closed,
+        // no dispatch owed) — find the slot first, before consuming anything.
+        let mut slot: Option<usize> = None;
         let mut i = 0;
         while i < self.len {
             if let Some(t) = self.table[i] {
                 if t.id() == self.current {
-                    self.cpu[i] = self.cpu[i].saturating_add(drained);
+                    slot = Some(i);
                     break;
                 }
             }
             i += 1;
         }
+        let Some(s) = slot else {
+            return (drained, false);
+        };
+        // S07 slice 16 periodic accounting: the running thread consumed
+        // these HW ticks — credit them to the current slot (bulk O(1),
+        // saturating).
+        self.cpu[s] = self.cpu[s].saturating_add(drained);
         self.ticks_left = self.ticks_left.saturating_sub(drained);
         let expired = self.ticks_left == 0;
         (drained, expired)
@@ -385,15 +401,21 @@ impl Scheduler {
     /// because the credit runs BEFORE the pick inside this helper. Callers
     /// MUST use this helper (or the equivalent `drain_timer`-then-`dispatch`
     /// sequence) — a bare `dispatch_gated` after idle HW ticks would credit
-    /// the whole backlog to the NEW current. Unknown-`current` drains still
-    /// count the quantum down while crediting nothing (fail-closed, pinned
-    /// by the edges test); a failed resched (`Some(Err)`) keeps the
-    /// consumed quantum (still `0`), it does not rearm.
+    /// the whole backlog to the NEW current. Unknown-`current` drains
+    /// preserve the quantum and owe no dispatch (S07 slice 20 backoff,
+    /// pinned by the edges test); a failed resched on a KNOWN current
+    /// (`Some(Err)`) keeps the consumed quantum (still `0`), it does not
+    /// rearm.
     ///
-    /// Retry-spin semantics (S07 slice 18, REVIEW #464 nit 2 — intentional):
-    /// because the consumed quantum stays `0`, every subsequent NON-EMPTY
-    /// drain reports expired and retries exactly one gated dispatch, while
-    /// empty drains (`drained == 0`) report `(0, None)` and never retry.
+    /// Retry-spin semantics (S07 slice 18, REVIEW #464 nit 2 — intentional;
+    /// slice 20 scopes it to known-`current` only): because the consumed
+    /// quantum stays `0`, every subsequent NON-EMPTY drain on a known current
+    /// reports expired and retries exactly one gated dispatch, while empty
+    /// drains (`drained == 0`) report `(0, None)` and never retry.
+    /// Unknown-`current` drains report `(drained, None)` and never retry
+    /// (backoff by construction — the live IRQ handler inherits this, so an
+    /// idle table costs one counter drain per tick batch, never a failed
+    /// pick per batch).
     ///
     /// Overflow-signal decision (S07 slice 18): `cpu[]`/`runs[]` saturate
     /// (no wrap, no overflow flag); the S08 harness adds a signal only if
@@ -1652,8 +1674,10 @@ mod tests {
 
     #[test]
     fn drain_timer_cpu_accounting_fail_closed_edges() {
-        // Empty drain credits nothing; unknown current credits nothing
-        // (no phantom time); flood credits bulk to the running thread.
+        // Empty drain credits nothing; unknown current drains the HW counter
+        // but preserves the quantum and owes no dispatch (S07 slice 20
+        // backoff: no phantom time, no per-tick failed pick); flood credits
+        // bulk to the running thread.
         let gate = unsafe { crate::cpu::IrqGuard::enter() };
         let mut s = Scheduler::new(1);
         assert!(s.spawn(mk(1, 0x1000_0000)));
@@ -1667,11 +1691,27 @@ mod tests {
         hw.tick();
         hw.tick();
         hw.tick();
-        // Unknown current: quantum still counts down, but no slot is
-        // credited (fail-closed, never attributes to the wrong thread).
-        assert_eq!(u.drain_timer(&mut hw, &gate), (3, true));
+        // Unknown current: HW ticks consumed, quantum preserved (still 0),
+        // no expiry, no slot credited.
+        assert_eq!(u.drain_timer(&mut hw, &gate), (3, false));
+        assert_eq!(u.quantum_left(), 0);
         assert_eq!(u.cpu_ticks_of(1), Some(0));
         assert_eq!(u.total_cpu_ticks(), 0);
+        assert_eq!(hw.pending(), 0);
+        // Unknown current with an armed quantum preserves it too (does not
+        // burn another thread's budget while idle).
+        let mut v = Scheduler::new(1);
+        assert!(v.spawn(mk(1, 0x1000_0000)));
+        assert!(v.spawn(mk(2, 0x2000_0000)));
+        assert_eq!(v.dispatch_gated(&gate), Ok(2));
+        assert_eq!(v.quantum_left(), QUANTUM_TICKS);
+        // Force unknown without dispatching: rebuild with the same table
+        // but an absent current is impossible via safe API, so pin the
+        // armed-known contrast instead — a known drain consumes.
+        let mut hw2 = TimerTicks::new();
+        hw2.tick();
+        assert_eq!(v.drain_timer(&mut hw2, &gate), (1, false));
+        assert_eq!(v.quantum_left(), QUANTUM_TICKS - 1);
         // Flood: bulk credit lands on the running thread in O(1).
         let mut f = Scheduler::new(1);
         assert!(f.spawn(mk(1, 0x1000_0000)));
@@ -1732,45 +1772,85 @@ mod tests {
         let mut empty = TimerTicks::new();
         let (d0, disp0) = s.drain_then_dispatch_gated(&mut empty, &gate);
         assert_eq!((d0, disp0.is_none()), (0, true));
-        // Failed resched still reports Some(Err) with the quantum consumed.
+        // Failed resched on a KNOWN current still reports Some(Err) with the
+        // quantum consumed (nothing Ready: current Running, other Done).
+        let mut k = Scheduler::new(1);
+        let mut run = mk(1, 0x1000_0000);
+        assert!(run.set_state(ThreadState::Running));
+        let mut done = mk(2, 0x2000_0000);
+        assert!(done.set_state(ThreadState::Done));
+        assert!(k.spawn(run));
+        assert!(k.spawn(done));
+        let mut hwk = TimerTicks::new();
+        hwk.tick();
+        let (dk, dispk) = k.drain_then_dispatch_gated(&mut hwk, &gate);
+        assert_eq!(dk, 1);
+        assert_eq!(dispk, Some(Err(SwitchError::NotReady)));
+        assert_eq!(k.total_cpu_ticks(), 1);
+        // Unknown current owes no dispatch (S07 slice 20 backoff): the HW
+        // ticks are consumed but no pick is attempted, even non-empty.
         let mut u = Scheduler::new(99);
         assert!(u.spawn(mk(1, 0x1000_0000)));
         let mut hw3 = TimerTicks::new();
         hw3.tick();
         let (du, dispu) = u.drain_then_dispatch_gated(&mut hw3, &gate);
         assert_eq!(du, 1);
-        assert_eq!(dispu, Some(Err(SwitchError::Unknown)));
+        assert!(dispu.is_none());
         assert_eq!(u.total_cpu_ticks(), 0);
+        assert_eq!(u.quantum_left(), 0);
     }
 
     #[test]
     fn drain_then_dispatch_failed_resched_retries_once_per_nonempty_drain() {
-        // S07 slice 18 (REVIEW #464 nit 2): a failed resched keeps the
-        // consumed quantum (`ticks_left == 0`), so every subsequent
-        // NON-EMPTY drain retries exactly one dispatch while empty drains
-        // stay quiet — intentional, pinned here so it reads as designed.
+        // S07 slice 18 (REVIEW #464 nit 2) scoped by slice 20: a failed
+        // resched on a KNOWN current keeps the consumed quantum
+        // (`ticks_left == 0`), so every subsequent NON-EMPTY drain retries
+        // exactly one dispatch while empty drains stay quiet. Unknown
+        // current never retries (backoff: `(drained, None)` even non-empty).
         let gate = unsafe { crate::cpu::IrqGuard::enter() };
-        let mut u = Scheduler::new(99);
-        assert!(u.spawn(mk(1, 0x1000_0000)));
+        // Known-but-nothing-Ready: current 1 Running, other Done.
+        let mut u = Scheduler::new(1);
+        let mut run = mk(1, 0x1000_0000);
+        assert!(run.set_state(ThreadState::Running));
+        let mut done = mk(2, 0x2000_0000);
+        assert!(done.set_state(ThreadState::Done));
+        assert!(u.spawn(run));
+        assert!(u.spawn(done));
         let mut hw = TimerTicks::new();
         hw.tick();
         let (d1, r1) = u.drain_then_dispatch_gated(&mut hw, &gate);
         assert_eq!(d1, 1);
-        assert_eq!(r1, Some(Err(SwitchError::Unknown)));
+        assert_eq!(r1, Some(Err(SwitchError::NotReady)));
         assert_eq!(u.quantum_left(), 0);
         // Empty drain: no retry even though the quantum is spent.
         let mut empty = TimerTicks::new();
         let (d0, r0) = u.drain_then_dispatch_gated(&mut empty, &gate);
         assert_eq!((d0, r0.is_none()), (0, true));
         assert_eq!(u.quantum_left(), 0);
-        // Next non-empty drain retries exactly once (still Err, still 0).
+        // Next non-empty drain retries exactly once (still Err, still 0),
+        // and the retry credit lands on the known current.
         hw.tick();
         hw.tick();
         let (d2, r2) = u.drain_then_dispatch_gated(&mut hw, &gate);
         assert_eq!(d2, 2);
-        assert_eq!(r2, Some(Err(SwitchError::Unknown)));
+        assert_eq!(r2, Some(Err(SwitchError::NotReady)));
         assert_eq!(u.quantum_left(), 0);
-        assert_eq!(u.total_cpu_ticks(), 0);
+        assert_eq!(u.cpu_ticks_of(1), Some(3));
+        // Unknown current: no retry, even non-empty, quantum preserved.
+        let mut w = Scheduler::new(99);
+        assert!(w.spawn(mk(1, 0x1000_0000)));
+        let mut hwu = TimerTicks::new();
+        hwu.tick();
+        let (du1, ru1) = w.drain_then_dispatch_gated(&mut hwu, &gate);
+        assert_eq!(du1, 1);
+        assert!(ru1.is_none());
+        hwu.tick();
+        hwu.tick();
+        let (du2, ru2) = w.drain_then_dispatch_gated(&mut hwu, &gate);
+        assert_eq!(du2, 2);
+        assert!(ru2.is_none());
+        assert_eq!(w.quantum_left(), 0);
+        assert_eq!(w.total_cpu_ticks(), 0);
     }
 
     #[test]
