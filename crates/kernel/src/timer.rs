@@ -76,6 +76,44 @@ pub const fn pit_divisor(hz: u32) -> u16 {
 /// Divisor for [`TIMER_HZ`] (1193182 / 100 = 11931).
 pub const TIMER_DIVISOR: u16 = pit_divisor(TIMER_HZ);
 
+/// Programmed `(lobyte, hibyte)` pair for [`TIMER_DIVISOR`] (S07 slice11).
+///
+/// First in-tree caller of [`pit_program_bytes`]: closes the REVIEW #444
+/// residual (zero callers — nothing enforced the zero-divisor refusal).
+/// `TIMER_DIVISOR` is non-zero by construction (`11931`), so this is
+/// `Some((0x9B, 0x2E))`; the guest PIT-program path consumes this const
+/// (never a raw divisor) so a `0` can never reach the port (`0x0000`
+/// latches 65536, not "stop"). Pure `core`-only; the actual `outb`
+/// sequence rides with the guest wiring slice (still `cli` until the IRQ0
+/// stub + EOI + `iretq` land first).
+pub const TIMER_PROGRAM: Option<(u8, u8)> = pit_program_bytes(TIMER_DIVISOR);
+
+/// PIC remap `outb` sequence (S07 slice11, pure `core`-only plan).
+///
+/// Returns the `(port, value)` pairs the guest wiring slice emits in order
+/// to remap the 8259 pair so IRQ0 lands on [`VECTOR_TIMER`] (32):
+/// ICW1 (`0x11`) to both command ports, ICW2 (offsets [`PICM_OFFSET`] /
+/// [`PICS_OFFSET`]), ICW3 (master `0x04` = slave at IRQ2, slave `0x02` =
+/// cascade identity), ICW4 (`0x01` = 8086 mode). Masks ride separately
+/// (wiring slice unmasks IRQ0 only: master `0xFE`, slave `0xFF`).
+/// String/const-only this slice — no port I/O, guest keeps `cli`, so QEMU
+/// behavior is unchanged. Host tests pin the order so the wiring slice
+/// cannot silently swap an offset or drop ICW3/ICW4 (which would wedge
+/// IRQ0 after the first tick).
+#[must_use]
+pub const fn pic_remap_writes() -> [(u16, u8); 8] {
+    [
+        (PICM_CMD, 0x11),
+        (PICS_CMD, 0x11),
+        (PICM_DATA, PICM_OFFSET),
+        (PICS_DATA, PICS_OFFSET),
+        (PICM_DATA, 0x04),
+        (PICS_DATA, 0x02),
+        (PICM_DATA, 0x01),
+        (PICS_DATA, 0x01),
+    ]
+}
+
 /// Split a programmable divisor into the `(lobyte, hibyte)` pair the wiring
 /// slice writes to [`PIT_CH0`] after [`PIT_MODE_CH0_SQUARE`] goes to
 /// [`PIT_CMD`]. Fails closed to `None` on `0` — the caller MUST refuse it:
@@ -147,6 +185,46 @@ macro_rules! timer_isr_stub_asm {
 #[cfg(test)]
 pub(crate) const fn timer_stub_text() -> &'static str {
     timer_isr_stub_asm!()
+}
+
+// S07 slice11 — consume the stub in the guest binary (closes the
+// string-only residual: `timer_isr_stub_asm!` now has one `global_asm!`
+// caller, same pattern as the `#DE`/`#PF` stubs in the parent). Linked
+// but UNWIRED this slice: `cpu::load_idt` still covers the 32 exception
+// vectors only, guest keeps `cli`, so QEMU behavior is unchanged. The
+// wiring slice adds IDT vector 32 + PIC remap + PIT program + `sti`.
+#[cfg(not(test))]
+core::arch::global_asm!(timer_isr_stub_asm!());
+
+/// Guest IRQ0 tick counter (S07 slice11).
+///
+/// `static mut`, guest-only: the IRQ0 stub runs with IF cleared by the
+/// interrupt gate (plus the post-EBS `cli` until the wiring slice adds
+/// `sti`), single-threaded boot owns it. The Rust body
+/// [`timer_irq_rust`] records one saturating tick per IRQ0; the scheduler
+/// drain (gated `take_gated` under `&IrqGuard`) rides with the wiring
+/// slice. Host `cargo test` never touches this (pure `TimerTicks` unit
+/// tests cover the counting rule).
+#[cfg(not(test))]
+static mut TIMER_TICKS: TimerTicks = TimerTicks::new();
+
+/// Rust body of the IRQ0 stub (S07 slice11, guest-only).
+///
+/// Called from `baseos_isr_timer` with the Win64-volatile frame saved and
+/// 32-byte shadow space reserved; the stub performs the single master EOI
+/// AFTER this returns (while the saved `rax` still sits on the stack) and
+/// `iretq`s. Body records exactly one saturating tick and returns — never
+/// parks, never touches ports (EOI lives in the stub so `mov al` cannot
+/// clobber the caller's `rax` before the pops).
+#[cfg(not(test))]
+#[no_mangle]
+pub extern "C" fn timer_irq_rust() {
+    // SAFETY: guest IRQ context only (interrupt gate, IF cleared);
+    // single-threaded boot owns `TIMER_TICKS` until the wiring slice adds
+    // the gated drain. Host builds never link this symbol.
+    unsafe {
+        (*core::ptr::addr_of_mut!(TIMER_TICKS)).tick();
+    }
 }
 
 /// Saturating HW-tick counter: the future IRQ0 handler calls [`tick`]
@@ -292,6 +370,38 @@ mod tests {
     }
 
     #[test]
+    fn timer_program_const_is_first_caller_and_pins_100hz_bytes() {
+        // S07 slice11: closes the zero-callers residual — `TIMER_PROGRAM`
+        // is the first in-tree caller of `pit_program_bytes`, so the
+        // refusal rule is enforced by construction (guest PIT path consumes
+        // this const, never a raw divisor).
+        assert_eq!(TIMER_PROGRAM, Some((0x9B, 0x2E)));
+        assert_eq!(TIMER_PROGRAM, pit_program_bytes(TIMER_DIVISOR));
+        let (lo, hi) = TIMER_PROGRAM.expect("TIMER_DIVISOR is programmable");
+        assert_eq!(u16::from(lo) | (u16::from(hi) << 8), TIMER_DIVISOR);
+    }
+
+    #[test]
+    fn pic_remap_sequence_pins_offsets_and_icw_order() {
+        // S07 slice11: pure plan the wiring slice emits in order. Offsets
+        // must equal the PICM/S_OFFSET consts (IRQ0 -> VECTOR_TIMER); a
+        // swapped ICW2 or a dropped ICW3/ICW4 must go red here.
+        let seq = pic_remap_writes();
+        assert_eq!(seq.len(), 8);
+        assert_eq!(seq[0], (PICM_CMD, 0x11));
+        assert_eq!(seq[1], (PICS_CMD, 0x11));
+        assert_eq!(seq[2], (PICM_DATA, PICM_OFFSET));
+        assert_eq!(seq[3], (PICS_DATA, PICS_OFFSET));
+        assert_eq!(seq[2].1, 0x20);
+        assert_eq!(seq[3].1, 0x28);
+        assert_eq!(VECTOR_TIMER, 32);
+        assert_eq!(seq[4], (PICM_DATA, 0x04));
+        assert_eq!(seq[5], (PICS_DATA, 0x02));
+        assert_eq!(seq[6], (PICM_DATA, 0x01));
+        assert_eq!(seq[7], (PICS_DATA, 0x01));
+    }
+
+    #[test]
     fn take_gated_agrees_with_take() {
         // Gated drain adds the IrqGuard proof, never new drain logic.
         let gate = unsafe { IrqGuard::enter() };
@@ -361,6 +471,10 @@ mod tests {
         assert!(
             !stub.contains("and rsp"),
             "returning IRQ stub must not destroy RSP with and: {stub}"
+        );
+        assert!(
+            !stub.contains("andq"),
+            "returning IRQ stub must not destroy RSP with andq: {stub}"
         );
         for reg in [
             "push rax", "push rcx", "push rdx", "push r8", "push r9", "push r10", "push r11",
