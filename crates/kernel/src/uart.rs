@@ -147,6 +147,24 @@ pub(crate) fn write_exc_line(ok: bool, vector: u64) {
     com1_write_byte(b'\n');
 }
 
+/// Emit `TICK ok=<0|1> ticks=<n>\n` directly on COM1 (S07 slice14 first-tick
+/// proof: `ok` is 1 only when the drained gated count is nonzero).
+///
+/// Safe wrapper: only calls [`com1_write_byte`] plus the safe decimal
+/// helper. Requires COM1 initialized; single-threaded bring-up context owns
+/// the UART exclusively.
+pub(crate) fn write_tick_line(ok: bool, ticks: u64) {
+    for b in b"TICK ok=" {
+        com1_write_byte(*b);
+    }
+    com1_write_byte(if ok { b'1' } else { b'0' });
+    for b in b" ticks=" {
+        com1_write_byte(*b);
+    }
+    write_dec_u64(ticks);
+    com1_write_byte(b'\n');
+}
+
 /// Emit `PF ok=<0|1> vector=<n> code=<0x...> addr=<0x...>\n` directly on
 /// COM1 (interrupt context cannot use the caller-supplied sink).
 ///

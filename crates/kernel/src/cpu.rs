@@ -199,6 +199,31 @@ pub unsafe fn cli() {
 #[cfg(test)]
 pub unsafe fn cli() {}
 
+/// Enable maskable interrupts on the boot CPU (`sti`, S07 slice14 timer
+/// enable).
+///
+/// Guest-only contract: post-`ExitBootServices`, CPL0 boot path, IDT vector
+/// 32 wired to the returning IRQ0 stub with PIC remapped + PIT programmed
+/// first (otherwise the first tick vectors into a missing gate or the PIT
+/// never fires). `sti` sets IF (hence NO `preserves_flags` — same rule as
+/// [`cli`]). Host builds are a no-op stub (the harness must never execute
+/// `sti`).
+///
+/// # Safety
+/// Same contract as [`cli`]: boot CPU only, post-EBS. The timer wiring
+/// slice calls this exactly once after the PIC/PIT program sequence.
+#[cfg(not(test))]
+pub unsafe fn sti() {
+    core::arch::asm!("sti", options(nomem, nostack));
+}
+
+/// Host-test stub: no-op (never touches flags).
+///
+/// # Safety
+/// Host `cargo test` only: no-op.
+#[cfg(test)]
+pub unsafe fn sti() {}
+
 /// Preempt-IRQ gate token (S06 slice28 / task #19): proves the holder runs
 /// with maskable IRQs masked (`cli` in effect) across a scheduler
 /// pick-then-mark critical section (`dispatch` / `exit_current` pick the next
@@ -216,10 +241,10 @@ pub unsafe fn cli() {}
 /// the same reason the live-swap stubs stay guest-only. The token must be
 /// asm-free to keep host and guest call sites identical.)
 ///
-/// `Drop` is a no-op (never `sti`: post-EBS bring-up has no IRQ handler for
-/// vectors 32+ yet — enabling interrupts here would fault into an unwired
-/// IDT. A future timer slice adds the paired `sti` with the handler wired
-/// first).
+/// `Drop` is a no-op (never `sti`: enabling interrupts belongs to the timer
+/// wiring slice, which programs the PIC/PIT and wires IDT 32 first — a
+/// `Drop`-time `sti` would enable IRQs at an arbitrary pick site. The paired
+/// [`sti`] lands with that slice, after the handler is wired).
 ///
 /// Contract: create the guard BEFORE the pick and hold the `&` across the
 /// whole pick + state-mark (`Scheduler::dispatch_gated` /
@@ -402,7 +427,11 @@ mod tests {
         use super::super::timer::VECTOR_TIMER;
         assert_eq!(VECTOR_TIMER, 32);
         assert_eq!(IDT_VECTORS, 33);
-        assert!(VECTOR_TIMER < IDT_VECTORS);
+        // `black_box` keeps the coverage assert runtime (not
+        // const-evaluable) so `clippy -D warnings`
+        // (`assertions_on_constants`) stays clean — same pattern as the
+        // probe-guard test in `lib.rs`.
+        assert!(core::hint::black_box(VECTOR_TIMER) < IDT_VECTORS);
         let handler = 0x0000_0000_1234_5678_u64;
         let e = gate_for(handler);
         assert_eq!(e.handler_offset(), handler);
@@ -494,5 +523,15 @@ mod tests {
         let gate2 = gate;
         assert_eq!(gate, gate2, "guard is a Copy token on the host");
         unsafe { cli() };
+    }
+
+    #[test]
+    fn sti_gate_is_unsafe_fn_and_host_noop() {
+        // S07 slice14: `sti` is the paired enable for the timer IRQ0 path —
+        // must stay `unsafe fn` (privileged, same as `cli`) so callers need
+        // an `unsafe` block. Host stub is a no-op (never touches flags).
+        let sti_fn: unsafe fn() = sti;
+        let _ = sti_fn;
+        unsafe { sti() };
     }
 }

@@ -43,6 +43,8 @@ pub mod uart;
 /// `cpu::` directly.
 #[cfg(test)]
 pub(crate) use cpu::IdtEntry;
+#[cfg(not(test))]
+use uart::write_tick_line;
 use uart::{write_exc_line, write_pf_line};
 
 /// Enter the kernel with the boot handoff: validate [`BootInfo`] and emit
@@ -274,11 +276,21 @@ core::arch::global_asm!(de_isr_stub_asm!());
 #[cfg(not(test))]
 core::arch::global_asm!(pf_isr_stub_asm!());
 
-/// Guest-only CPU bring-up + live `#PF` proof: load GDT, load IDT, then
-/// volatile-read [`PF_PROBE_ADDR`] (unmapped guard → not-present `#PF`).
+/// Guest-only CPU bring-up + timer first-tick + live `#PF` proof (S07
+/// slice14): load GDT, load IDT (now covering `#DE` + `#PF` + timer IRQ0
+/// vector 32), remap the PIC + arm the PIT at 100 Hz, `sti`, wait for the
+/// first IRQ0 tick, emit `TICK ok=1 ticks=<n>`, then volatile-read
+/// [`PF_PROBE_ADDR`] (unmapped guard → not-present `#PF`).
 /// The `#PF` gate jumps to [`exception_handler_pf_rust`], which emits
 /// `PF ok=1 vector=14 code=... addr=...` and chains into an intentional
 /// `#DE` so `EXC ok=1 vector=0` still fires before parking — never returns.
+///
+/// The tick wait is bounded (200 `hlt` spins ≈ 2 s budget at 100 Hz): a
+/// missing tick emits `TICK ok=0 ticks=0` and the e2e hard-require fails
+/// loudly instead of hanging. The drain runs gated (`cli` + `IrqGuard` +
+/// `take_gated`), closing the REVIEW #442 R2 static-mut drain in the guest.
+/// The timer IRQ body only ticks (no serial), so extra ticks during the
+/// later `#PF`/`#DE` park cannot interleave the proof lines.
 ///
 /// # Safety
 /// Must run post-`ExitBootServices` on the boot CPU with interrupts
@@ -288,6 +300,27 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
     cpu::load_gdt();
     cpu::load_idt();
+    timer::remap_pic();
+    timer::program_pit();
+    cpu::sti();
+    // First-tick wait: `hlt` until the IRQ-side gated tick lands.
+    let mut spins = 0u32;
+    loop {
+        if timer::pending_snapshot() > 0 {
+            break;
+        }
+        if spins >= 200 {
+            break;
+        }
+        spins += 1;
+        core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+    }
+    // Re-mask before the drain so the `IrqGuard` proof holds and the
+    // `#PF` probe below runs deterministically.
+    cpu::cli();
+    let gate = cpu::IrqGuard::enter();
+    let drained = timer::drain_gated(&gate);
+    write_tick_line(drained > 0, drained);
     // Live #PF (#168n6, sole functional open): touch the unmapped guard.
     // If either IDT gate is wrong this triple-faults and e2e fails loudly
     // (missing PF/EXC lines). Volatile so the read is never optimized out.
@@ -606,9 +639,10 @@ mod tests {
         let write_byte: fn(u8) = uart::com1_write_byte;
         let exc: fn(bool, u64) = uart::write_exc_line;
         let pf: fn(bool, u64, u64, u64) = uart::write_pf_line;
+        let tick: fn(bool, u64) = uart::write_tick_line;
         let dec: fn(u64) = uart::write_dec_u64;
         let hex: fn(u64) = uart::write_hex_u64;
-        let _ = (init, write_byte, exc, pf, dec, hex);
+        let _ = (init, write_byte, exc, pf, tick, dec, hex);
     }
 
     #[test]
@@ -626,8 +660,14 @@ mod tests {
             "com1_write_byte",
             "write_exc_line",
             "write_pf_line",
+            "write_tick_line",
+            "remap_pic",
+            "program_pit",
+            "pending_snapshot",
+            "drain_gated",
             "load_gdt",
             "load_idt",
+            "sti",
             "bring_up_cpu_and_prove_exception",
             "baseos_isr_div0",
             "baseos_isr_pf",
@@ -635,9 +675,9 @@ mod tests {
             assert!(DOC.contains(site), "inventory must document {site}");
         }
         for row in [
-            "| A1 |", "| A2 |", "| A3 |", "| A4 |", "| A5 |", "| A6 |", "| A7 |", "| D1 |",
-            "| D2 |", "| D3 |", "| D4 |", "| D5 |", "| D6 |", "| D7 |", "| D8 |", "| D9 |",
-            "| D10 |",
+            "| A1 |", "| A2 |", "| A3 |", "| A4 |", "| A5 |", "| A6 |", "| A7 |", "| A8 |",
+            "| A9 |", "| D1 |", "| D2 |", "| D3 |", "| D4 |", "| D5 |", "| D6 |", "| D7 |",
+            "| D8 |", "| D9 |", "| D10 |", "| D11 |",
         ] {
             assert!(DOC.contains(row), "inventory must keep row {row}");
         }

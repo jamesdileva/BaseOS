@@ -17,7 +17,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S07 slice 5: scheduler quantum tick) ==="
+Write-Output "=== BaseOS UEFI guest boot (S07 slice14: timer IRQ0 first-tick) ==="
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -242,8 +242,12 @@ if ($serialText -and $serialText.Contains($marker)) {
   $schedFair = "SCHED-FAIR ok=1 total=30 r1=10 r2=10 r3=10 spread=0"
   $schedTrace = "SCHED-TRACE ok=1 n=3 t0=2 t1=3 t2=1"
   $schedTraceX = "SCHED-TRACE-X ok=1 n=2 t0=2 t1=3"
-  $schedTick = "SCHED-TICK ok=1 q=4 used=4 expired=1 next=3"
-  $exc = "EXC ok=1 vector=0"
+   $schedTick = "SCHED-TICK ok=1 q=4 used=4 expired=1 next=3"
+   # S07 slice14 (timer IRQ0 enable): PIC remap + PIT 100Hz + sti must deliver
+   # the first tick before the #PF/#DE chain. Same-line shape mirrors the
+   # GUARD gate (literal space after ok=1 stops ok=10 false-passing).
+   $tickPat = "TICK ok=1 [^\r\n]*ticks=[1-9][0-9]*(\s|$)"
+   $exc = "EXC ok=1 vector=0"
   # S04 #168n6 live-#PF (REVIEW #229 cheapest disconfirm): the guest touches
   # the unmapped PF_PROBE_ADDR guard, so the PF stub must emit
   # `PF ok=1 vector=14 code=0x... addr=0x...` before chaining into #DE.
@@ -312,7 +316,8 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasSchedFair = $serialText.Contains($schedFair)
   $hasSchedTrace = $serialText.Contains($schedTrace)
   $hasSchedTraceX = $serialText.Contains($schedTraceX)
-  $hasSchedTick = $serialText.Contains($schedTick)
+   $hasSchedTick = $serialText.Contains($schedTick)
+   $hasTick = [regex]::IsMatch($serialText, $tickPat)
   $chainOrderOk = $false
   $ci2 = $serialText.IndexOf($chainHop2)
   $ci3 = $serialText.IndexOf($chainHop3)
@@ -322,9 +327,9 @@ if ($serialText -and $serialText.Contains($marker)) {
   }
   $hasPf = [regex]::IsMatch($serialText, $pfPat)
   $hasExc = $serialText.Contains($exc)
-  if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasThreadJump -and $hasThreadJumpRun -and $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and $hasPf -and $hasExc) {
+   if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasTick -and $hasThreadJump -and $hasThreadJumpRun -and $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and $hasPf -and $hasExc) {
     Write-Output ("Boot summary: FOUND (" + $bootinfo + " + " + $memmap + " + " + $notrunc + " + " + $mapsize + " + " + $descsize + " + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -355,6 +360,7 @@ if ($serialText -and $serialText.Contains($marker)) {
        "SCHED-TRACE ok=1 present=$hasSchedTrace, " +
        "SCHED-TRACE-X ok=1 present=$hasSchedTraceX, " +
        "SCHED-TICK ok=1 present=$hasSchedTick, " +
+      "TICK ok=1 ticks-shape present=$hasTick, " +
       "THREAD-JUMP ok=1 id=2 present=$hasThreadJump, " +
       "THREAD-JUMP-RUN id=2 present=$hasThreadJumpRun, " +
       "THREAD-JUMP ok=0 id=0 present=$hasThreadJumpRefusal, " +

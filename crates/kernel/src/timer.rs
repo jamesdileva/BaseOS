@@ -1,9 +1,10 @@
 //! S07 slice 7a — real-timer IRQ contract (host-testable, no guest wiring yet).
 //!
 //! Pure `core`-only constants + counter the future PIT/PIC/IDT32 slice will
-//! consume. No port I/O, no `lidt`/`sti` here — the guest keeps `cli` in
-//! effect until the wiring slice programs the hardware and installs the
-//! returning IRQ0 stub (with EOI + `iretq`) first.
+//! consume. S07 slice14 adds the guest-only program path (`remap_pic` +
+//! `program_pit` consuming the const plans via `outb`) plus the volatile
+//! snapshot / gated drain the bring-up uses around `sti`; the IRQ0 stub +
+//! EOI + `iretq` and the IDT-32 gate landed in earlier slices.
 //!
 //! Contracts pinned here:
 //! - `PIT_BASE_HZ = 1_193_182`, [`pit_divisor`] (integer division, fails
@@ -173,6 +174,95 @@ pub const fn pit_program_bytes(divisor: u16) -> Option<(u8, u8)> {
         return None;
     }
     Some((divisor as u8, (divisor >> 8) as u8))
+}
+
+/// Guest-only port write for the PIC/PIT program path (S07 slice14).
+///
+/// Private to this module: safe callers use [`remap_pic`] / [`program_pit`]
+/// without naming a port. COM1 lives in `uart`; this body covers only the
+/// timer-programming ports consumed from the const plans above.
+#[cfg(not(test))]
+#[inline(always)]
+unsafe fn outb(port: u16, value: u8) {
+    core::arch::asm!(
+        "out dx, al",
+        in("dx") port,
+        in("al") value,
+        options(nomem, nostack, preserves_flags),
+    );
+}
+
+/// Guest-only PIC remap + mask (S07 slice14).
+///
+/// Emits [`pic_remap_writes`] then [`pic_mask_writes`] in order via `outb`,
+/// so IRQ0 lands on [`VECTOR_TIMER`] with IRQ0 unmasked only. Consumes the
+/// const plans (never raw literals) so a swapped offset or dropped ICW fails
+/// at the host plan tests, not silently in QEMU.
+///
+/// # Safety
+/// Post-EBS guest only, `cli` in effect, single-threaded boot owns the PIC.
+#[cfg(not(test))]
+pub(crate) unsafe fn remap_pic() {
+    let remap = pic_remap_writes();
+    let mut i = 0;
+    while i < remap.len() {
+        let (port, value) = remap[i];
+        outb(port, value);
+        i += 1;
+    }
+    let masks = pic_mask_writes();
+    let mut j = 0;
+    while j < masks.len() {
+        let (port, value) = masks[j];
+        outb(port, value);
+        j += 1;
+    }
+}
+
+/// Guest-only PIT arm at [`TIMER_HZ`] (S07 slice14).
+///
+/// Emits [`pit_program_writes`] in order via `outb` (mode byte to
+/// [`PIT_CMD`], then lobyte/hibyte to [`PIT_CH0`]). Consumes
+/// [`TIMER_PROGRAM`] (never a raw divisor) so a `0` can never reach the
+/// port. No-op when [`TIMER_PROGRAM`] is `None` (fail-closed: the caller
+/// must refuse to `sti` — `bring_up` checks the tick, not this helper).
+///
+/// # Safety
+/// Post-EBS guest only, `cli` in effect, single-threaded boot owns the PIT.
+#[cfg(not(test))]
+pub(crate) unsafe fn program_pit() {
+    let Some(seq) = pit_program_writes() else {
+        return;
+    };
+    let mut i = 0;
+    while i < seq.len() {
+        let (port, value) = seq[i];
+        outb(port, value);
+        i += 1;
+    }
+}
+
+/// Guest-only volatile tick snapshot (S07 slice14).
+///
+/// Volatile whole-struct read of `TIMER_TICKS` so the `sti` spin-wait
+/// observes IRQ-side increments without a data race on the host model
+/// (guest runs with IF set here; the IRQ body is the only writer).
+///
+/// # Safety
+/// Guest IRQ-enabled window only; single-threaded boot owns the read.
+#[cfg(not(test))]
+pub(crate) unsafe fn pending_snapshot() -> u64 {
+    core::ptr::addr_of!(TIMER_TICKS).read_volatile().pending()
+}
+
+/// Guest-only gated drain (S07 slice14).
+///
+/// Drains via [`TimerTicks::take_gated`] under `&IrqGuard`, closing the
+/// REVIEW #442 R2 static-mut drain in the guest (not just host parity):
+/// the IRQ side ticks gated, the bring-up side drains gated after `cli`.
+#[cfg(not(test))]
+pub(crate) unsafe fn drain_gated(gate: &IrqGuard) -> u64 {
+    (*core::ptr::addr_of_mut!(TIMER_TICKS)).take_gated(gate)
 }
 
 /// Shared IRQ0 ISR stub source (AT&T). Same Win64-ABI contract as the
