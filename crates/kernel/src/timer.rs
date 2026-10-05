@@ -278,6 +278,33 @@ pub(crate) unsafe fn drain_into_scheduler(sched: &mut Scheduler, gate: &IrqGuard
     sched.drain_timer(&mut (*core::ptr::addr_of_mut!(TIMER_TICKS)), gate)
 }
 
+/// Guest-only combined PIT-handler step (S07 slice 17).
+///
+/// Drains the static `TIMER_TICKS` into `sched` via
+/// [`crate::sched::Scheduler::drain_then_dispatch_gated`] (bulk credit to
+/// the pre-dispatch current, then at most one gated dispatch on expiry)
+/// and returns `(drained, dispatch)` — `dispatch` is `None` when no expiry
+/// (nothing to do) and `Some(Ok/Err)` when one resched was attempted. The
+/// single call site (`bring_up_cpu_and_prove_exception`) uses this so the
+/// guest can never dispatch without draining first (REVIEW #462 risk 1).
+/// The `TICK` line still reports `drained` only; the dispatch result is
+/// intentionally ignored (demo table always has a `Ready` target).
+///
+/// # Safety
+/// Post-EBS guest only, `cli` in effect, `gate` proves the critical
+/// section; single-threaded boot owns `TIMER_TICKS` and `sched`.
+#[cfg(not(test))]
+pub(crate) unsafe fn poll_timer_dispatch(
+    sched: &mut Scheduler,
+    gate: &IrqGuard,
+) -> (u64, Option<Result<u64, crate::thread::SwitchError>>) {
+    let (drained, expired) = drain_into_scheduler(sched, gate);
+    if !expired {
+        return (drained, None);
+    }
+    (drained, Some(sched.dispatch_gated(gate)))
+}
+
 /// Shared IRQ0 ISR stub source (AT&T). Same Win64-ABI contract as the
 /// `#DE`/`#PF` stubs in the parent (`RCX` first arg, 32-byte shadow space,
 /// `RSP` 16-byte aligned before `call`): the handler body is a future

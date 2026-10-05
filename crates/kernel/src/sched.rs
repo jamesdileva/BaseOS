@@ -369,6 +369,38 @@ impl Scheduler {
         (drained, expired)
     }
 
+    /// Combined drain-then-dispatch step (S07 slice 17, PIT-handler shape).
+    ///
+    /// Drains `ticks` via [`Scheduler::drain_timer`] (credits the drained
+    /// HW ticks to the PRE-dispatch current slot) and, on expiry only,
+    /// performs exactly one [`Scheduler::dispatch_gated`]. Returns
+    /// `(drained, dispatch)` where `dispatch` is `None` when no expiry
+    /// (nothing to do, including the empty-drain case) and
+    /// `Some(Ok(next))` / `Some(Err(e))` when one gated dispatch was
+    /// attempted. The caller never dispatches without draining first.
+    ///
+    /// Misattribution window closed by construction (REVIEW #462 risk 1):
+    /// ticks that accumulate across a dispatch are always credited to the
+    /// thread that ran while they accumulated (the pre-pick `current`),
+    /// because the credit runs BEFORE the pick inside this helper. Callers
+    /// MUST use this helper (or the equivalent `drain_timer`-then-`dispatch`
+    /// sequence) — a bare `dispatch_gated` after idle HW ticks would credit
+    /// the whole backlog to the NEW current. Unknown-`current` drains still
+    /// count the quantum down while crediting nothing (fail-closed, pinned
+    /// by the edges test); a failed resched (`Some(Err)`) keeps the
+    /// consumed quantum (still `0`), it does not rearm.
+    pub fn drain_then_dispatch_gated(
+        &mut self,
+        ticks: &mut TimerTicks,
+        gate: &IrqGuard,
+    ) -> (u64, Option<Result<u64, SwitchError>>) {
+        let (drained, expired) = self.drain_timer(ticks, gate);
+        if !expired {
+            return (drained, None);
+        }
+        (drained, Some(self.dispatch_gated(gate)))
+    }
+
     /// Record one quantum while capacity remains (refusals never reach here;
     /// saturation keeps the prefix deterministic instead of wrapping).
     fn record_trace(&mut self, id: u64) {
@@ -1586,6 +1618,94 @@ mod tests {
         assert_eq!(f.cpu_ticks_of(2), Some(1000));
         assert_eq!(f.cpu_ticks_of(1), Some(0));
         assert_eq!(f.total_cpu_ticks(), 1000);
+    }
+
+    #[test]
+    fn drain_then_dispatch_credits_pre_dispatch_current() {
+        // S07 slice 17 (REVIEW #462 risk 1): the combined helper credits the
+        // drained backlog to the PRE-dispatch current before the pick, so a
+        // backlog accumulated across a dispatch can never misattribute to
+        // the NEW current. Partial drain dispatches nothing; expiry drains
+        // then dispatches exactly once.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert_eq!(s.dispatch_gated(&gate), Ok(2));
+        // Partial quantum: 2 of 4 ticks, no dispatch owed.
+        let mut hw = TimerTicks::new();
+        hw.tick();
+        hw.tick();
+        let (drained, dispatched) = s.drain_then_dispatch_gated(&mut hw, &gate);
+        assert_eq!(drained, 2);
+        assert!(dispatched.is_none());
+        assert_eq!(s.current(), 2);
+        assert_eq!(s.cpu_ticks_of(2), Some(2));
+        // Expiry: remaining 2 ticks credit 2 (still current) then resched
+        // 2->1 exactly once; the 2-tick credit stays on 2, not 1.
+        hw.tick();
+        hw.tick();
+        let (drained2, dispatched2) = s.drain_then_dispatch_gated(&mut hw, &gate);
+        assert_eq!(drained2, 2);
+        assert_eq!(dispatched2, Some(Ok(1)));
+        assert_eq!(s.current(), 1);
+        assert_eq!(s.cpu_ticks_of(2), Some(4));
+        assert_eq!(s.cpu_ticks_of(1), Some(0));
+        // Next quantum credits the new current (1).
+        let mut hw2 = TimerTicks::new();
+        hw2.tick();
+        let (drained3, dispatched3) = s.drain_then_dispatch_gated(&mut hw2, &gate);
+        assert_eq!(drained3, 1);
+        assert!(dispatched3.is_none());
+        assert_eq!(s.cpu_ticks_of(1), Some(1));
+        assert_eq!(s.total_cpu_ticks(), 5);
+        // Empty drain dispatches nothing (IRQ silence never rescheds).
+        let mut empty = TimerTicks::new();
+        let (d0, disp0) = s.drain_then_dispatch_gated(&mut empty, &gate);
+        assert_eq!((d0, disp0.is_none()), (0, true));
+        // Failed resched still reports Some(Err) with the quantum consumed.
+        let mut u = Scheduler::new(99);
+        assert!(u.spawn(mk(1, 0x1000_0000)));
+        let mut hw3 = TimerTicks::new();
+        hw3.tick();
+        let (du, dispu) = u.drain_then_dispatch_gated(&mut hw3, &gate);
+        assert_eq!(du, 1);
+        assert_eq!(dispu, Some(Err(SwitchError::Unknown)));
+        assert_eq!(u.total_cpu_ticks(), 0);
+    }
+
+    #[test]
+    fn cpu_slot_invariant_across_sweep() {
+        // S07 slice 17 (REVIEW #462 risk 2): `cpu[i]` belongs to `table[i]`
+        // under the same append-only invariant as `runs[i]` (zeroed on
+        // spawn, no remove/compact exists). Three full quanta through the
+        // combined helper credit exactly QUANTUM_TICKS to each thread in
+        // turn (2, then 3, then 1), so a future table-shift without `cpu`
+        // goes red here exactly as the `runs` sweep does.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert!(s.spawn(mk(3, 0x3000_0000)));
+        assert_eq!(s.dispatch_gated(&gate), Ok(2));
+        for _ in 0..3 {
+            let mut hw = TimerTicks::new();
+            let mut i = 0u64;
+            while i < QUANTUM_TICKS {
+                hw.tick();
+                i += 1;
+            }
+            let (drained, dispatched) = s.drain_then_dispatch_gated(&mut hw, &gate);
+            assert_eq!(drained, QUANTUM_TICKS);
+            assert!(dispatched.is_some());
+        }
+        assert_eq!(s.current(), 2);
+        assert_eq!(s.cpu_ticks_of(2), Some(QUANTUM_TICKS));
+        assert_eq!(s.cpu_ticks_of(3), Some(QUANTUM_TICKS));
+        assert_eq!(s.cpu_ticks_of(1), Some(QUANTUM_TICKS));
+        assert_eq!(s.total_cpu_ticks(), QUANTUM_TICKS * 3);
+        assert_eq!(s.cpu_ticks_of(99), None);
+        assert_eq!(s.len(), 3);
     }
 
     #[test]

@@ -282,7 +282,9 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 /// (fail-closed: `pit_program_writes() == None` skips `program` + `sti` and
 /// emits `TICK ok=0 ticks=0` before the `#PF` probe — REVIEW #458 residue
 /// 1), `sti`, wait for the first IRQ0 tick, feed the drained HW ticks into
-/// an armed `Scheduler` quantum via `timer::drain_into_scheduler`, emit
+/// an armed `Scheduler` quantum via `timer::poll_timer_dispatch` (S07
+/// slice 17 combined drain-then-dispatch; slice 15 introduced the drain via
+/// `timer::drain_into_scheduler`, still the inner drain step), emit
 /// `TICK ok=1 ticks=<n>`, then volatile-read [`PF_PROBE_ADDR`] (unmapped
 /// guard → not-present `#PF`).
 /// The `#PF` gate jumps to [`exception_handler_pf_rust`], which emits
@@ -292,12 +294,14 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 /// The tick wait is bounded (200 `hlt` spins ≈ 2 s budget at 100 Hz): a
 /// missing tick emits `TICK ok=0 ticks=0` and the e2e hard-require fails
 /// loudly instead of hanging. The drain runs gated (`cli` + `IrqGuard` +
-/// `drain_into_scheduler`), closing the REVIEW #442 R2 static-mut drain in
+/// `poll_timer_dispatch`), closing the REVIEW #442 R2 static-mut drain in
 /// the guest. The quantum feed arms a two-thread demo scheduler
 /// (metadata-only descriptors, no stack switch) with one gated dispatch,
 /// drains HW ticks into it (bulk accounting, at most one resched owed),
 /// and dispatches ONCE on expiry — the same
-/// `drain_timer`-then-`dispatch_gated` shape the future PIT handler uses.
+/// `drain_then_dispatch_gated` shape the future PIT handler uses (S07
+/// slice 17: drain-then-pick in one helper so the backlog credits the
+/// pre-dispatch current, never the new one).
 /// The timer IRQ body only ticks (no serial), so extra ticks during the
 /// later `#PF`/`#DE` park cannot interleave the proof lines.
 /// The `TICK` line shape is unchanged (`ok=<0|1> ticks=<n>`), so the e2e
@@ -350,10 +354,11 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
             let _ = sched.spawn(t2);
         }
         let _ = sched.dispatch_gated(&gate);
-        let (drained, expired) = timer::drain_into_scheduler(&mut sched, &gate);
-        if expired {
-            let _ = sched.dispatch_gated(&gate);
-        }
+        // S07 slice 17: combined drain-then-dispatch (credits to the
+        // pre-dispatch current before the pick, so the backlog can never
+        // misattribute to the new current). Dispatch result ignored: the
+        // demo table always has a Ready target when expiry fires.
+        let (drained, _dispatched) = timer::poll_timer_dispatch(&mut sched, &gate);
         write_tick_line(drained > 0, drained);
     }
     // Live #PF (#168n6, sole functional open): touch the unmapped guard.
@@ -700,6 +705,7 @@ mod tests {
             "program_pit",
             "pending_snapshot",
             "drain_into_scheduler",
+            "poll_timer_dispatch",
             "load_gdt",
             "load_idt",
             "sti",
