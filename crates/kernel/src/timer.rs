@@ -55,6 +55,19 @@ pub const PICS_DATA: u16 = 0xA1;
 /// PIC end-of-interrupt byte (master; IRQ0 handler issues exactly one).
 pub const PIC_EOI: u8 = 0x20;
 
+/// PIC ICW1: edge-triggered, cascade mode, ICW4 needed (`0x11`).
+pub const PIC_ICW1_INIT_ICW4: u8 = 0x11;
+/// PIC ICW4: 8086 mode (`0x01`).
+pub const PIC_ICW4_8086: u8 = 0x01;
+/// PIC ICW3 master: slave present at IRQ2 (`0x04`).
+pub const PIC_ICW3_MASTER_SLAVE_IRQ2: u8 = 0x04;
+/// PIC ICW3 slave: cascade identity (`0x02`).
+pub const PIC_ICW3_SLAVE_IDENTITY: u8 = 0x02;
+/// PIC master mask with IRQ0 unmasked only (`0xFE`).
+pub const PICM_MASK_IRQ0_ONLY: u8 = 0xFE;
+/// PIC slave mask with all lines masked (`0xFF`; IRQ0 is master-only).
+pub const PICS_MASK_ALL: u8 = 0xFF;
+
 /// Integer PIT divisor for `hz` (`PIT_BASE_HZ / hz`); fails closed to `0`
 /// when the quotient is not programmable: `hz == 0`, quotient `0`
 /// (`hz > PIT_BASE_HZ`), or quotient `> 0xFFFF` (e.g. `hz == 1` gives
@@ -92,10 +105,13 @@ pub const TIMER_PROGRAM: Option<(u8, u8)> = pit_program_bytes(TIMER_DIVISOR);
 ///
 /// Returns the `(port, value)` pairs the guest wiring slice emits in order
 /// to remap the 8259 pair so IRQ0 lands on [`VECTOR_TIMER`] (32):
-/// ICW1 (`0x11`) to both command ports, ICW2 (offsets [`PICM_OFFSET`] /
-/// [`PICS_OFFSET`]), ICW3 (master `0x04` = slave at IRQ2, slave `0x02` =
-/// cascade identity), ICW4 (`0x01` = 8086 mode). Masks ride separately
-/// (wiring slice unmasks IRQ0 only: master `0xFE`, slave `0xFF`).
+/// ICW1 ([`PIC_ICW1_INIT_ICW4`]) to both command ports, ICW2 (offsets
+/// [`PICM_OFFSET`] / [`PICS_OFFSET`]), ICW3 (master
+/// [`PIC_ICW3_MASTER_SLAVE_IRQ2`] = slave at IRQ2, slave
+/// [`PIC_ICW3_SLAVE_IDENTITY`] = cascade identity), ICW4
+/// ([`PIC_ICW4_8086`] = 8086 mode). Masks ride separately
+/// ([`pic_mask_writes`]: master [`PICM_MASK_IRQ0_ONLY`], slave
+/// [`PICS_MASK_ALL`]).
 /// String/const-only this slice — no port I/O, guest keeps `cli`, so QEMU
 /// behavior is unchanged. Host tests pin the order so the wiring slice
 /// cannot silently swap an offset or drop ICW3/ICW4 (which would wedge
@@ -103,15 +119,44 @@ pub const TIMER_PROGRAM: Option<(u8, u8)> = pit_program_bytes(TIMER_DIVISOR);
 #[must_use]
 pub const fn pic_remap_writes() -> [(u16, u8); 8] {
     [
-        (PICM_CMD, 0x11),
-        (PICS_CMD, 0x11),
+        (PICM_CMD, PIC_ICW1_INIT_ICW4),
+        (PICS_CMD, PIC_ICW1_INIT_ICW4),
         (PICM_DATA, PICM_OFFSET),
         (PICS_DATA, PICS_OFFSET),
-        (PICM_DATA, 0x04),
-        (PICS_DATA, 0x02),
-        (PICM_DATA, 0x01),
-        (PICS_DATA, 0x01),
+        (PICM_DATA, PIC_ICW3_MASTER_SLAVE_IRQ2),
+        (PICS_DATA, PIC_ICW3_SLAVE_IDENTITY),
+        (PICM_DATA, PIC_ICW4_8086),
+        (PICS_DATA, PIC_ICW4_8086),
     ]
+}
+
+/// PIC mask `outb` sequence (S07 slice12, pure `core`-only plan).
+///
+/// Returns the `(port, value)` pairs the guest wiring slice emits AFTER
+/// [`pic_remap_writes`] to unmask IRQ0 only: master
+/// [`PICM_MASK_IRQ0_ONLY`] (`0xFE`), slave [`PICS_MASK_ALL`] (`0xFF`).
+/// IRQ0 is master-only so the slave stays fully masked. String/const-only
+/// this slice — no port I/O, guest keeps `cli`.
+#[must_use]
+pub const fn pic_mask_writes() -> [(u16, u8); 2] {
+    [(PICM_DATA, PICM_MASK_IRQ0_ONLY), (PICS_DATA, PICS_MASK_ALL)]
+}
+
+/// PIT program `outb` sequence (S07 slice12, pure `core`-only plan).
+///
+/// Returns the `(port, value)` triples the guest wiring slice emits in
+/// order to arm channel 0 at [`TIMER_HZ`]: mode byte
+/// [`PIT_MODE_CH0_SQUARE`] to [`PIT_CMD`], then the [`TIMER_PROGRAM`]
+/// lobyte/hibyte pair to [`PIT_CH0`]. Consumes [`TIMER_PROGRAM`] (never
+/// a raw divisor) so a `0` can never reach the port (`0x0000` latches
+/// 65536, not "stop"): returns `None` when [`TIMER_PROGRAM`] is `None`.
+/// String/const-only this slice — no port I/O, guest keeps `cli`.
+#[must_use]
+pub const fn pit_program_writes() -> Option<[(u16, u8); 3]> {
+    match TIMER_PROGRAM {
+        None => None,
+        Some((lo, hi)) => Some([(PIT_CMD, PIT_MODE_CH0_SQUARE), (PIT_CH0, lo), (PIT_CH0, hi)]),
+    }
 }
 
 /// Split a programmable divisor into the `(lobyte, hibyte)` pair the wiring
@@ -216,6 +261,11 @@ static mut TIMER_TICKS: TimerTicks = TimerTicks::new();
 /// `iretq`s. Body records exactly one saturating tick and returns — never
 /// parks, never touches ports (EOI lives in the stub so `mov al` cannot
 /// clobber the caller's `rax` before the pops).
+///
+/// S07 slice12: IRQ side uses the gated form (`tick_gated` under
+/// `IrqGuard::enter()` — the interrupt gate clears IF, so the `cli`
+/// proof holds on entry). Raw `tick()` stays for host parity tests only;
+/// the scheduler drain must use `take_gated` under the same guard.
 #[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn timer_irq_rust() {
@@ -223,7 +273,8 @@ pub extern "C" fn timer_irq_rust() {
     // single-threaded boot owns `TIMER_TICKS` until the wiring slice adds
     // the gated drain. Host builds never link this symbol.
     unsafe {
-        (*core::ptr::addr_of_mut!(TIMER_TICKS)).tick();
+        let gate = IrqGuard::enter();
+        (*core::ptr::addr_of_mut!(TIMER_TICKS)).tick_gated(&gate);
     }
 }
 
@@ -386,19 +437,70 @@ mod tests {
         // S07 slice11: pure plan the wiring slice emits in order. Offsets
         // must equal the PICM/S_OFFSET consts (IRQ0 -> VECTOR_TIMER); a
         // swapped ICW2 or a dropped ICW3/ICW4 must go red here.
+        // S07 slice12: ICW bytes are named consts so the plan cannot drift
+        // from the documented values.
+        assert_eq!(PIC_ICW1_INIT_ICW4, 0x11);
+        assert_eq!(PIC_ICW3_MASTER_SLAVE_IRQ2, 0x04);
+        assert_eq!(PIC_ICW3_SLAVE_IDENTITY, 0x02);
+        assert_eq!(PIC_ICW4_8086, 0x01);
         let seq = pic_remap_writes();
         assert_eq!(seq.len(), 8);
-        assert_eq!(seq[0], (PICM_CMD, 0x11));
-        assert_eq!(seq[1], (PICS_CMD, 0x11));
+        assert_eq!(seq[0], (PICM_CMD, PIC_ICW1_INIT_ICW4));
+        assert_eq!(seq[1], (PICS_CMD, PIC_ICW1_INIT_ICW4));
         assert_eq!(seq[2], (PICM_DATA, PICM_OFFSET));
         assert_eq!(seq[3], (PICS_DATA, PICS_OFFSET));
         assert_eq!(seq[2].1, 0x20);
         assert_eq!(seq[3].1, 0x28);
         assert_eq!(VECTOR_TIMER, 32);
-        assert_eq!(seq[4], (PICM_DATA, 0x04));
-        assert_eq!(seq[5], (PICS_DATA, 0x02));
-        assert_eq!(seq[6], (PICM_DATA, 0x01));
-        assert_eq!(seq[7], (PICS_DATA, 0x01));
+        assert_eq!(seq[4], (PICM_DATA, PIC_ICW3_MASTER_SLAVE_IRQ2));
+        assert_eq!(seq[5], (PICS_DATA, PIC_ICW3_SLAVE_IDENTITY));
+        assert_eq!(seq[6], (PICM_DATA, PIC_ICW4_8086));
+        assert_eq!(seq[7], (PICS_DATA, PIC_ICW4_8086));
+    }
+
+    #[test]
+    fn pic_mask_sequence_unmasks_irq0_only() {
+        // S07 slice12 (REVIEW #452 R4): mask plan the wiring slice emits
+        // after the remap — master IRQ0 only, slave fully masked.
+        assert_eq!(PICM_MASK_IRQ0_ONLY, 0xFE);
+        assert_eq!(PICS_MASK_ALL, 0xFF);
+        let seq = pic_mask_writes();
+        assert_eq!(seq.len(), 2);
+        assert_eq!(seq[0], (PICM_DATA, PICM_MASK_IRQ0_ONLY));
+        assert_eq!(seq[1], (PICS_DATA, PICS_MASK_ALL));
+    }
+
+    #[test]
+    fn pit_program_sequence_consumes_timer_program_const() {
+        // S07 slice12: guest PIT path consumes TIMER_PROGRAM (never a raw
+        // divisor) — mode byte to PIT_CMD, then lo/hi to PIT_CH0.
+        let seq = pit_program_writes().expect("TIMER_DIVISOR is programmable");
+        assert_eq!(TIMER_PROGRAM, Some((0x9B, 0x2E)));
+        assert_eq!(seq.len(), 3);
+        assert_eq!(seq[0], (PIT_CMD, PIT_MODE_CH0_SQUARE));
+        assert_eq!(seq[0].1, 0x36);
+        let (lo, hi) = TIMER_PROGRAM.expect("programmable");
+        assert_eq!(seq[1], (PIT_CH0, lo));
+        assert_eq!(seq[2], (PIT_CH0, hi));
+        assert_eq!(u16::from(lo) | (u16::from(hi) << 8), TIMER_DIVISOR);
+    }
+
+    #[test]
+    fn timer_stub_eoi_literals_match_pic_consts() {
+        // S07 slice12 (REVIEW #452 R3): the stub hardcodes `mov al, 0x20`
+        // / `out 0x20, al` as text, so pin the consts to the same literals
+        // here — a const/rename drift fails here, not silently in QEMU.
+        assert_eq!(PICM_CMD, 0x20);
+        assert_eq!(PIC_EOI, 0x20);
+        let stub = timer_stub_text();
+        assert!(
+            stub.contains("mov al, 0x20"),
+            "EOI byte must match PIC_EOI: {stub}"
+        );
+        assert!(
+            stub.contains("out 0x20, al"),
+            "EOI port must match PICM_CMD: {stub}"
+        );
     }
 
     #[test]
