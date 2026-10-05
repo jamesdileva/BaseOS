@@ -31,6 +31,7 @@ pub mod page_table;
 pub mod sched;
 pub mod sync;
 pub mod thread;
+pub mod timer;
 /// Safe COM1 port-I/O boundary: raw `in`/`out` confined to private
 /// `uart::outb`/`inb` bodies; safe callers use `uart::com1_write_byte` and
 /// the `write_*` line helpers without an `unsafe` block.
