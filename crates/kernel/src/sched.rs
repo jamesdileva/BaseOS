@@ -1712,6 +1712,20 @@ mod tests {
         hw2.tick();
         assert_eq!(v.drain_timer(&mut hw2, &gate), (1, false));
         assert_eq!(v.quantum_left(), QUANTUM_TICKS - 1);
+        // Armed-unknown preserve (REVIEW #468 R2): unreachable via safe
+        // API (no setter for an absent current), so pin it via the
+        // test-child private-field access: force unknown current with a
+        // full quantum, then drain must consume HW ticks but preserve
+        // the quantum, credit nothing, owe no expiry.
+        v.current = 99;
+        v.ticks_left = QUANTUM_TICKS;
+        let mut hw_armed_unknown = TimerTicks::new();
+        hw_armed_unknown.tick();
+        hw_armed_unknown.tick();
+        assert_eq!(v.drain_timer(&mut hw_armed_unknown, &gate), (2, false));
+        assert_eq!(v.quantum_left(), QUANTUM_TICKS);
+        assert_eq!(v.total_cpu_ticks(), 1);
+        assert_eq!(hw_armed_unknown.pending(), 0);
         // Flood: bulk credit lands on the running thread in O(1).
         let mut f = Scheduler::new(1);
         assert!(f.spawn(mk(1, 0x1000_0000)));
