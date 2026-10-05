@@ -410,6 +410,27 @@ impl Scheduler {
         (drained, Some(self.dispatch_gated(gate)))
     }
 
+    /// Demo table constructor the IRQ-owned static consumes (S07 slice 19).
+    ///
+    /// Builds `Scheduler::new(1)`, spawns metadata-only descriptors 1 and 2
+    /// (same bases/entry ids as the bring-up probe — no stack switch, just
+    /// the quantum counter the HW ticks drain into), then one gated dispatch
+    /// (armed, `current == 2`). Spawn/dispatch failures are ignored (demo
+    /// table always has a `Ready` target when the refusal-free path holds).
+    /// Pure (no static) so host tests pin it; the guest
+    /// [`sched_init_demo_static`] copies it into `STATIC_SCHED`.
+    pub fn demo_armed_scheduler(gate: &IrqGuard) -> Self {
+        let mut s = Scheduler::new(1);
+        if let Ok(t1) = Thread::new(1, 0x1000_0000, 8192, 0x1001) {
+            let _ = s.spawn(t1);
+        }
+        if let Ok(t2) = Thread::new(2, 0x2000_0000, 8192, 0x1002) {
+            let _ = s.spawn(t2);
+        }
+        let _ = s.dispatch_gated(gate);
+        s
+    }
+
     /// Record one quantum while capacity remains (refusals never reach here;
     /// saturation keeps the prefix deterministic instead of wrapping).
     fn record_trace(&mut self, id: u64) {
@@ -611,6 +632,45 @@ impl Scheduler {
     pub fn exit_current_gated(&mut self, _gate: &IrqGuard) -> Result<u64, SwitchError> {
         self.exit_current()
     }
+}
+
+/// IRQ-owned scheduler table (S07 slice 19, guest-only).
+///
+/// `static mut`, guest-only: the future IRQ0 periodic handler needs `&mut`
+/// access from IRQ context, which cannot borrow bring-up's stack-local. The
+/// tick counter (`timer::TIMER_TICKS`) is already IRQ-owned the same way;
+/// this is its scheduler half. Single-threaded boot owns it (`cli` +
+/// `&IrqGuard` on every access); the interrupt gate clears IF so a
+/// handler-side `IrqGuard::enter()` proof holds on entry. Host `cargo test`
+/// never touches this (the pure [`Scheduler::demo_armed_scheduler`]
+/// constructor covers the build rule; the static wiring is proven by QEMU).
+#[cfg(not(test))]
+static mut STATIC_SCHED: Scheduler = Scheduler::new(NULL_THREAD);
+
+/// Guest-only static init (S07 slice 19): reset `STATIC_SCHED` to the
+/// demo-armed table ([`Scheduler::demo_armed_scheduler`]).
+///
+/// # Safety
+/// Post-EBS guest only, `cli` in effect, `gate` proves the critical
+/// section; single-threaded boot owns `STATIC_SCHED`.
+#[cfg(not(test))]
+pub(crate) unsafe fn sched_init_demo_static(gate: &IrqGuard) {
+    STATIC_SCHED = Scheduler::demo_armed_scheduler(gate);
+}
+
+/// Guest-only static poll (S07 slice 19): drain `ticks` into `STATIC_SCHED`
+/// via [`Scheduler::drain_then_dispatch_gated`] (bulk credit to the
+/// pre-dispatch current, then at most one gated dispatch on expiry).
+///
+/// # Safety
+/// Post-EBS guest only, `cli` in effect, `gate` proves the critical
+/// section; single-threaded boot owns `STATIC_SCHED` and `ticks`.
+#[cfg(not(test))]
+pub(crate) unsafe fn sched_poll_static(
+    ticks: &mut TimerTicks,
+    gate: &IrqGuard,
+) -> (u64, Option<Result<u64, SwitchError>>) {
+    (&mut *core::ptr::addr_of_mut!(STATIC_SCHED)).drain_then_dispatch_gated(ticks, gate)
 }
 
 #[cfg(test)]
@@ -1756,6 +1816,41 @@ mod tests {
             assert_eq!(a.cpu_ticks_of(2), b.cpu_ticks_of(2));
             assert_eq!(a.quantum_left(), b.quantum_left());
         }
+    }
+
+    #[test]
+    fn demo_armed_scheduler_matches_bring_up_shape() {
+        // S07 slice 19: the IRQ-owned static init consumes this constructor,
+        // so pin the build rule host-side (guest static wiring is proven by
+        // QEMU `TICK ok=1`). Same table the old bring-up inlined: two
+        // metadata-only descriptors, one armed dispatch to 2.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut s = Scheduler::demo_armed_scheduler(&gate);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.current(), 2);
+        assert_eq!(s.state_of(2), Some(ThreadState::Running));
+        assert_eq!(s.state_of(1), Some(ThreadState::Ready));
+        assert_eq!(s.quantum_left(), QUANTUM_TICKS);
+        assert_eq!(s.runs_of(2), Some(1));
+        assert_eq!(s.runs_of(1), Some(0));
+        assert_eq!(s.cpu_ticks_of(1), Some(0));
+        assert_eq!(s.cpu_ticks_of(2), Some(0));
+        // Drains like the armed bring-up table: 1 tick credits current 2
+        // without expiry; a full quantum expires and rescheds to 1.
+        let mut one = TimerTicks::new();
+        one.tick();
+        assert_eq!(s.drain_then_dispatch_gated(&mut one, &gate), (1, None));
+        assert_eq!(s.cpu_ticks_of(2), Some(1));
+        let mut rest = TimerTicks::new();
+        let mut i = 0u64;
+        while i < QUANTUM_TICKS - 1 {
+            rest.tick();
+            i += 1;
+        }
+        let (drained, dispatched) = s.drain_then_dispatch_gated(&mut rest, &gate);
+        assert_eq!(drained, QUANTUM_TICKS - 1);
+        assert_eq!(dispatched, Some(Ok(1)));
+        assert_eq!(s.cpu_ticks_of(2), Some(QUANTUM_TICKS));
     }
 
     #[test]

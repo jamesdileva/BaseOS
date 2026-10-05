@@ -277,14 +277,17 @@ core::arch::global_asm!(de_isr_stub_asm!());
 core::arch::global_asm!(pf_isr_stub_asm!());
 
 /// Guest-only CPU bring-up + timer first-tick + scheduler quantum feed +
-/// live `#PF` proof (S07 slice15): load GDT, load IDT (now covering `#DE` +
-/// `#PF` + timer IRQ0 vector 32), remap the PIC, arm the PIT at 100 Hz
+/// live `#PF` proof (S07 slice15; slice19: IRQ-owned static scheduler): load
+/// GDT, load IDT (now covering `#DE` + `#PF` + timer IRQ0 vector 32), remap
+/// the PIC, arm the PIT at 100 Hz
 /// (fail-closed: `pit_program_writes() == None` skips `program` + `sti` and
 /// emits `TICK ok=0 ticks=0` before the `#PF` probe — REVIEW #458 residue
 /// 1), `sti`, wait for the first IRQ0 tick, feed the drained HW ticks into
-/// an armed `Scheduler` quantum via `timer::poll_timer_dispatch` (S07
-/// slice 17 combined drain-then-dispatch, slice 18 delegating directly to
-/// `Scheduler::drain_then_dispatch_gated` so the wrapper cannot drift),
+/// the IRQ-owned static demo scheduler quantum via `timer::poll_timer_dispatch`
+/// (S07 slice 17 combined drain-then-dispatch, slice 18 delegating directly
+/// to `Scheduler::drain_then_dispatch_gated` so the wrapper cannot drift,
+/// slice 19 static-only over `TIMER_TICKS` + `STATIC_SCHED` so no
+/// stack-local table remains for the future live IRQ handler),
 /// emit
 /// `TICK ok=1 ticks=<n>`, then volatile-read [`PF_PROBE_ADDR`] (unmapped
 /// guard → not-present `#PF`).
@@ -343,23 +346,17 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         // `#PF` probe below runs deterministically.
         cpu::cli();
         let gate = cpu::IrqGuard::enter();
-        // Scheduler quantum feed (S07 slice15): arm a demo table
-        // (descriptors are metadata-only here — no stack switch, just the
-        // quantum counter the HW ticks drain into), then drain via the
-        // scheduler path and reschedule ONCE on expiry.
-        let mut sched = crate::sched::Scheduler::new(1);
-        if let Ok(t1) = crate::thread::Thread::new(1, 0x1000_0000, 8192, 0x1001) {
-            let _ = sched.spawn(t1);
-        }
-        if let Ok(t2) = crate::thread::Thread::new(2, 0x2000_0000, 8192, 0x1002) {
-            let _ = sched.spawn(t2);
-        }
-        let _ = sched.dispatch_gated(&gate);
+        // Scheduler quantum feed (S07 slice15; slice19 static): arm the
+        // IRQ-owned static demo table (descriptors are metadata-only here —
+        // no stack switch, just the quantum counter the HW ticks drain
+        // into), then drain via the static scheduler path and reschedule
+        // ONCE on expiry.
+        crate::sched::sched_init_demo_static(&gate);
         // S07 slice 17: combined drain-then-dispatch (credits to the
         // pre-dispatch current before the pick, so the backlog can never
         // misattribute to the new current). Dispatch result ignored: the
         // demo table always has a Ready target when expiry fires.
-        let (drained, _dispatched) = timer::poll_timer_dispatch(&mut sched, &gate);
+        let (drained, _dispatched) = timer::poll_timer_dispatch(&gate);
         write_tick_line(drained > 0, drained);
     }
     // Live #PF (#168n6, sole functional open): touch the unmapped guard.

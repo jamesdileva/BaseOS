@@ -22,8 +22,6 @@
 //! Failure model: all pure, never panics, `core`-only.
 
 use crate::cpu::IrqGuard;
-#[cfg(not(test))]
-use crate::sched::Scheduler;
 
 /// PIT input clock (Intel 8254, 1.193182 MHz).
 pub const PIT_BASE_HZ: u32 = 1_193_182;
@@ -262,33 +260,38 @@ pub(crate) unsafe fn pending_snapshot() -> u64 {
 }
 
 /// Guest-only combined PIT-handler step (S07 slice 17; slice 18 delegates
-/// to the helper instead of re-implementing it).
+/// to the helper instead of re-implementing it; slice 19 is static-only).
 ///
-/// Delegates to
-/// [`crate::sched::Scheduler::drain_then_dispatch_gated`] over the static
-/// `TIMER_TICKS` (bulk credit to the pre-dispatch current, then at most one
-/// gated dispatch on expiry) and returns `(drained, dispatch)` — `dispatch`
-/// is `None` when no expiry (nothing to do) and `Some(Ok/Err)` when one
-/// resched was attempted. Single call site
-/// (`bring_up_cpu_and_prove_exception`) so the guest can never dispatch
-/// without draining first (REVIEW #462 risk 1), and the helper owns the
-/// order so this wrapper cannot drift from it (REVIEW #464 nit 1). The
-/// `TICK` line still reports `drained` only; the dispatch result is
-/// intentionally ignored (demo table always has a `Ready` target).
+/// Drains the IRQ-owned static `TIMER_TICKS` into the IRQ-owned static
+/// scheduler via [`crate::sched::sched_poll_static`] (bulk credit to the
+/// pre-dispatch current, then at most one gated dispatch on expiry) and
+/// returns `(drained, dispatch)` — `dispatch` is `None` when no expiry
+/// (nothing to do) and `Some(Ok/Err)` when one resched was attempted.
+/// Single call site (`bring_up_cpu_and_prove_exception`) so the guest can
+/// never dispatch without draining first (REVIEW #462 risk 1), and the
+/// helper owns the order so this wrapper cannot drift from it (REVIEW #464
+/// nit 1). The `TICK` line still reports `drained` only; the dispatch result
+/// is intentionally ignored (demo table always has a `Ready` target).
 ///
 /// Retry-spin note (REVIEW #464 nit 2): a failed resched (`Some(Err)`)
 /// keeps the consumed quantum (`ticks_left == 0`), so every subsequent
 /// non-empty drain retries exactly one dispatch; empty drains stay `None`.
 ///
+/// Static note (S07 slice 19): both ends are IRQ-owned statics now — the
+/// counter (`TIMER_TICKS`) and the table (`sched::STATIC_SCHED`, armed once
+/// via `sched_init_demo_static`). No stack-local scheduler remains, so the
+/// future live periodic IRQ handler can call this same path from IRQ
+/// context (still task-context polled this slice; the handler move rides
+/// with the S08 live periodic slice together with its failure backoff).
+///
 /// # Safety
 /// Post-EBS guest only, `cli` in effect, `gate` proves the critical
-/// section; single-threaded boot owns `TIMER_TICKS` and `sched`.
+/// section; single-threaded boot owns `TIMER_TICKS` and the static sched.
 #[cfg(not(test))]
 pub(crate) unsafe fn poll_timer_dispatch(
-    sched: &mut Scheduler,
     gate: &IrqGuard,
 ) -> (u64, Option<Result<u64, crate::thread::SwitchError>>) {
-    sched.drain_then_dispatch_gated(&mut (*core::ptr::addr_of_mut!(TIMER_TICKS)), gate)
+    crate::sched::sched_poll_static(&mut (*core::ptr::addr_of_mut!(TIMER_TICKS)), gate)
 }
 
 /// Shared IRQ0 ISR stub source (AT&T). Same Win64-ABI contract as the
