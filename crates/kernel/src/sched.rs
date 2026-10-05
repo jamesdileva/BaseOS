@@ -389,6 +389,15 @@ impl Scheduler {
     /// count the quantum down while crediting nothing (fail-closed, pinned
     /// by the edges test); a failed resched (`Some(Err)`) keeps the
     /// consumed quantum (still `0`), it does not rearm.
+    ///
+    /// Retry-spin semantics (S07 slice 18, REVIEW #464 nit 2 — intentional):
+    /// because the consumed quantum stays `0`, every subsequent NON-EMPTY
+    /// drain reports expired and retries exactly one gated dispatch, while
+    /// empty drains (`drained == 0`) report `(0, None)` and never retry.
+    ///
+    /// Overflow-signal decision (S07 slice 18): `cpu[]`/`runs[]` saturate
+    /// (no wrap, no overflow flag); the S08 harness adds a signal only if
+    /// it ever samples long enough to care (`u64::MAX` is ~5 Gyr at 100 Hz).
     pub fn drain_then_dispatch_gated(
         &mut self,
         ticks: &mut TimerTicks,
@@ -1672,6 +1681,81 @@ mod tests {
         assert_eq!(du, 1);
         assert_eq!(dispu, Some(Err(SwitchError::Unknown)));
         assert_eq!(u.total_cpu_ticks(), 0);
+    }
+
+    #[test]
+    fn drain_then_dispatch_failed_resched_retries_once_per_nonempty_drain() {
+        // S07 slice 18 (REVIEW #464 nit 2): a failed resched keeps the
+        // consumed quantum (`ticks_left == 0`), so every subsequent
+        // NON-EMPTY drain retries exactly one dispatch while empty drains
+        // stay quiet — intentional, pinned here so it reads as designed.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut u = Scheduler::new(99);
+        assert!(u.spawn(mk(1, 0x1000_0000)));
+        let mut hw = TimerTicks::new();
+        hw.tick();
+        let (d1, r1) = u.drain_then_dispatch_gated(&mut hw, &gate);
+        assert_eq!(d1, 1);
+        assert_eq!(r1, Some(Err(SwitchError::Unknown)));
+        assert_eq!(u.quantum_left(), 0);
+        // Empty drain: no retry even though the quantum is spent.
+        let mut empty = TimerTicks::new();
+        let (d0, r0) = u.drain_then_dispatch_gated(&mut empty, &gate);
+        assert_eq!((d0, r0.is_none()), (0, true));
+        assert_eq!(u.quantum_left(), 0);
+        // Next non-empty drain retries exactly once (still Err, still 0).
+        hw.tick();
+        hw.tick();
+        let (d2, r2) = u.drain_then_dispatch_gated(&mut hw, &gate);
+        assert_eq!(d2, 2);
+        assert_eq!(r2, Some(Err(SwitchError::Unknown)));
+        assert_eq!(u.quantum_left(), 0);
+        assert_eq!(u.total_cpu_ticks(), 0);
+    }
+
+    #[test]
+    fn drain_then_dispatch_matches_manual_drain_plus_dispatch() {
+        // S07 slice 18 (REVIEW #464 nit 1): the helper owns the
+        // drain-before-pick order, so it must agree tick-for-tick with the
+        // manual `drain_timer`-then-`dispatch_gated` sequence the old guest
+        // wrapper inlined. A future helper edit that reorders (credit after
+        // pick) or double-dispatches goes red here.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        fn manual(
+            s: &mut Scheduler,
+            hw: &mut TimerTicks,
+            gate: &IrqGuard,
+        ) -> (u64, Option<Result<u64, SwitchError>>) {
+            let (drained, expired) = s.drain_timer(hw, gate);
+            if !expired {
+                return (drained, None);
+            }
+            (drained, Some(s.dispatch_gated(gate)))
+        }
+        for ticks in [1u64, 2, 4, 5, 9] {
+            let mut a = Scheduler::new(1);
+            assert!(a.spawn(mk(1, 0x1000_0000)));
+            assert!(a.spawn(mk(2, 0x2000_0000)));
+            assert_eq!(a.dispatch_gated(&gate), Ok(2));
+            let mut b = a.clone();
+            let mut ha = TimerTicks::new();
+            let mut hb = TimerTicks::new();
+            let mut i = 0;
+            while i < ticks {
+                ha.tick();
+                hb.tick();
+                i += 1;
+            }
+            let ra = a.drain_then_dispatch_gated(&mut ha, &gate);
+            let rb = manual(&mut b, &mut hb, &gate);
+            assert_eq!(
+                ra, rb,
+                "helper must match manual sequence for {ticks} ticks"
+            );
+            assert_eq!(a.current(), b.current());
+            assert_eq!(a.cpu_ticks_of(2), b.cpu_ticks_of(2));
+            assert_eq!(a.quantum_left(), b.quantum_left());
+        }
     }
 
     #[test]

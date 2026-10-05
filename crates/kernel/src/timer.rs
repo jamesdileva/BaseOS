@@ -261,34 +261,24 @@ pub(crate) unsafe fn pending_snapshot() -> u64 {
     core::ptr::addr_of!(TIMER_TICKS).read_volatile().pending()
 }
 
-/// Guest-only scheduler quantum feed (S07 slice15; supersedes the slice14
-/// count-only `drain_gated`, removed — this is the single guest drain path).
+/// Guest-only combined PIT-handler step (S07 slice 17; slice 18 delegates
+/// to the helper instead of re-implementing it).
 ///
-/// Drains the static `TIMER_TICKS` into `sched` via
-/// [`crate::sched::Scheduler::drain_timer`] (bulk `saturating_sub`, at most
-/// one dispatch owed) and returns `(drained, expired)` — the caller emits
-/// the `TICK` line from `drained` and dispatches ONCE on `expired`, never
-/// a tight re-tick loop (slice-6 timer rule).
-///
-/// # Safety
-/// Post-EBS guest only, `cli` in effect, `gate` proves the critical
-/// section; single-threaded boot owns `TIMER_TICKS` and `sched`.
-#[cfg(not(test))]
-pub(crate) unsafe fn drain_into_scheduler(sched: &mut Scheduler, gate: &IrqGuard) -> (u64, bool) {
-    sched.drain_timer(&mut (*core::ptr::addr_of_mut!(TIMER_TICKS)), gate)
-}
-
-/// Guest-only combined PIT-handler step (S07 slice 17).
-///
-/// Drains the static `TIMER_TICKS` into `sched` via
-/// [`crate::sched::Scheduler::drain_then_dispatch_gated`] (bulk credit to
-/// the pre-dispatch current, then at most one gated dispatch on expiry)
-/// and returns `(drained, dispatch)` — `dispatch` is `None` when no expiry
-/// (nothing to do) and `Some(Ok/Err)` when one resched was attempted. The
-/// single call site (`bring_up_cpu_and_prove_exception`) uses this so the
-/// guest can never dispatch without draining first (REVIEW #462 risk 1).
-/// The `TICK` line still reports `drained` only; the dispatch result is
+/// Delegates to
+/// [`crate::sched::Scheduler::drain_then_dispatch_gated`] over the static
+/// `TIMER_TICKS` (bulk credit to the pre-dispatch current, then at most one
+/// gated dispatch on expiry) and returns `(drained, dispatch)` — `dispatch`
+/// is `None` when no expiry (nothing to do) and `Some(Ok/Err)` when one
+/// resched was attempted. Single call site
+/// (`bring_up_cpu_and_prove_exception`) so the guest can never dispatch
+/// without draining first (REVIEW #462 risk 1), and the helper owns the
+/// order so this wrapper cannot drift from it (REVIEW #464 nit 1). The
+/// `TICK` line still reports `drained` only; the dispatch result is
 /// intentionally ignored (demo table always has a `Ready` target).
+///
+/// Retry-spin note (REVIEW #464 nit 2): a failed resched (`Some(Err)`)
+/// keeps the consumed quantum (`ticks_left == 0`), so every subsequent
+/// non-empty drain retries exactly one dispatch; empty drains stay `None`.
 ///
 /// # Safety
 /// Post-EBS guest only, `cli` in effect, `gate` proves the critical
@@ -298,11 +288,7 @@ pub(crate) unsafe fn poll_timer_dispatch(
     sched: &mut Scheduler,
     gate: &IrqGuard,
 ) -> (u64, Option<Result<u64, crate::thread::SwitchError>>) {
-    let (drained, expired) = drain_into_scheduler(sched, gate);
-    if !expired {
-        return (drained, None);
-    }
-    (drained, Some(sched.dispatch_gated(gate)))
+    sched.drain_then_dispatch_gated(&mut (*core::ptr::addr_of_mut!(TIMER_TICKS)), gate)
 }
 
 /// Shared IRQ0 ISR stub source (AT&T). Same Win64-ABI contract as the

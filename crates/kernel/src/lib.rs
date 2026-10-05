@@ -283,8 +283,9 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 /// emits `TICK ok=0 ticks=0` before the `#PF` probe — REVIEW #458 residue
 /// 1), `sti`, wait for the first IRQ0 tick, feed the drained HW ticks into
 /// an armed `Scheduler` quantum via `timer::poll_timer_dispatch` (S07
-/// slice 17 combined drain-then-dispatch; slice 15 introduced the drain via
-/// `timer::drain_into_scheduler`, still the inner drain step), emit
+/// slice 17 combined drain-then-dispatch, slice 18 delegating directly to
+/// `Scheduler::drain_then_dispatch_gated` so the wrapper cannot drift),
+/// emit
 /// `TICK ok=1 ticks=<n>`, then volatile-read [`PF_PROBE_ADDR`] (unmapped
 /// guard → not-present `#PF`).
 /// The `#PF` gate jumps to [`exception_handler_pf_rust`], which emits
