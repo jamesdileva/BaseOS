@@ -175,8 +175,23 @@ impl TimerTicks {
     }
 
     /// Record one HW tick (saturates at `u64::MAX`).
+    ///
+    /// Host-only single-threaded form: once real IRQ0 lands, the IRQ-side
+    /// caller must use [`TimerTicks::tick_gated`] under `&IrqGuard` (same
+    /// serialized shape as `take_gated` on the drain side); raw `tick()`
+    /// stays for host parity tests only.
     pub const fn tick(&mut self) {
         self.pending = self.pending.saturating_add(1);
+    }
+
+    /// IRQ-gated tick: identical saturating increment to [`TimerTicks::tick`],
+    /// but the caller proves the `cli` critical section with `&IrqGuard`.
+    /// Together with [`TimerTicks::take_gated`] this closes the two-sided
+    /// gate host-side (REVIEW #448 residual 2): the wiring slice must call
+    /// the gated forms on both sides and must not program the PIT/enable
+    /// IRQ0 until the gate is held on both paths.
+    pub fn tick_gated(&mut self, _gate: &IrqGuard) {
+        self.tick();
     }
 
     /// Pending (undrained) ticks.
@@ -292,6 +307,30 @@ mod tests {
     }
 
     #[test]
+    fn tick_gated_agrees_with_tick() {
+        // REVIEW #448 residual 2 (two-sided gate): `tick_gated` adds the
+        // IrqGuard proof, never new increment logic — gated tick-for-tick
+        // parity with raw `tick()`, plus saturation parity at u64::MAX.
+        let gate = unsafe { IrqGuard::enter() };
+        let mut g = TimerTicks::new();
+        let mut u = TimerTicks::new();
+        for _ in 0..3 {
+            g.tick_gated(&gate);
+            u.tick();
+        }
+        assert_eq!(g.pending(), u.pending());
+        assert_eq!(g.pending(), 3);
+        g.pending = u64::MAX - 1;
+        u.pending = u64::MAX - 1;
+        g.tick_gated(&gate);
+        g.tick_gated(&gate);
+        u.tick();
+        u.tick();
+        assert_eq!(g.pending(), u64::MAX);
+        assert_eq!(g.pending(), u.pending());
+    }
+
+    #[test]
     fn pic_eoi_ports_pinned_for_irq0() {
         // IRQ0 is master-only: exactly one EOI byte to the master command
         // port. Slave ports are remap-path only this slice.
@@ -323,12 +362,52 @@ mod tests {
             !stub.contains("and rsp"),
             "returning IRQ stub must not destroy RSP with and: {stub}"
         );
-        for reg in ["push rax", "push rcx", "push rdx", "push r8", "push r9"] {
+        for reg in [
+            "push rax", "push rcx", "push rdx", "push r8", "push r9", "push r10", "push r11",
+        ] {
             assert!(stub.contains(reg), "stub must save {reg}: {stub}");
         }
-        for reg in ["pop rdx", "pop rcx", "pop rax", "pop r8", "pop r9"] {
+        for reg in [
+            "pop r11", "pop r10", "pop r9", "pop r8", "pop rdx", "pop rcx", "pop rax",
+        ] {
             assert!(stub.contains(reg), "stub must restore {reg}: {stub}");
         }
+        // REVIEW #448 residual 1: pin all 7 + LIFO order — a dropped r10/r11
+        // or a swapped push/pop pair must fail here, not pass silently.
+        let pushes = [
+            "push rax", "push rcx", "push rdx", "push r8", "push r9", "push r10", "push r11",
+        ];
+        let pops = [
+            "pop r11", "pop r10", "pop r9", "pop r8", "pop rdx", "pop rcx", "pop rax",
+        ];
+        let mut last = 0;
+        for reg in pushes {
+            let i = stub.find(reg).unwrap();
+            assert!(i >= last, "push order must be rax..r11: {stub}");
+            last = i;
+        }
+        last = 0;
+        for reg in pops {
+            let i = stub.find(reg).unwrap();
+            assert!(i >= last, "pop order must be r11..rax (LIFO): {stub}");
+            last = i;
+        }
+        // Full push block precedes the call; full pop block follows the EOI
+        // and precedes iretq.
+        let first_push = stub.find("push rax").unwrap();
+        let last_push = stub.find("push r11").unwrap();
+        let first_pop = stub.find("pop r11").unwrap();
+        let last_pop = stub.find("pop rax").unwrap();
+        let sub = stub.find("sub rsp, 32").unwrap();
+        let call_idx = stub.find("call timer_irq_rust").unwrap();
+        assert!(
+            first_push < last_push && last_push < sub && sub < call_idx,
+            "push block + shadow must precede call: {stub}"
+        );
+        assert!(
+            first_pop < last_pop,
+            "pop block must be LIFO r11..rax: {stub}"
+        );
         assert!(
             stub.contains("sub rsp, 32"),
             "32-byte shadow space required by Win64 ABI: {stub}"
