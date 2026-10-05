@@ -85,6 +85,15 @@ pub const QUANTUM_TICKS: u64 = 4;
 /// remove/compact API is added it MUST shift `runs` with `table` (or the
 /// counts misattribute); the sweep test below would go red on misalignment.
 ///
+/// S07 slice 16 — periodic PIT-handler accounting: `cpu[i]` belongs to the
+/// thread in `table[i]` under the same append-only invariant (zeroed on
+/// spawn, shifted with `table` if removal ever lands). Each gated
+/// [`Scheduler::drain_timer`] attributes the drained HW ticks to the
+/// CURRENT thread's slot (saturating add, one bulk O(1) credit — the
+/// running thread consumed those ticks while the quantum counted down).
+/// Unknown-`current` or empty drain credits nothing (fail-closed, no
+/// phantom time). Read via `cpu_ticks_of` / `total_cpu_ticks`.
+///
 /// S07 slice 2 — fairness: each successful `dispatch` is one equal quantum
 /// (no timer/preempt yet — preempt IRQ rides with a future timer slice and
 /// reuses the same gated pick). Fairness over N rounds is `max - min` of
@@ -114,6 +123,7 @@ pub const QUANTUM_TICKS: u64 = 4;
 pub struct Scheduler {
     table: [Option<Thread>; MAX_THREADS],
     runs: [u64; MAX_THREADS],
+    cpu: [u64; MAX_THREADS],
     trace: [u64; TRACE_CAP],
     trace_len: usize,
     ticks_left: u64,
@@ -140,6 +150,7 @@ impl Scheduler {
         Self {
             table: [None; MAX_THREADS],
             runs: [0; MAX_THREADS],
+            cpu: [0; MAX_THREADS],
             trace: [0; TRACE_CAP],
             trace_len: 0,
             ticks_left: 0,
@@ -207,6 +218,35 @@ impl Scheduler {
         let mut i = 0;
         while i < self.len {
             total = total.saturating_add(self.runs[i]);
+            i += 1;
+        }
+        total
+    }
+
+    /// CPU ticks consumed by one spawned thread (`None` when unknown id).
+    /// Read-only periodic-accounting query (S07 slice 16): each gated
+    /// `drain_timer` credits the drained HW ticks to the current thread.
+    #[must_use]
+    pub fn cpu_ticks_of(&self, id: u64) -> Option<u64> {
+        let mut i = 0;
+        while i < self.len {
+            if let Some(t) = self.table[i] {
+                if t.id() == id {
+                    return Some(self.cpu[i]);
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Total accounted CPU ticks (saturating sum over spawned slots).
+    #[must_use]
+    pub fn total_cpu_ticks(&self) -> u64 {
+        let mut total = 0u64;
+        let mut i = 0;
+        while i < self.len {
+            total = total.saturating_add(self.cpu[i]);
             i += 1;
         }
         total
@@ -311,6 +351,19 @@ impl Scheduler {
         if drained == 0 {
             return (0, false);
         }
+        // S07 slice 16 periodic accounting: the running thread consumed
+        // these HW ticks — credit them to the current slot (bulk O(1),
+        // saturating). Unknown `current` credits nothing (no phantom time).
+        let mut i = 0;
+        while i < self.len {
+            if let Some(t) = self.table[i] {
+                if t.id() == self.current {
+                    self.cpu[i] = self.cpu[i].saturating_add(drained);
+                    break;
+                }
+            }
+            i += 1;
+        }
         self.ticks_left = self.ticks_left.saturating_sub(drained);
         let expired = self.ticks_left == 0;
         (drained, expired)
@@ -375,6 +428,7 @@ impl Scheduler {
         }
         self.table[self.len] = Some(thread);
         self.runs[self.len] = 0;
+        self.cpu[self.len] = 0;
         let packed = self.packed();
         if validate_threads(&packed[..self.len + 1]).is_err() {
             self.table[self.len] = None;
@@ -1457,6 +1511,81 @@ mod tests {
         assert_eq!(s.drain_timer(&mut hw, &gate), (1, false));
         assert_eq!(s.quantum_left(), QUANTUM_TICKS - 1);
         assert_eq!(hw.pending(), 0);
+    }
+
+    #[test]
+    fn drain_timer_credits_cpu_ticks_to_current_thread() {
+        // S07 slice 16 periodic PIT-handler accounting: drained HW ticks
+        // are CPU time for the RUNNING thread (current slot), bulk O(1).
+        // Dispatch to 2, drain 2 ticks (partial) then 2 more (expiry):
+        // both credits land on 2; dispatch to 1 re-targets later credits.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert_eq!(s.cpu_ticks_of(1), Some(0));
+        assert_eq!(s.cpu_ticks_of(2), Some(0));
+        assert_eq!(s.total_cpu_ticks(), 0);
+        assert_eq!(s.cpu_ticks_of(99), None);
+        assert_eq!(s.dispatch_gated(&gate), Ok(2));
+        let mut hw = TimerTicks::new();
+        hw.tick();
+        hw.tick();
+        assert_eq!(s.drain_timer(&mut hw, &gate), (2, false));
+        assert_eq!(s.cpu_ticks_of(2), Some(2));
+        assert_eq!(s.cpu_ticks_of(1), Some(0));
+        assert_eq!(s.total_cpu_ticks(), 2);
+        hw.tick();
+        hw.tick();
+        assert_eq!(s.drain_timer(&mut hw, &gate), (2, true));
+        assert_eq!(s.cpu_ticks_of(2), Some(4));
+        assert_eq!(s.total_cpu_ticks(), 4);
+        assert_eq!(s.dispatch_gated(&gate), Ok(1));
+        let mut hw2 = TimerTicks::new();
+        hw2.tick();
+        assert_eq!(s.drain_timer(&mut hw2, &gate), (1, false));
+        assert_eq!(s.cpu_ticks_of(1), Some(1));
+        assert_eq!(s.cpu_ticks_of(2), Some(4));
+        assert_eq!(s.total_cpu_ticks(), 5);
+    }
+
+    #[test]
+    fn drain_timer_cpu_accounting_fail_closed_edges() {
+        // Empty drain credits nothing; unknown current credits nothing
+        // (no phantom time); flood credits bulk to the running thread.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        let mut empty = TimerTicks::new();
+        assert_eq!(s.drain_timer(&mut empty, &gate), (0, false));
+        assert_eq!(s.total_cpu_ticks(), 0);
+        let mut u = Scheduler::new(99);
+        assert!(u.spawn(mk(1, 0x1000_0000)));
+        let mut hw = TimerTicks::new();
+        hw.tick();
+        hw.tick();
+        hw.tick();
+        // Unknown current: quantum still counts down, but no slot is
+        // credited (fail-closed, never attributes to the wrong thread).
+        assert_eq!(u.drain_timer(&mut hw, &gate), (3, true));
+        assert_eq!(u.cpu_ticks_of(1), Some(0));
+        assert_eq!(u.total_cpu_ticks(), 0);
+        // Flood: bulk credit lands on the running thread in O(1).
+        let mut f = Scheduler::new(1);
+        assert!(f.spawn(mk(1, 0x1000_0000)));
+        assert!(f.spawn(mk(2, 0x2000_0000)));
+        assert_eq!(f.dispatch_gated(&gate), Ok(2));
+        let mut flood = TimerTicks::new();
+        let mut i = 0u64;
+        while i < 1000 {
+            flood.tick();
+            i += 1;
+        }
+        assert_eq!(f.drain_timer(&mut flood, &gate), (1000, true));
+        assert_eq!(f.cpu_ticks_of(2), Some(1000));
+        assert_eq!(f.cpu_ticks_of(1), Some(0));
+        assert_eq!(f.total_cpu_ticks(), 1000);
     }
 
     #[test]
