@@ -22,6 +22,8 @@
 //! Failure model: all pure, never panics, `core`-only.
 
 use crate::cpu::IrqGuard;
+#[cfg(not(test))]
+use crate::sched::Scheduler;
 
 /// PIT input clock (Intel 8254, 1.193182 MHz).
 pub const PIT_BASE_HZ: u32 = 1_193_182;
@@ -247,6 +249,10 @@ pub(crate) unsafe fn program_pit() {
 /// Volatile whole-struct read of `TIMER_TICKS` so the `sti` spin-wait
 /// observes IRQ-side increments without a data race on the host model
 /// (guest runs with IF set here; the IRQ body is the only writer).
+/// Atomicity note (REVIEW #458 residue 2): single-core boot, `u64` is
+/// 8-byte aligned so each x86-64 load/store is single-copy — the IRQ-side
+/// `tick_gated` write cannot tear this read; the drain itself runs gated
+/// under `cli` + `IrqGuard` anyway.
 ///
 /// # Safety
 /// Guest IRQ-enabled window only; single-threaded boot owns the read.
@@ -255,14 +261,21 @@ pub(crate) unsafe fn pending_snapshot() -> u64 {
     core::ptr::addr_of!(TIMER_TICKS).read_volatile().pending()
 }
 
-/// Guest-only gated drain (S07 slice14).
+/// Guest-only scheduler quantum feed (S07 slice15; supersedes the slice14
+/// count-only `drain_gated`, removed — this is the single guest drain path).
 ///
-/// Drains via [`TimerTicks::take_gated`] under `&IrqGuard`, closing the
-/// REVIEW #442 R2 static-mut drain in the guest (not just host parity):
-/// the IRQ side ticks gated, the bring-up side drains gated after `cli`.
+/// Drains the static `TIMER_TICKS` into `sched` via
+/// [`crate::sched::Scheduler::drain_timer`] (bulk `saturating_sub`, at most
+/// one dispatch owed) and returns `(drained, expired)` — the caller emits
+/// the `TICK` line from `drained` and dispatches ONCE on `expired`, never
+/// a tight re-tick loop (slice-6 timer rule).
+///
+/// # Safety
+/// Post-EBS guest only, `cli` in effect, `gate` proves the critical
+/// section; single-threaded boot owns `TIMER_TICKS` and `sched`.
 #[cfg(not(test))]
-pub(crate) unsafe fn drain_gated(gate: &IrqGuard) -> u64 {
-    (*core::ptr::addr_of_mut!(TIMER_TICKS)).take_gated(gate)
+pub(crate) unsafe fn drain_into_scheduler(sched: &mut Scheduler, gate: &IrqGuard) -> (u64, bool) {
+    sched.drain_timer(&mut (*core::ptr::addr_of_mut!(TIMER_TICKS)), gate)
 }
 
 /// Shared IRQ0 ISR stub source (AT&T). Same Win64-ABI contract as the

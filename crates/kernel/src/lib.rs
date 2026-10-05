@@ -276,11 +276,15 @@ core::arch::global_asm!(de_isr_stub_asm!());
 #[cfg(not(test))]
 core::arch::global_asm!(pf_isr_stub_asm!());
 
-/// Guest-only CPU bring-up + timer first-tick + live `#PF` proof (S07
-/// slice14): load GDT, load IDT (now covering `#DE` + `#PF` + timer IRQ0
-/// vector 32), remap the PIC + arm the PIT at 100 Hz, `sti`, wait for the
-/// first IRQ0 tick, emit `TICK ok=1 ticks=<n>`, then volatile-read
-/// [`PF_PROBE_ADDR`] (unmapped guard → not-present `#PF`).
+/// Guest-only CPU bring-up + timer first-tick + scheduler quantum feed +
+/// live `#PF` proof (S07 slice15): load GDT, load IDT (now covering `#DE` +
+/// `#PF` + timer IRQ0 vector 32), remap the PIC, arm the PIT at 100 Hz
+/// (fail-closed: `pit_program_writes() == None` skips `program` + `sti` and
+/// emits `TICK ok=0 ticks=0` before the `#PF` probe — REVIEW #458 residue
+/// 1), `sti`, wait for the first IRQ0 tick, feed the drained HW ticks into
+/// an armed `Scheduler` quantum via `timer::drain_into_scheduler`, emit
+/// `TICK ok=1 ticks=<n>`, then volatile-read [`PF_PROBE_ADDR`] (unmapped
+/// guard → not-present `#PF`).
 /// The `#PF` gate jumps to [`exception_handler_pf_rust`], which emits
 /// `PF ok=1 vector=14 code=... addr=...` and chains into an intentional
 /// `#DE` so `EXC ok=1 vector=0` still fires before parking — never returns.
@@ -288,9 +292,16 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 /// The tick wait is bounded (200 `hlt` spins ≈ 2 s budget at 100 Hz): a
 /// missing tick emits `TICK ok=0 ticks=0` and the e2e hard-require fails
 /// loudly instead of hanging. The drain runs gated (`cli` + `IrqGuard` +
-/// `take_gated`), closing the REVIEW #442 R2 static-mut drain in the guest.
+/// `drain_into_scheduler`), closing the REVIEW #442 R2 static-mut drain in
+/// the guest. The quantum feed arms a two-thread demo scheduler
+/// (metadata-only descriptors, no stack switch) with one gated dispatch,
+/// drains HW ticks into it (bulk accounting, at most one resched owed),
+/// and dispatches ONCE on expiry — the same
+/// `drain_timer`-then-`dispatch_gated` shape the future PIT handler uses.
 /// The timer IRQ body only ticks (no serial), so extra ticks during the
 /// later `#PF`/`#DE` park cannot interleave the proof lines.
+/// The `TICK` line shape is unchanged (`ok=<0|1> ticks=<n>`), so the e2e
+/// `ticks=[1-9]` hard-require is untouched.
 ///
 /// # Safety
 /// Must run post-`ExitBootServices` on the boot CPU with interrupts
@@ -301,26 +312,50 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
     cpu::load_gdt();
     cpu::load_idt();
     timer::remap_pic();
-    timer::program_pit();
-    cpu::sti();
-    // First-tick wait: `hlt` until the IRQ-side gated tick lands.
-    let mut spins = 0u32;
-    loop {
-        if timer::pending_snapshot() > 0 {
-            break;
+    if timer::pit_program_writes().is_none() {
+        // Fail-closed before `sti` (REVIEW #458 residue 1): no PIT program
+        // means no tick can arrive — report loudly and skip the IRQ window
+        // entirely (the `#PF` probe below still fires, so e2e fails on the
+        // missing `TICK ok=1`, never on a hang). `TIMER_PROGRAM` is `Some`
+        // by construction, so this arm is dead-code in practice.
+        write_tick_line(false, 0);
+    } else {
+        timer::program_pit();
+        cpu::sti();
+        // First-tick wait: `hlt` until the IRQ-side gated tick lands.
+        let mut spins = 0u32;
+        loop {
+            if timer::pending_snapshot() > 0 {
+                break;
+            }
+            if spins >= 200 {
+                break;
+            }
+            spins += 1;
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
         }
-        if spins >= 200 {
-            break;
+        // Re-mask before the drain so the `IrqGuard` proof holds and the
+        // `#PF` probe below runs deterministically.
+        cpu::cli();
+        let gate = cpu::IrqGuard::enter();
+        // Scheduler quantum feed (S07 slice15): arm a demo table
+        // (descriptors are metadata-only here — no stack switch, just the
+        // quantum counter the HW ticks drain into), then drain via the
+        // scheduler path and reschedule ONCE on expiry.
+        let mut sched = crate::sched::Scheduler::new(1);
+        if let Ok(t1) = crate::thread::Thread::new(1, 0x1000_0000, 8192, 0x1001) {
+            let _ = sched.spawn(t1);
         }
-        spins += 1;
-        core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+        if let Ok(t2) = crate::thread::Thread::new(2, 0x2000_0000, 8192, 0x1002) {
+            let _ = sched.spawn(t2);
+        }
+        let _ = sched.dispatch_gated(&gate);
+        let (drained, expired) = timer::drain_into_scheduler(&mut sched, &gate);
+        if expired {
+            let _ = sched.dispatch_gated(&gate);
+        }
+        write_tick_line(drained > 0, drained);
     }
-    // Re-mask before the drain so the `IrqGuard` proof holds and the
-    // `#PF` probe below runs deterministically.
-    cpu::cli();
-    let gate = cpu::IrqGuard::enter();
-    let drained = timer::drain_gated(&gate);
-    write_tick_line(drained > 0, drained);
     // Live #PF (#168n6, sole functional open): touch the unmapped guard.
     // If either IDT gate is wrong this triple-faults and e2e fails loudly
     // (missing PF/EXC lines). Volatile so the read is never optimized out.
@@ -664,7 +699,7 @@ mod tests {
             "remap_pic",
             "program_pit",
             "pending_snapshot",
-            "drain_gated",
+            "drain_into_scheduler",
             "load_gdt",
             "load_idt",
             "sti",

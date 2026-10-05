@@ -1440,6 +1440,26 @@ mod tests {
     }
 
     #[test]
+    fn guest_first_tick_armed_drain_shape() {
+        // S07 slice15 guest parity: the bring-up arms a 1+2 demo table with
+        // one gated dispatch (quantum = QUANTUM_TICKS), then feeds the
+        // drained HW ticks via `drain_timer`. QEMU delivers exactly 1 tick
+        // in the bounded wait, so the guest owes no resched
+        // (`(1, false)`, `quantum_left == QUANTUM_TICKS - 1`).
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert_eq!(s.dispatch_gated(&gate), Ok(2));
+        assert_eq!(s.quantum_left(), QUANTUM_TICKS);
+        let mut hw = TimerTicks::new();
+        hw.tick();
+        assert_eq!(s.drain_timer(&mut hw, &gate), (1, false));
+        assert_eq!(s.quantum_left(), QUANTUM_TICKS - 1);
+        assert_eq!(hw.pending(), 0);
+    }
+
+    #[test]
     fn slot_index_invariant_append_only_with_id_keyed_trace() {
         // REVIEW #433 F1 regression: `runs[i]` belongs to `table[i]`
         // (append-only, no remove/compact exists). Pins two rounds of
