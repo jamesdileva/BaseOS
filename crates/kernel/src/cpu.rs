@@ -19,7 +19,9 @@
 
 use super::KERNEL_CODE_SEL;
 #[cfg(not(test))]
-use super::{EXCEPTION_VECTORS, GDT_CODE, GDT_DATA, GDT_NULL, VECTOR_DE, VECTOR_PF};
+use super::{GDT_CODE, GDT_DATA, GDT_NULL, VECTOR_DE, VECTOR_PF};
+#[cfg(not(test))]
+use crate::timer::VECTOR_TIMER;
 
 /// Minimal long-mode GDT: null, kernel code (`0x08`), kernel data (`0x10`).
 /// Static so `lgdt` keeps a stable base after the function returns.
@@ -100,21 +102,23 @@ impl IdtEntry {
     }
 }
 
-/// IDT covering the 32 exception vectors; `#DE` + `#PF` are wired this
-/// slice (others stay [`IdtEntry::missing`] and would `#GP` if hit — with
-/// `cli` and single-threaded bring-up only `#DE` is expected; `#PF` is
-/// wired-but-untriggered until the live-injection slice).
+/// IDT covering the 32 exception vectors plus the timer IRQ0 vector 32
+/// (S07 slice13); `#DE` + `#PF` + timer are wired this slice (others stay
+/// [`IdtEntry::missing`] and would `#GP` if hit — with `cli` and
+/// single-threaded bring-up only `#DE` is expected; `#PF` is
+/// wired-but-untriggered until the live-injection slice; timer is
+/// wired-but-masked until the PIC/PIT/`sti` slice).
 /// Guest-only IDT storage; host tests exercise [`IdtEntry`] encoding
 /// without instantiating the full table.
 #[cfg(not(test))]
 #[repr(C, align(16))]
 struct Idt {
-    entries: [IdtEntry; EXCEPTION_VECTORS],
+    entries: [IdtEntry; IDT_VECTORS],
 }
 
 #[cfg(not(test))]
 static mut IDT: Idt = Idt {
-    entries: [IdtEntry::missing(); EXCEPTION_VECTORS],
+    entries: [IdtEntry::missing(); IDT_VECTORS],
 };
 
 /// Build a present DPL0 interrupt gate for `handler` in the kernel code
@@ -287,7 +291,21 @@ pub unsafe fn read_efer() -> u64 {
 extern "C" {
     fn baseos_isr_div0();
     fn baseos_isr_pf();
+    /// S07 slice13: timer IRQ0 stub (defined in `timer.rs` `global_asm!`).
+    /// Wired into the IDT by [`load_idt`] below; still `cli` so it never
+    /// fires until the PIC/PIT/`sti` slice lands.
+    fn baseos_isr_timer();
 }
+
+/// Number of IDT vectors the guest table covers (S07 slice13).
+///
+/// 32 exception vectors (0..=31) plus the timer IRQ0 vector 32
+/// ([`crate::timer::VECTOR_TIMER`]). The timer gate is wired but never
+/// fires this slice (guest keeps `cli`, no PIC/PIT programming yet), so
+/// QEMU behavior is unchanged. Un-gated (all builds) so host tests pin the
+/// coverage without instantiating the guest-only table. Single-sourced off
+/// [`super::EXCEPTION_VECTORS`] (32 exception vectors + timer vector 32).
+const IDT_VECTORS: usize = super::EXCEPTION_VECTORS + 1;
 
 /// Load the S02 GDT and reload visible segment registers + CS.
 ///
@@ -323,21 +341,31 @@ pub(crate) unsafe fn load_gdt() {
     );
 }
 
-/// Populate `#DE` (vector 0) + `#PF` (vector 14) and `lidt` the table.
+/// Populate `#DE` (vector 0) + `#PF` (vector 14) + timer IRQ0 (vector 32)
+/// and `lidt` the table.
+///
+/// The timer gate is a present DPL0 interrupt gate (type `0xE`, same
+/// [`gate_for`] encoding as the exception gates): on delivery the CPU
+/// clears IF in hardware, which is what makes the
+/// [`crate::timer::timer_irq_rust`] `IrqGuard::enter()` proof true on
+/// entry. Still `cli` with no PIC/PIT programming this slice, so the timer
+/// gate never fires and QEMU behavior is unchanged.
 ///
 /// # Safety
 /// Same guest-only contract as [`load_gdt`]: `IDT` static must outlive the
-/// CPU, gates target [`baseos_isr_div0`] / [`baseos_isr_pf`] in the kernel
-/// code segment (via [`gate_for`]), and `cli` is already in effect so
-/// unhandled vectors cannot fire this slice. Host builds are a no-op; e2e
-/// proves BOTH gates (`PF ok=1` via the live probe touch, then `EXC ok=1`
-/// via the chained `#DE`).
+/// CPU, gates target [`baseos_isr_div0`] / [`baseos_isr_pf`] /
+/// [`baseos_isr_timer`] in the kernel code segment (via [`gate_for`]), and
+/// `cli` is already in effect so unhandled vectors cannot fire this slice.
+/// Host builds are a no-op; e2e proves BOTH exception gates (`PF ok=1` via
+/// the live probe touch, then `EXC ok=1` via the chained `#DE`).
 #[cfg(not(test))]
 pub(crate) unsafe fn load_idt() {
     let de_handler = baseos_isr_div0 as *const () as u64;
     (*core::ptr::addr_of_mut!(IDT)).entries[VECTOR_DE] = gate_for(de_handler);
     let pf_handler = baseos_isr_pf as *const () as u64;
     (*core::ptr::addr_of_mut!(IDT)).entries[VECTOR_PF] = gate_for(pf_handler);
+    let timer_handler = baseos_isr_timer as *const () as u64;
+    (*core::ptr::addr_of_mut!(IDT)).entries[VECTOR_TIMER] = gate_for(timer_handler);
     let ptr = DescriptorTablePointer {
         limit: (core::mem::size_of::<Idt>() - 1) as u16,
         base: core::ptr::addr_of!(IDT) as u64,
@@ -360,6 +388,32 @@ mod tests {
         assert_eq!(selector, KERNEL_CODE_SEL);
         assert_eq!(selector, 0x08);
         assert_eq!(type_attr, 0x8E, "present interrupt gate DPL0");
+        assert_eq!(ist, 0);
+        assert_eq!(reserved, 0);
+    }
+
+    #[test]
+    fn timer_gate_uses_interrupt_gate_covering_vector_32() {
+        // S07 slice13: the wiring slice wires VECTOR_TIMER through the same
+        // `gate_for` path as the exception gates — a present DPL0 interrupt
+        // gate (type 0xE, which clears IF in HW so the IrqGuard entry-proof
+        // holds), in the kernel code segment, with the table covering the
+        // vector. Still `cli` + no PIC/PIT this slice, so QEMU is unchanged.
+        use super::super::timer::VECTOR_TIMER;
+        assert_eq!(VECTOR_TIMER, 32);
+        assert_eq!(IDT_VECTORS, 33);
+        assert!(VECTOR_TIMER < IDT_VECTORS);
+        let handler = 0x0000_0000_1234_5678_u64;
+        let e = gate_for(handler);
+        assert_eq!(e.handler_offset(), handler);
+        let (selector, type_attr, ist, reserved) = (e.selector, e.type_attr, e.ist, e.reserved);
+        assert_eq!(selector, KERNEL_CODE_SEL);
+        assert_eq!(type_attr, 0x8E, "present interrupt gate DPL0");
+        assert_eq!(
+            type_attr & 0x0F,
+            0x0E,
+            "gate type must be 0xE (IF cleared by HW)"
+        );
         assert_eq!(ist, 0);
         assert_eq!(reserved, 0);
     }
