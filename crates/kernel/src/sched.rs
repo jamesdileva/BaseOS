@@ -131,6 +131,41 @@ pub struct Scheduler {
     current: u64,
 }
 
+/// S07 slice 22 — live-IRQ failure backoff cap (REVIEW #470 R1 policy,
+/// pure, host-testable, no production behavior change yet).
+///
+/// The task-context [`Scheduler::drain_then_dispatch_gated`] keeps its
+/// slice-18 retry-spin (every non-empty drain on a KNOWN current retries
+/// exactly one dispatch). The future live periodic IRQ handler MUST NOT
+/// inherit that spin unbounded: a persistently unready table (e.g. all
+/// `Done`, known current, `Some(Err)` every batch) would otherwise attempt
+/// one failed pick per 100 Hz batch forever. Policy: the live handler
+/// drains every batch (counter always consumed) but attempts a dispatch
+/// only while `!live_backoff_suppresses(failures)`; `failures` counts
+/// consecutive `Some(Err)` batches (saturating), reset to `0` on
+/// `Some(Ok)` or `None` (no expiry / unknown-current backoff / empty).
+/// `LIVE_MAX_CONSECUTIVE_FAILURES = 3` bounds the spam to 3 picks, then
+/// drain-only until a success or idle `None` resets the streak.
+pub const LIVE_MAX_CONSECUTIVE_FAILURES: u64 = 3;
+
+/// Live-handler gate: `true` once the consecutive-failure streak reaches
+/// the cap (caller drains without dispatching while suppressed).
+#[must_use]
+pub const fn live_backoff_suppresses(consecutive_failures: u64) -> bool {
+    consecutive_failures >= LIVE_MAX_CONSECUTIVE_FAILURES
+}
+
+/// Live-handler streak step: `Some(Err)` bumps (saturating), anything else
+/// (`Some(Ok)` success, `None` no-dispatch) resets to `0`.
+#[must_use]
+pub const fn live_backoff_next(consecutive_failures: u64, failed: bool) -> u64 {
+    if failed {
+        consecutive_failures.saturating_add(1)
+    } else {
+        0
+    }
+}
+
 impl Scheduler {
     /// New empty scheduler with `current` preset (usually the boot thread
     /// id, or `NULL_THREAD` when no thread runs yet). `current` is NOT
@@ -1865,6 +1900,34 @@ mod tests {
         assert!(ru2.is_none());
         assert_eq!(w.quantum_left(), 0);
         assert_eq!(w.total_cpu_ticks(), 0);
+    }
+
+    #[test]
+    fn live_backoff_cap_bounds_consecutive_failures() {
+        // S07 slice 22 (REVIEW #470 R1 policy): the live handler drains
+        // every batch but dispatches only while unsuppressed. Streak bumps
+        // on failed dispatch, resets on success or no-dispatch, saturates.
+        assert_eq!(LIVE_MAX_CONSECUTIVE_FAILURES, 3);
+        assert!(!live_backoff_suppresses(0));
+        assert!(!live_backoff_suppresses(2));
+        assert!(live_backoff_suppresses(3));
+        assert!(live_backoff_suppresses(4));
+        assert!(live_backoff_suppresses(u64::MAX));
+        let mut streak = 0u64;
+        streak = live_backoff_next(streak, true);
+        assert_eq!(streak, 1);
+        streak = live_backoff_next(streak, true);
+        streak = live_backoff_next(streak, true);
+        assert_eq!(streak, 3);
+        assert!(live_backoff_suppresses(streak));
+        // Suppressed stays suppressed on further failures (saturating).
+        streak = live_backoff_next(streak, true);
+        assert_eq!(streak, 4);
+        assert!(live_backoff_suppresses(streak));
+        // Success or no-dispatch resets.
+        assert_eq!(live_backoff_next(streak, false), 0);
+        assert!(!live_backoff_suppresses(live_backoff_next(streak, false)));
+        assert_eq!(live_backoff_next(u64::MAX, true), u64::MAX);
     }
 
     #[test]
