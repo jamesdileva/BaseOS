@@ -278,7 +278,7 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 
 /// Guest-only CPU bring-up + timer multi-tick + scheduler quantum feed +
 /// live `#PF` proof (S07 slice15; slice19: IRQ-owned static scheduler;
-/// S08 slice26: multi-tick task-context live poll): load
+/// S07 slice26: multi-tick task-context live poll): load
 /// GDT, load IDT (now covering `#DE` + `#PF` + timer IRQ0 vector 32), remap
 /// the PIC, arm the PIT at 100 Hz
 /// (fail-closed: `pit_program_writes() == None` skips `program` + `sti` and
@@ -291,7 +291,7 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 /// to `Scheduler::drain_then_dispatch_gated` so the wrapper cannot drift,
 /// slice 19 static-only over `TIMER_TICKS` + `STATIC_SCHED` so no
 /// stack-local table remains for the future live IRQ handler;
-/// S08 slice25 live helper with the IRQ-owned streak static, still
+/// S07 slice25 live helper with the IRQ-owned streak static, still
 /// task-context polled — the IRQ-handler move rides next with its
 /// cumulative-drained counter + EOI/reentrancy proof),
 /// emit
@@ -336,7 +336,7 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
     } else {
         timer::program_pit();
         cpu::sti();
-        // Multi-tick wait (S08 slice26): `hlt` until `QUANTUM_TICKS + 1`
+        // Multi-tick wait (S07 slice26): `hlt` until `QUANTUM_TICKS + 1`
         // IRQ-side gated ticks land (one full quantum plus one, so the
         // task-context live drain expires and owes exactly one resched).
         // Const-driven: a quantum change moves the target with it; the ps1
