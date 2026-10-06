@@ -338,20 +338,21 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         timer::program_pit();
         timer::reset_total_drained();
         cpu::sti();
-        // Multi-tick wait (S07 slice26; slice28 cumulative): `hlt` until
-        // `QUANTUM_TICKS + 1` total ticks are observed (one full quantum
-        // plus one, so the task-context live drain expires and owes exactly
-        // one resched). Cumulative (`pending + drained_total`) instead of
-        // pending-only: a future per-tick IRQ-handler drain would hold
-        // `pending` at 0 and a pending-only wait would never fire. This
-        // slice still drains once after the wait (total == 0 until then),
-        // so the behavior is unchanged and the handler move inherits the
-        // wait shape. Const-driven: a quantum change moves the target; the
+        // Multi-tick wait (S07 slice26; slice28 cumulative; slice33 `>=`
+        // helper): `hlt` until `QUANTUM_TICKS + 1` total ticks are observed
+        // (one full quantum plus one, so the task-context live drain expires
+        // and owes exactly one resched). Cumulative (`pending + drained_total`)
+        // instead of pending-only: a future per-tick IRQ-handler drain would
+        // hold `pending` at 0 and a pending-only wait would never fire. The
+        // target check routes through `timer::cumulative_wait_ready` (`>=`,
+        // never `==`): the storm fallback is non-monotonic by construction
+        // (REVIEW #501 risk 2), so exact equality could miss its wakeup after
+        // a step-back. Const-driven: a quantum change moves the target; the
         // ps1 `ticks=[1-9]` gate accepts any positive count.
         let wait_target = crate::sched::QUANTUM_TICKS + 1;
         let mut spins = 0u32;
         loop {
-            if timer::cumulative_snapshot() >= wait_target {
+            if timer::cumulative_wait_ready(timer::cumulative_snapshot(), wait_target) {
                 break;
             }
             if spins >= 200 {

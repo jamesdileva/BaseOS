@@ -269,6 +269,23 @@ pub const fn cumulative_join(drained_before: u64, pending: u64, drained_after: u
     }
     Some(cumulative_total(pending, drained_after))
 }
+
+/// Pure wait-target check for the cumulative `sti` wait (S07 slice33).
+///
+/// `total >= target`: the storm fallback (`cumulative_snapshot` bounded
+/// retry, see above) is NOT monotonic — a fallback read can over-count one
+/// batch (stale-high pending + fresh-high drained double-counts the
+/// in-flight tick) and the next clean read goes BACKWARD. An exact-equality
+/// waiter (`== target`) would miss its wakeup after such a step-back and
+/// spin until the 200-`hlt` budget expires (loud `TICK ok=0`, but a
+/// self-inflicted timeout); a `>=` waiter only ever wakes at most one
+/// `hlt` early, never late. All cumulative waiters MUST route through this
+/// helper so a future `==` regression fails host-side, not in QEMU.
+/// Pure `core`-only so host tests pin it; the guest `sti` wait calls it.
+#[must_use]
+pub const fn cumulative_wait_ready(total: u64, target: u64) -> bool {
+    total >= target
+}
 /// Guest-only volatile tick snapshot (S07 slice14).
 ///
 /// Volatile whole-struct read of `TIMER_TICKS` so the `sti` spin-wait
@@ -1002,5 +1019,35 @@ mod tests {
         assert_eq!(fallback.saturating_sub(clean_next), 1);
         // Saturation still holds on the fallback path (never wraps).
         assert_eq!(cumulative_total(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn cumulative_wait_ready_uses_ge_never_eq() {
+        // S07 slice33 (REVIEW #501 risk 2): all cumulative waiters route
+        // through `cumulative_wait_ready` (`>=`), never `==`. Storm shape
+        // from the test above: 1 real tick, fallback reports 2, next clean
+        // read steps BACK to 1. For target 2 the fallback is ready (wakes
+        // at most one `hlt` early — benign) while the stepped-back clean
+        // read is not (waiter loops again — never a missed wakeup). An
+        // `==` waiter would have fired on the phantom 2 and could then
+        // never observe 2 again once the count steps back to 1.
+        assert!(cumulative_wait_ready(2, 2));
+        assert!(cumulative_wait_ready(3, 2));
+        assert!(!cumulative_wait_ready(1, 2));
+        // The step-back itself: fallback-ready then clean-not-ready.
+        let fallback = cumulative_total(1, 1);
+        let clean_next = cumulative_join(1, 0, 1).expect("clean read agrees");
+        assert_eq!((fallback, clean_next), (2, 1));
+        assert!(cumulative_wait_ready(fallback, 2));
+        assert!(!cumulative_wait_ready(clean_next, 2));
+        // Boundary + saturation: exact target fires, zero target always
+        // fires, saturated totals never wrap past the target.
+        assert!(cumulative_wait_ready(0, 0));
+        assert!(!cumulative_wait_ready(0, 1));
+        assert!(cumulative_wait_ready(u64::MAX, u64::MAX));
+        assert!(cumulative_wait_ready(
+            crate::sched::QUANTUM_TICKS + 1,
+            crate::sched::QUANTUM_TICKS + 1
+        ));
     }
 }
