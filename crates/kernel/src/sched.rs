@@ -467,6 +467,57 @@ impl Scheduler {
         (drained, Some(self.dispatch_gated(gate)))
     }
 
+    /// Live-IRQ drain-then-dispatch step consuming the slice-22 backoff cap
+    /// (S07 slice 23, pure, host-testable, guest unwired this slice).
+    ///
+    /// Same drain-then-dispatch shape as
+    /// [`Scheduler::drain_then_dispatch_gated`] (bulk credit to the
+    /// pre-dispatch current before the pick, at most one gated dispatch),
+    /// plus the [`LIVE_MAX_CONSECUTIVE_FAILURES`] bound the future periodic
+    /// IRQ handler needs: the task-context helper retry-spins (one failed
+    /// pick per non-empty batch forever), which at 100 Hz is a spam loop the
+    /// live handler must not inherit.
+    ///
+    /// Streak rule (owns `*consecutive_failures` so callers cannot forget):
+    /// - suppressed entry (`live_backoff_suppresses(*consecutive_failures)`):
+    ///   drain-only (counter consumed, CPU credited, quantum still consumed
+    ///   via `drain_timer`), NO dispatch attempted, streak RESET to `0`.
+    ///   Reset (not hold) is the recovery path: a suppressed batch that held
+    ///   the streak would stall forever once the table becomes `Ready` again
+    ///   (no dispatch means no `Some(Ok)` to reset with). Reset bounds
+    ///   CONSECUTIVE failed picks to `LIVE_MAX_CONSECUTIVE_FAILURES`
+    ///   (3-on-1-off throttle under persistent failure) with automatic probe.
+    /// - unsuppressed, no expiry (`None`: empty / partial / unknown-current
+    ///   backoff): no dispatch, streak reset to `0`.
+    /// - unsuppressed, expiry: exactly one gated dispatch; `Some(Ok)` resets
+    ///   to `0`, `Some(Err)` bumps (saturating) via [`live_backoff_next`].
+    ///
+    /// Unknown-`current` inherits the slice-20 backoff (drain consumes, no
+    /// dispatch owed) and resets the streak. Task-context
+    /// [`Scheduler::drain_then_dispatch_gated`] is untouched (keeps its
+    /// retry-spin); the S08 live-handler wiring calls THIS helper from IRQ
+    /// context with an IRQ-owned streak static.
+    pub fn drain_then_dispatch_live_gated(
+        &mut self,
+        ticks: &mut TimerTicks,
+        gate: &IrqGuard,
+        consecutive_failures: &mut u64,
+    ) -> (u64, Option<Result<u64, SwitchError>>) {
+        if live_backoff_suppresses(*consecutive_failures) {
+            let (drained, _) = self.drain_timer(ticks, gate);
+            *consecutive_failures = 0;
+            return (drained, None);
+        }
+        let (drained, expired) = self.drain_timer(ticks, gate);
+        if !expired {
+            *consecutive_failures = 0;
+            return (drained, None);
+        }
+        let res = self.dispatch_gated(gate);
+        *consecutive_failures = live_backoff_next(*consecutive_failures, res.is_err());
+        (drained, Some(res))
+    }
+
     /// Demo table constructor the IRQ-owned static consumes (S07 slice 19).
     ///
     /// Builds `Scheduler::new(1)`, spawns metadata-only descriptors 1 and 2
@@ -1928,6 +1979,108 @@ mod tests {
         assert_eq!(live_backoff_next(streak, false), 0);
         assert!(!live_backoff_suppresses(live_backoff_next(streak, false)));
         assert_eq!(live_backoff_next(u64::MAX, true), u64::MAX);
+    }
+
+    #[test]
+    fn live_helper_throttles_persistent_failures_three_on_one_off() {
+        // S07 slice 23: the live helper consumes the slice-22 cap — at most
+        // LIVE_MAX_CONSECUTIVE_FAILURES failed picks in a row, then one
+        // drain-only skip (no dispatch, streak reset), then probes again
+        // (automatic recovery when the table becomes Ready).
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut s = Scheduler::new(1);
+        let mut run = mk(1, 0x1000_0000);
+        assert!(run.set_state(ThreadState::Running));
+        let mut done = mk(2, 0x2000_0000);
+        assert!(done.set_state(ThreadState::Done));
+        assert!(s.spawn(run));
+        assert!(s.spawn(done));
+        let mut streak = 0u64;
+        // Three consecutive failed picks (streak 1, 2, 3).
+        let mut i = 0;
+        while i < LIVE_MAX_CONSECUTIVE_FAILURES {
+            let mut hw = TimerTicks::new();
+            hw.tick();
+            let (drained, res) = s.drain_then_dispatch_live_gated(&mut hw, &gate, &mut streak);
+            assert_eq!(drained, 1);
+            assert_eq!(res, Some(Err(SwitchError::NotReady)));
+            assert_eq!(streak, i + 1);
+            i += 1;
+        }
+        assert!(live_backoff_suppresses(streak));
+        // Fourth batch: suppressed drain-only — HW ticks still consumed and
+        // credited, NO dispatch attempted, streak reset (not held, or the
+        // handler would stall forever once a thread becomes Ready).
+        let mut hw_skip = TimerTicks::new();
+        hw_skip.tick();
+        hw_skip.tick();
+        let cpu_before = s.total_cpu_ticks();
+        let (drained_skip, res_skip) =
+            s.drain_then_dispatch_live_gated(&mut hw_skip, &gate, &mut streak);
+        assert_eq!(drained_skip, 2);
+        assert!(res_skip.is_none());
+        assert_eq!(streak, 0);
+        assert_eq!(s.total_cpu_ticks(), cpu_before.saturating_add(2));
+        assert_eq!(s.quantum_left(), 0);
+        // Fifth batch: probes again (fails while still nothing-Ready).
+        let mut hw_probe = TimerTicks::new();
+        hw_probe.tick();
+        let (drained_probe, res_probe) =
+            s.drain_then_dispatch_live_gated(&mut hw_probe, &gate, &mut streak);
+        assert_eq!(drained_probe, 1);
+        assert_eq!(res_probe, Some(Err(SwitchError::NotReady)));
+        assert_eq!(streak, 1);
+    }
+
+    #[test]
+    fn live_helper_resets_streak_on_success_and_idle_none() {
+        // Success, empty, partial, and unknown-current drains all reset the
+        // streak; the unsuppressed live path agrees with the task-context
+        // helper on success.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(mk(1, 0x1000_0000)));
+        assert!(s.spawn(mk(2, 0x2000_0000)));
+        assert_eq!(s.dispatch_gated(&gate), Ok(2));
+        let mut streak = 2u64;
+        // Partial quantum (no expiry): no dispatch, streak reset.
+        let mut hw = TimerTicks::new();
+        hw.tick();
+        let (drained, res) = s.drain_then_dispatch_live_gated(&mut hw, &gate, &mut streak);
+        assert_eq!(drained, 1);
+        assert!(res.is_none());
+        assert_eq!(streak, 0);
+        // Expiry success: one dispatch, streak reset.
+        streak = 2;
+        let mut hw2 = TimerTicks::new();
+        let mut i = 0u64;
+        while i < QUANTUM_TICKS - 1 {
+            hw2.tick();
+            i += 1;
+        }
+        let (drained2, res2) = s.drain_then_dispatch_live_gated(&mut hw2, &gate, &mut streak);
+        assert_eq!(drained2, QUANTUM_TICKS - 1);
+        assert_eq!(res2, Some(Ok(1)));
+        assert_eq!(streak, 0);
+        assert_eq!(s.current(), 1);
+        // Empty drain resets a non-zero streak (IRQ silence is idle).
+        streak = 2;
+        let mut empty = TimerTicks::new();
+        let (d0, r0) = s.drain_then_dispatch_live_gated(&mut empty, &gate, &mut streak);
+        assert_eq!((d0, r0.is_none()), (0, true));
+        assert_eq!(streak, 0);
+        // Unknown current: HW ticks consumed, no dispatch, streak reset.
+        streak = 2;
+        let mut u = Scheduler::new(99);
+        assert!(u.spawn(mk(1, 0x1000_0000)));
+        let mut hwu = TimerTicks::new();
+        hwu.tick();
+        hwu.tick();
+        let (du, ru) = u.drain_then_dispatch_live_gated(&mut hwu, &gate, &mut streak);
+        assert_eq!(du, 2);
+        assert!(ru.is_none());
+        assert_eq!(streak, 0);
+        assert_eq!(u.total_cpu_ticks(), 0);
     }
 
     #[test]
