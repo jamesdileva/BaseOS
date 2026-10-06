@@ -2392,6 +2392,134 @@ mod tests {
     }
 
     #[test]
+    fn quantum_boundary_trio_and_suppressed_coupling_with_empty_poll_backoff() {
+        // S07 slice27 (trio off-by-one disconfirm + REVIEW #473 f3 coupling +
+        // poll-before-init backoff; host-only, guest untouched): the armed
+        // demo quantum expires at exactly QUANTUM_TICKS (Q-1 owes nothing,
+        // Q and Q+1 owe exactly one resched), a suppressed live drain still
+        // consumes the quantum via `drain_timer` (no dispatch, streak reset),
+        // and an empty table (pre-`sched_init_demo_static` shape) drains
+        // without dispatching (backoff by construction).
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        // Trio on the task helper: Q-1 partial, Q exact, Q+1 bulk.
+        for (ticks, expect_dispatch) in [
+            (QUANTUM_TICKS - 1, false),
+            (QUANTUM_TICKS, true),
+            (QUANTUM_TICKS + 1, true),
+        ] {
+            let mut s = Scheduler::demo_armed_scheduler(&gate);
+            let mut hw = TimerTicks::new();
+            let mut i = 0u64;
+            while i < ticks {
+                hw.tick();
+                i += 1;
+            }
+            let (drained, res) = s.drain_then_dispatch_gated(&mut hw, &gate);
+            assert_eq!(drained, ticks, "task trio {ticks} ticks");
+            assert_eq!(res.is_some(), expect_dispatch, "task trio {ticks} ticks");
+            if expect_dispatch {
+                assert_eq!(res, Some(Ok(1)));
+                assert_eq!(s.current(), 1);
+                assert_eq!(s.quantum_left(), QUANTUM_TICKS);
+                assert_eq!(s.cpu_ticks_of(2), Some(ticks));
+            } else {
+                assert_eq!(s.current(), 2);
+                assert_eq!(s.quantum_left(), 1);
+                assert_eq!(s.cpu_ticks_of(2), Some(ticks));
+            }
+        }
+        // Trio on the live helper (unsuppressed streak 0): same drain +
+        // dispatch as task, streak stays 0 on the never-failing demo table.
+        for (ticks, expect_dispatch) in [
+            (QUANTUM_TICKS - 1, false),
+            (QUANTUM_TICKS, true),
+            (QUANTUM_TICKS + 1, true),
+        ] {
+            let mut s = Scheduler::demo_armed_scheduler(&gate);
+            let mut hw = TimerTicks::new();
+            let mut i = 0u64;
+            while i < ticks {
+                hw.tick();
+                i += 1;
+            }
+            let mut streak = 0u64;
+            let (drained, res) = s.drain_then_dispatch_live_gated(&mut hw, &gate, &mut streak);
+            assert_eq!(drained, ticks, "live trio {ticks} ticks");
+            assert_eq!(res.is_some(), expect_dispatch, "live trio {ticks} ticks");
+            assert_eq!(streak, 0, "demo never fails so streak stays 0");
+            if expect_dispatch {
+                assert_eq!(res, Some(Ok(1)));
+                assert_eq!(s.current(), 1);
+            } else {
+                assert_eq!(s.current(), 2);
+                assert_eq!(s.quantum_left(), 1);
+            }
+        }
+        // Suppressed-expiry coupling (f3): drive a known-nothing-Ready table
+        // to the cap, then the suppressed drain still consumes via
+        // `drain_timer` (CPU credited, quantum stays 0), dispatches nothing,
+        // and resets the streak for the next probe.
+        let mut f = Scheduler::new(1);
+        let mut run = mk(1, 0x1000_0000);
+        assert!(run.set_state(ThreadState::Running));
+        let mut done = mk(2, 0x2000_0000);
+        assert!(done.set_state(ThreadState::Done));
+        assert!(f.spawn(run));
+        assert!(f.spawn(done));
+        let mut streak = 0u64;
+        let mut i = 0u64;
+        while i < LIVE_MAX_CONSECUTIVE_FAILURES {
+            let mut hw = TimerTicks::new();
+            hw.tick();
+            let (_, res) = f.drain_then_dispatch_live_gated(&mut hw, &gate, &mut streak);
+            assert_eq!(res, Some(Err(SwitchError::NotReady)));
+            i += 1;
+        }
+        assert!(live_backoff_suppresses(streak));
+        let cpu_before = f.total_cpu_ticks();
+        let mut hw_skip = TimerTicks::new();
+        hw_skip.tick();
+        hw_skip.tick();
+        let (drained_skip, res_skip) =
+            f.drain_then_dispatch_live_gated(&mut hw_skip, &gate, &mut streak);
+        assert_eq!(drained_skip, 2);
+        assert!(res_skip.is_none());
+        assert_eq!(streak, 0);
+        assert_eq!(f.quantum_left(), 0);
+        assert_eq!(f.total_cpu_ticks(), cpu_before.saturating_add(2));
+        // Suppressed with an armed quantum still consumes it (coupling, not
+        // preserve): forced streak 3 on a fresh demo table drains 1 tick to
+        // QUANTUM-1 with no dispatch and streak reset.
+        let mut armed = Scheduler::demo_armed_scheduler(&gate);
+        let mut streak_armed = LIVE_MAX_CONSECUTIVE_FAILURES;
+        assert!(live_backoff_suppresses(streak_armed));
+        let mut hw_one = TimerTicks::new();
+        hw_one.tick();
+        let (drained_a, res_a) =
+            armed.drain_then_dispatch_live_gated(&mut hw_one, &gate, &mut streak_armed);
+        assert_eq!(drained_a, 1);
+        assert!(res_a.is_none());
+        assert_eq!(streak_armed, 0);
+        assert_eq!(armed.quantum_left(), QUANTUM_TICKS - 1);
+        assert_eq!(armed.cpu_ticks_of(2), Some(1));
+        // Poll-before-init backoff: empty table (pre-init STATIC_SCHED shape)
+        // consumes HW ticks, dispatches nothing, resets a dirty streak.
+        let mut empty = Scheduler::new(NULL_THREAD);
+        let mut streak_dirty = 2u64;
+        let mut hw_empty = TimerTicks::new();
+        hw_empty.tick();
+        hw_empty.tick();
+        hw_empty.tick();
+        let (drained_e, res_e) =
+            empty.drain_then_dispatch_live_gated(&mut hw_empty, &gate, &mut streak_dirty);
+        assert_eq!(drained_e, 3);
+        assert!(res_e.is_none());
+        assert_eq!(streak_dirty, 0);
+        assert_eq!(empty.total_cpu_ticks(), 0);
+        assert_eq!(empty.quantum_left(), 0);
+    }
+
+    #[test]
     fn scheduler_holds_no_cell_interior_mutability() {
         // Replace-not-reuse pin (REVIEW #319 finding 2, REVIEW #321
         // residual c): the scheduler type must not contain the coop
