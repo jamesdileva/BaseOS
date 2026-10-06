@@ -314,8 +314,9 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 /// pre-dispatch current, never the new one).
 /// The timer IRQ body only ticks (no serial), so extra ticks during the
 /// later `#PF`/`#DE` park cannot interleave the proof lines.
-/// The `TICK` line shape is unchanged (`ok=<0|1> ticks=<n>`), so the e2e
-/// `ticks=[1-9]` hard-require is untouched.
+/// The `TICK` line shape is unchanged (`ok=<0|1> ticks=<n>`, S07 slice30: `n`
+/// is the gated cumulative total), so the e2e `ticks=[1-9]` hard-require is
+/// untouched.
 ///
 /// # Safety
 /// Must run post-`ExitBootServices` on the boot CPU with interrupts
@@ -373,8 +374,17 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         // pre-dispatch current before the pick, so the backlog can never
         // misattribute to the new current). Dispatch result ignored: the
         // demo table always has a Ready target when expiry fires.
-        let (drained, _dispatched) = timer::poll_timer_dispatch(&gate);
-        write_tick_line(drained > 0, drained);
+        // S07 slice30 per-tick IRQ drain: `timer_irq_rust` already drains
+        // every tick via this same helper, so this task-context remainder is
+        // ~0 by design — the proof line reports the CUMULATIVE total via the
+        // gated snapshot (pending + drained_total under `cli` + gate), never
+        // the drained-only remainder (which would print ok=0 while the
+        // cumulative wait correctly fired — REVIEW #495 tail 1). This also
+        // wires `cumulative_snapshot_gated` into the guest proof (REVIEW
+        // #495 tail 3: the gated path is the one used under `cli`).
+        let (_drained, _dispatched) = timer::poll_timer_dispatch(&gate);
+        let total = timer::cumulative_snapshot_gated(&gate);
+        write_tick_line(total > 0, total);
     }
     // Live #PF (#168n6, sole functional open): touch the unmapped guard.
     // If either IDT gate is wrong this triple-faults and e2e fails loudly

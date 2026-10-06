@@ -148,7 +148,9 @@ pub(crate) fn write_exc_line(ok: bool, vector: u64) {
 }
 
 /// Emit `TICK ok=<0|1> ticks=<n>\n` directly on COM1 (S07 slice14 first-tick
-/// proof: `ok` is 1 only when the drained gated count is nonzero).
+/// proof; slice30 cumulative: `ok` is 1 only when the gated cumulative total
+/// `pending + drained_total` is nonzero — the per-tick IRQ drain holds the
+/// task-context remainder near 0, so drained-only would misreport ok=0).
 ///
 /// Safe wrapper: only calls [`com1_write_byte`] plus the safe decimal
 /// helper. Requires COM1 initialized; single-threaded bring-up context owns

@@ -332,26 +332,32 @@ pub(crate) unsafe fn cumulative_snapshot() -> u64 {
         }
         i += 1;
         if i >= 3 {
-            // Bounded retry exhausted under a_tick-storm: fall back to the
-            // latest drained-side view (monotonic, saturating) rather than
-            // spinning forever inside the observer.
+            // Bounded retry exhausted under a tick-storm: fall back to the
+            // latest drained-side view (saturating) rather than spinning
+            // forever inside the observer. NOT monotonic: the fallback can
+            // over-count one batch (stale-high pending + fresh-high drained
+            // double-counts the in-flight tick), so a later clean read can
+            // return a SMALLER value. Benign for a `>= target` wait (at most
+            // one `hlt` early) but callers must never assume monotonicity or
+            // exact equality — pinned by the storm-bound test below.
             return cumulative_total(pending, d1);
         }
     }
 }
 
-/// Guest-only exact cumulative observation (S07 slice29).
+/// Guest-only exact cumulative observation (S07 slice29; wired S07 slice30).
 ///
 /// Single-pass volatile `pending + drained_total` for `cli`-gated contexts
-/// (drain path, future IRQ handler): the `&IrqGuard` proves IF is masked so
+/// (drain path, TICK proof line): the `&IrqGuard` proves IF is masked so
 /// no accumulate can interleave and the two-read race cannot occur. The
 /// `sti` wait cannot use this (it needs IF set) and uses
-/// [`cumulative_snapshot`] instead.
+/// [`cumulative_snapshot`] instead. Slice30 wires this into
+/// `bring_up_cpu_and_prove_exception`'s TICK line (post-`cli` + gate), so
+/// the gated path is proven by the QEMU `TICK ok=1` proof, not dead code.
 ///
 /// # Safety
 /// `cli` in effect (`gate` proves it); single-threaded boot owns both statics.
 #[cfg(not(test))]
-#[allow(dead_code)] // S07 slice29: exact gated read for the handler-move slice; wait uses the retry variant
 pub(crate) unsafe fn cumulative_snapshot_gated(_gate: &IrqGuard) -> u64 {
     let pending = core::ptr::addr_of!(TIMER_TICKS).read_volatile().pending();
     let drained: u64 = core::ptr::addr_of!(TOTAL_DRAINED).read_volatile();
@@ -376,7 +382,8 @@ pub(crate) unsafe fn reset_total_drained() {
 
 /// Guest-only combined PIT-handler step (S07 slice 17; slice 18 delegates
 /// to the helper instead of re-implementing it; slice 19 is static-only;
-/// S08 slice25 polls the LIVE helper with the IRQ-owned streak static).
+/// S08 slice25 polls the LIVE helper with the IRQ-owned streak static;
+/// S07 slice30 calls this same helper per-tick from `timer_irq_rust`).
 ///
 /// Drains the IRQ-owned static `TIMER_TICKS` into the IRQ-owned static
 /// scheduler via [`crate::sched::sched_poll_live_static`] (bulk credit to the
@@ -505,14 +512,24 @@ core::arch::global_asm!(timer_isr_stub_asm!());
 #[cfg(not(test))]
 static mut TIMER_TICKS: TimerTicks = TimerTicks::new();
 
-/// Rust body of the IRQ0 stub (S07 slice11, guest-only).
+/// Rust body of the IRQ0 stub (S07 slice11, guest-only; slice30 per-tick drain).
 ///
 /// Called from `baseos_isr_timer` with the Win64-volatile frame saved and
 /// 32-byte shadow space reserved; the stub performs the single master EOI
 /// AFTER this returns (while the saved `rax` still sits on the stack) and
-/// `iretq`s. Body records exactly one saturating tick and returns — never
-/// parks, never touches ports (EOI lives in the stub so `mov al` cannot
-/// clobber the caller's `rax` before the pops).
+/// `iretq`s. Body records exactly one saturating tick and drains it the same
+/// way the task-context poll does (same [`poll_timer_dispatch`] helper, so
+/// the two paths cannot drift) — never parks, never touches ports (EOI
+/// lives in the stub so `mov al` cannot clobber the caller's `rax` before
+/// the pops).
+///
+/// Reentrancy: safe by construction — the CPU clears IF on entry (interrupt
+/// gate) and the PIC withholds this IRQ until the stub's EOI, so no nested
+/// IRQ0 can interleave this body. Single-core boot owns `TIMER_TICKS`,
+/// `TOTAL_DRAINED`, `STATIC_SCHED`, `STATIC_STREAK` under the entry gate.
+/// Pre-`sched_init_demo_static` ticks drain safely (static starts as
+/// `Scheduler::new(NULL_THREAD)`: unknown-current drains consume the counter
+/// with no dispatch owed, slice-20 backoff by construction).
 ///
 /// S07 slice12: IRQ side uses the gated form (`tick_gated` under
 /// `IrqGuard::enter()` — the interrupt gate clears IF, so the `cli`
@@ -527,6 +544,14 @@ pub extern "C" fn timer_irq_rust() {
     unsafe {
         let gate = IrqGuard::enter();
         (*core::ptr::addr_of_mut!(TIMER_TICKS)).tick_gated(&gate);
+        // S07 slice30 per-tick drain: same combined drain-then-dispatch the
+        // task-context poll uses (scheduler credit + TOTAL_DRAINED
+        // accumulate + at most one backoff-capped dispatch). Holds pending
+        // near 0 by design — the `sti` wait survives via cumulative, and the
+        // post-`cli` TICK line reports the cumulative total (never the ~0
+        // task-context remainder). Dispatch result ignored in IRQ context
+        // (demo table always has a `Ready` target while unsuppressed).
+        let _ = poll_timer_dispatch(&gate);
     }
 }
 
@@ -944,5 +969,36 @@ mod tests {
         let stale_two_read = cumulative_total(1, 1);
         assert_eq!(stale_two_read, 2);
         assert_eq!(cumulative_join(0, 1, 1), None);
+    }
+
+    #[test]
+    fn cumulative_storm_fallback_bounds_overcount_and_pins_nonmonotonic() {
+        // S07 slice30 (REVIEW #495 tail 2, risk-1a storm pin): the bounded
+        // 3-retry fallback returns `cumulative_total(pending, d1)`, which
+        // over-counts exactly the in-flight batch when a tick-storm
+        // interleaves every attempt — benign for a `>= target` wait (at most
+        // one `hlt` early, never a hang) but NOT monotonic.
+        //
+        // Storm shape: 1 real tick exists. Read d0=0, then pending=1, then
+        // the IRQ moves that 1 into drained so d1=1. True total is 1, the
+        // fallback reports 2 (over-count 1 = the in-flight batch, never more:
+        // one pending value plus one drained value can share at most the
+        // pending batch once).
+        let fallback = cumulative_total(1, 1);
+        assert_eq!(fallback, 2);
+        // The NEXT clean read (no interleave: d0=d1=1, pending=0) reports
+        // the true 1 — going BACKWARD from the fallback's 2. Successive
+        // fallback-then-clean reads are non-monotonic by construction, so
+        // callers must only wait on `>= target`, never exact equality.
+        let clean_next = cumulative_join(1, 0, 1).expect("clean read agrees");
+        assert_eq!(clean_next, 1);
+        assert!(
+            clean_next < fallback,
+            "storm fallback must be allowed to go backward"
+        );
+        // Bound: over-count is at most the stale pending batch (here 1).
+        assert_eq!(fallback.saturating_sub(clean_next), 1);
+        // Saturation still holds on the fallback path (never wraps).
+        assert_eq!(cumulative_total(u64::MAX, u64::MAX), u64::MAX);
     }
 }
