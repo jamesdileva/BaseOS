@@ -179,6 +179,19 @@ pub const fn live_backoff_next(consecutive_failures: u64, failed: bool) -> u64 {
 /// `core`-only so host tests pin it.
 pub const IRQ_STACK_SWITCH_PERMITTED: bool = false;
 
+/// IRQ-gate enforcement helper (S07 slice35, REVIEW #505 enforcement).
+///
+/// `true` while IRQ-context dispatch must defer (`!IRQ_STACK_SWITCH_PERMITTED`).
+/// Pure `core`-only so host tests pin it; the guest `timer_irq_rust` IRQ path
+/// `debug_assert!`s this (code reference to the gate, not docs-only), so a
+/// future real-switch slice that flips the const without converting the IRQ
+/// path to record-then-defer fails the IRQ debug build instead of silently
+/// switching stacks in IRQ context.
+#[must_use]
+pub const fn irq_dispatch_must_defer() -> bool {
+    !IRQ_STACK_SWITCH_PERMITTED
+}
+
 impl Scheduler {
     /// New empty scheduler with `current` preset (usually the boot thread
     /// id, or `NULL_THREAD` when no thread runs yet). `current` is NOT
@@ -2634,5 +2647,16 @@ mod tests {
         assert!(!core::hint::black_box(IRQ_STACK_SWITCH_PERMITTED));
         assert_eq!(next, s.current());
         assert_eq!(s.quantum_left(), QUANTUM_TICKS);
+    }
+
+    #[test]
+    fn irq_gate_enforcement_helper_defers_while_closed() {
+        // S07 slice35 (REVIEW #505): the IRQ path references the gate in code
+        // (`debug_assert!(irq_dispatch_must_defer())` in `timer_irq_rust`),
+        // not docs-only. Pin the helper the IRQ site calls: true while the
+        // gate is closed. `black_box` keeps `clippy -D warnings`
+        // (`assertions_on_constants`) clean, same as the slice34 pin.
+        assert!(core::hint::black_box(super::irq_dispatch_must_defer()));
+        assert!(!core::hint::black_box(super::IRQ_STACK_SWITCH_PERMITTED));
     }
 }

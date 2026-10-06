@@ -556,6 +556,13 @@ static mut TIMER_TICKS: TimerTicks = TimerTicks::new();
 /// metadata-only state flips, no RSP switch). The real-switch slice must
 /// convert this path to record-then-defer.
 ///
+/// S07 slice35 (REVIEW #505 enforcement): the IRQ path `debug_assert!`s
+/// `crate::sched::irq_dispatch_must_defer()` on entry (code reference to the
+/// gate, not docs-only) — a future real-switch slice cannot switch stacks
+/// here while the gate is closed without tripping the debug assert; the
+/// real-switch slice flips the const AND converts this path to
+/// record-then-defer together.
+///
 /// S07 slice12: IRQ side uses the gated form (`tick_gated` under
 /// `IrqGuard::enter()` — the interrupt gate clears IF, so the `cli`
 /// proof holds on entry). Raw `tick()` stays for host parity tests only;
@@ -568,6 +575,13 @@ pub extern "C" fn timer_irq_rust() {
     // the gated drain. Host builds never link this symbol.
     unsafe {
         let gate = IrqGuard::enter();
+        // S07 slice35 (REVIEW #505): enforce the IRQ stack-switch gate at the
+        // IRQ site (not docs-only) — while closed this must defer, never
+        // switch stacks in IRQ context.
+        debug_assert!(
+            crate::sched::irq_dispatch_must_defer(),
+            "IRQ stack switch forbidden while gate closed"
+        );
         (*core::ptr::addr_of_mut!(TIMER_TICKS)).tick_gated(&gate);
         // S07 slice30 per-tick drain: same combined drain-then-dispatch the
         // task-context poll uses (scheduler credit + TOTAL_DRAINED
