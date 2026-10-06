@@ -257,6 +257,18 @@ pub const fn cumulative_total(pending: u64, drained_total: u64) -> u64 {
     pending.saturating_add(drained_total)
 }
 
+/// Pure join for the seqlock-style cumulative read (S07 slice29).
+///
+/// `Some(pending.saturating_add(drained))` when the two `drained` reads
+/// agree (no IRQ-side accumulate interleaved), `None` on disagreement so
+/// the guest snapshot retries. Pure `core`-only so host tests pin it.
+#[must_use]
+pub const fn cumulative_join(drained_before: u64, pending: u64, drained_after: u64) -> Option<u64> {
+    if drained_before != drained_after {
+        return None;
+    }
+    Some(cumulative_total(pending, drained_after))
+}
 /// Guest-only volatile tick snapshot (S07 slice14).
 ///
 /// Volatile whole-struct read of `TIMER_TICKS` so the `sti` spin-wait
@@ -287,19 +299,60 @@ pub(crate) unsafe fn pending_snapshot() -> u64 {
 #[cfg(not(test))]
 static mut TOTAL_DRAINED: u64 = 0;
 
-/// Guest-only cumulative observation (S07 slice28).
+/// Guest-only cumulative observation (S07 slice28; slice29 seqlock retry).
 ///
 /// Volatile `pending + drained_total` via [`cumulative_total`] so the `sti`
 /// wait survives the future per-tick handler drain (pending-only would stall
-/// at 0 once the handler drains every tick). Two volatile reads, each
-/// single-copy on x86-64; the drain-side accumulation runs gated under
-/// `cli` + `IrqGuard` anyway.
+/// at 0 once the handler drains every tick).
+///
+/// Race note (REVIEW #491 risk 1): the `sti` wait runs with IF set, so it
+/// cannot hold `&IrqGuard` — a per-tick IRQ accumulate between the two
+/// reads would double-count (pending read, IRQ moves pending into drained,
+/// drained read) or undercount (reverse order). This wait path reads
+/// drained-first (`d0`), then pending, then drained-again (`d1`) via the
+/// pure [`cumulative_join`], retrying (bounded: 3 tries) while `d0 != d1`.
+/// Residual staleness is at most benign for a `>= target` wait: an
+/// occasional off-by-one wakes one `hlt` early or spins once more — never
+/// a hang, never a wrap (saturating). Exact reads belong to
+/// [`cumulative_snapshot_gated`] under `cli` + `&IrqGuard`.
+///
+/// Each read is single-copy on x86-64 (`u64`, 8-byte aligned).
 ///
 /// # Safety
-/// Guest IRQ-enabled window (wait) or `cli`-gated drain path only;
-/// single-threaded boot owns both statics.
+/// Guest IRQ-enabled wait window only; single-threaded boot owns both statics.
 #[cfg(not(test))]
 pub(crate) unsafe fn cumulative_snapshot() -> u64 {
+    let mut i = 0;
+    loop {
+        let d0: u64 = core::ptr::addr_of!(TOTAL_DRAINED).read_volatile();
+        let pending = core::ptr::addr_of!(TIMER_TICKS).read_volatile().pending();
+        let d1: u64 = core::ptr::addr_of!(TOTAL_DRAINED).read_volatile();
+        if let Some(total) = cumulative_join(d0, pending, d1) {
+            return total;
+        }
+        i += 1;
+        if i >= 3 {
+            // Bounded retry exhausted under a_tick-storm: fall back to the
+            // latest drained-side view (monotonic, saturating) rather than
+            // spinning forever inside the observer.
+            return cumulative_total(pending, d1);
+        }
+    }
+}
+
+/// Guest-only exact cumulative observation (S07 slice29).
+///
+/// Single-pass volatile `pending + drained_total` for `cli`-gated contexts
+/// (drain path, future IRQ handler): the `&IrqGuard` proves IF is masked so
+/// no accumulate can interleave and the two-read race cannot occur. The
+/// `sti` wait cannot use this (it needs IF set) and uses
+/// [`cumulative_snapshot`] instead.
+///
+/// # Safety
+/// `cli` in effect (`gate` proves it); single-threaded boot owns both statics.
+#[cfg(not(test))]
+#[allow(dead_code)] // S07 slice29: exact gated read for the handler-move slice; wait uses the retry variant
+pub(crate) unsafe fn cumulative_snapshot_gated(_gate: &IrqGuard) -> u64 {
     let pending = core::ptr::addr_of!(TIMER_TICKS).read_volatile().pending();
     let drained: u64 = core::ptr::addr_of!(TOTAL_DRAINED).read_volatile();
     cumulative_total(pending, drained)
@@ -316,7 +369,9 @@ pub(crate) unsafe fn cumulative_snapshot() -> u64 {
 /// owns `TOTAL_DRAINED`.
 #[cfg(not(test))]
 pub(crate) unsafe fn reset_total_drained() {
-    core::ptr::addr_of_mut!(TOTAL_DRAINED).write(0);
+    // REVIEW #491 risk 2: volatile-consistent with the snapshot reads —
+    // plain `write` here would mix orderings with `read_volatile` there.
+    core::ptr::addr_of_mut!(TOTAL_DRAINED).write_volatile(0);
 }
 
 /// Guest-only combined PIT-handler step (S07 slice 17; slice 18 delegates
@@ -365,8 +420,10 @@ pub(crate) unsafe fn poll_timer_dispatch(
     // equals that batch; the future per-tick IRQ handler accumulates the
     // same way and the `sti` wait (now cumulative) survives the move.
     let total_ptr = core::ptr::addr_of_mut!(TOTAL_DRAINED);
-    let total = total_ptr.read();
-    total_ptr.write(total.saturating_add(drained));
+    // REVIEW #491 risk 2: volatile-consistent with snapshot/reset (single
+    // ordering family; still `cli` + `&IrqGuard` single-threaded).
+    let total = total_ptr.read_volatile();
+    total_ptr.write_volatile(total.saturating_add(drained));
     (drained, dispatch)
 }
 
@@ -869,5 +926,23 @@ mod tests {
         assert!(cumulative_total(crate::sched::QUANTUM_TICKS + 1, 0) > crate::sched::QUANTUM_TICKS);
         assert!(cumulative_total(0, crate::sched::QUANTUM_TICKS + 1) > crate::sched::QUANTUM_TICKS);
         assert!(cumulative_total(1, crate::sched::QUANTUM_TICKS) > crate::sched::QUANTUM_TICKS);
+    }
+
+    #[test]
+    fn cumulative_join_retries_only_on_interleave() {
+        // S07 slice29 (REVIEW #491 risk 1): drained-first seqlock join.
+        assert_eq!(cumulative_join(4, 1, 4), Some(5));
+        assert_eq!(cumulative_join(0, 0, 0), Some(0));
+        assert_eq!(cumulative_join(0, 5, 0), Some(5));
+        assert_eq!(cumulative_join(u64::MAX, 1, u64::MAX), Some(u64::MAX));
+        // Interleaved IRQ accumulate between the reads -> retry.
+        assert_eq!(cumulative_join(4, 1, 5), None);
+        assert_eq!(cumulative_join(5, 0, 4), None);
+        // Old two-read shape would double-count this interleave
+        // (pending=1 read, IRQ moves 1 to drained, drained=1 read => 2 for
+        // 1 real tick); the join refuses it instead of reporting 2.
+        let stale_two_read = cumulative_total(1, 1);
+        assert_eq!(stale_two_read, 2);
+        assert_eq!(cumulative_join(0, 1, 1), None);
     }
 }
