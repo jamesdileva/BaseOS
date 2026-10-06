@@ -2084,6 +2084,105 @@ mod tests {
     }
 
     #[test]
+    fn live_unsuppressed_agrees_with_task_helper() {
+        // S07 slice24 (REVIEW #473 finding 2): the live helper duplicates
+        // the drain-then-dispatch shape — while unsuppressed it must agree
+        // exactly with the task-context helper (same drain, same dispatch,
+        // same state), differing only by the streak update. A future edit
+        // that reorders (credit after pick), double-dispatches, or credits
+        // differently in one helper goes red here. Suppressed batches
+        // diverge by design (drain-only vs retry) and are pinned by the
+        // throttle test, not here.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        for ticks in [0u64, 1, 2, 4, 5, 9] {
+            for streak_in in [0u64, 1, 2] {
+                assert!(
+                    !live_backoff_suppresses(streak_in),
+                    "unsuppressed only for {ticks} ticks streak {streak_in}"
+                );
+                // Success table: armed 1+2, current 2, full quantum.
+                let mut live = Scheduler::new(1);
+                assert!(live.spawn(mk(1, 0x1000_0000)));
+                assert!(live.spawn(mk(2, 0x2000_0000)));
+                assert_eq!(live.dispatch_gated(&gate), Ok(2));
+                let mut task = live.clone();
+                let mut hw_live = TimerTicks::new();
+                let mut hw_task = TimerTicks::new();
+                let mut i = 0;
+                while i < ticks {
+                    hw_live.tick();
+                    hw_task.tick();
+                    i += 1;
+                }
+                let mut streak = streak_in;
+                let r_live = live.drain_then_dispatch_live_gated(&mut hw_live, &gate, &mut streak);
+                let r_task = task.drain_then_dispatch_gated(&mut hw_task, &gate);
+                assert_eq!(
+                    r_live, r_task,
+                    "success table {ticks} ticks streak {streak_in}"
+                );
+                assert_eq!(live.current(), task.current());
+                assert_eq!(live.quantum_left(), task.quantum_left());
+                assert_eq!(live.total_cpu_ticks(), task.total_cpu_ticks());
+                let failed = matches!(r_live.1, Some(Err(_)));
+                assert_eq!(streak, live_backoff_next(streak_in, failed));
+                // Failure table: known current, nothing Ready (NotReady).
+                let mut run = mk(1, 0x1000_0000);
+                assert!(run.set_state(ThreadState::Running));
+                let mut done = mk(2, 0x2000_0000);
+                assert!(done.set_state(ThreadState::Done));
+                let mut live_f = Scheduler::new(1);
+                assert!(live_f.spawn(run));
+                assert!(live_f.spawn(done));
+                let mut task_f = live_f.clone();
+                let mut hw_live_f = TimerTicks::new();
+                let mut hw_task_f = TimerTicks::new();
+                let mut j = 0;
+                while j < ticks {
+                    hw_live_f.tick();
+                    hw_task_f.tick();
+                    j += 1;
+                }
+                let mut streak_f = streak_in;
+                let rf_live =
+                    live_f.drain_then_dispatch_live_gated(&mut hw_live_f, &gate, &mut streak_f);
+                let rf_task = task_f.drain_then_dispatch_gated(&mut hw_task_f, &gate);
+                assert_eq!(
+                    rf_live, rf_task,
+                    "failure table {ticks} ticks streak {streak_in}"
+                );
+                assert_eq!(live_f.current(), task_f.current());
+                assert_eq!(live_f.quantum_left(), task_f.quantum_left());
+                assert_eq!(live_f.total_cpu_ticks(), task_f.total_cpu_ticks());
+                let failed_f = matches!(rf_live.1, Some(Err(_)));
+                assert_eq!(streak_f, live_backoff_next(streak_in, failed_f));
+                // Unknown current: HW ticks consumed, no dispatch, streak reset.
+                let mut live_u = Scheduler::new(99);
+                assert!(live_u.spawn(mk(1, 0x1000_0000)));
+                let mut task_u = live_u.clone();
+                let mut hw_live_u = TimerTicks::new();
+                let mut hw_task_u = TimerTicks::new();
+                let mut k = 0;
+                while k < ticks {
+                    hw_live_u.tick();
+                    hw_task_u.tick();
+                    k += 1;
+                }
+                let mut streak_u = streak_in;
+                let ru_live =
+                    live_u.drain_then_dispatch_live_gated(&mut hw_live_u, &gate, &mut streak_u);
+                let ru_task = task_u.drain_then_dispatch_gated(&mut hw_task_u, &gate);
+                assert_eq!(
+                    ru_live, ru_task,
+                    "unknown table {ticks} ticks streak {streak_in}"
+                );
+                assert!(ru_live.1.is_none());
+                assert_eq!(streak_u, 0);
+            }
+        }
+    }
+
+    #[test]
     fn drain_then_dispatch_matches_manual_drain_plus_dispatch() {
         // S07 slice 18 (REVIEW #464 nit 1): the helper owns the
         // drain-before-pick order, so it must agree tick-for-tick with the
