@@ -260,29 +260,35 @@ pub(crate) unsafe fn pending_snapshot() -> u64 {
 }
 
 /// Guest-only combined PIT-handler step (S07 slice 17; slice 18 delegates
-/// to the helper instead of re-implementing it; slice 19 is static-only).
+/// to the helper instead of re-implementing it; slice 19 is static-only;
+/// S08 slice25 polls the LIVE helper with the IRQ-owned streak static).
 ///
 /// Drains the IRQ-owned static `TIMER_TICKS` into the IRQ-owned static
-/// scheduler via [`crate::sched::sched_poll_static`] (bulk credit to the
-/// pre-dispatch current, then at most one gated dispatch on expiry) and
+/// scheduler via [`crate::sched::sched_poll_live_static`] (bulk credit to the
+/// pre-dispatch current, then at most one gated dispatch on expiry under the
+/// 3-on-1-off backoff cap) and
 /// returns `(drained, dispatch)` — `dispatch` is `None` when no expiry
 /// (nothing to do) and `Some(Ok/Err)` when one resched was attempted.
 /// Single call site (`bring_up_cpu_and_prove_exception`) so the guest can
 /// never dispatch without draining first (REVIEW #462 risk 1), and the
 /// helper owns the order so this wrapper cannot drift from it (REVIEW #464
 /// nit 1). The `TICK` line still reports `drained` only; the dispatch result
-/// is intentionally ignored (demo table always has a `Ready` target).
+/// is intentionally ignored (demo table always has a `Ready` target, so the
+/// streak stays `0` and slice-24 parity keeps this identical to the task
+/// helper on this table).
 ///
-/// Retry-spin note (REVIEW #464 nit 2): a failed resched (`Some(Err)`)
-/// keeps the consumed quantum (`ticks_left == 0`), so every subsequent
-/// non-empty drain retries exactly one dispatch; empty drains stay `None`.
+/// Throttle note (S08 slice25): a failed resched bumps the IRQ-owned streak
+/// (suppressed every 4th consecutive failure drains without dispatching, then
+/// probes again); the demo table never fails so the guest `TICK` proof is
+/// unchanged.
 ///
 /// Static note (S07 slice 19): both ends are IRQ-owned statics now — the
 /// counter (`TIMER_TICKS`) and the table (`sched::STATIC_SCHED`, armed once
-/// via `sched_init_demo_static`). No stack-local scheduler remains, so the
-/// future live periodic IRQ handler can call this same path from IRQ
-/// context (still task-context polled this slice; the handler move rides
-/// with the S08 live periodic slice together with its failure backoff).
+/// via `sched_init_demo_static` which also resets `sched::STATIC_STREAK`).
+/// No stack-local scheduler remains, so the future live periodic IRQ handler
+/// can call this same live path from IRQ context (still task-context polled
+/// this slice; the handler move rides with the next S08 slice together with
+/// its EOI/reentrancy + QEMU TICK proof).
 ///
 /// # Safety
 /// Post-EBS guest only, `cli` in effect, `gate` proves the critical
@@ -291,7 +297,7 @@ pub(crate) unsafe fn pending_snapshot() -> u64 {
 pub(crate) unsafe fn poll_timer_dispatch(
     gate: &IrqGuard,
 ) -> (u64, Option<Result<u64, crate::thread::SwitchError>>) {
-    crate::sched::sched_poll_static(&mut (*core::ptr::addr_of_mut!(TIMER_TICKS)), gate)
+    crate::sched::sched_poll_live_static(&mut (*core::ptr::addr_of_mut!(TIMER_TICKS)), gate)
 }
 
 /// Shared IRQ0 ISR stub source (AT&T). Same Win64-ABI contract as the

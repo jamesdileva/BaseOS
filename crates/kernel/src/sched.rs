@@ -755,30 +755,76 @@ impl Scheduler {
 #[cfg(not(test))]
 static mut STATIC_SCHED: Scheduler = Scheduler::new(NULL_THREAD);
 
-/// Guest-only static init (S07 slice 19): reset `STATIC_SCHED` to the
-/// demo-armed table ([`Scheduler::demo_armed_scheduler`]).
+/// Guest-only static init (S07 slice 19; S08 slice25 resets the streak):
+/// reset `STATIC_SCHED` to the demo-armed table
+/// ([`Scheduler::demo_armed_scheduler`]) and `STATIC_STREAK` to `0` so the
+/// task-context live poll starts unsuppressed.
 ///
 /// # Safety
 /// Post-EBS guest only, `cli` in effect, `gate` proves the critical
-/// section; single-threaded boot owns `STATIC_SCHED`.
+/// section; single-threaded boot owns `STATIC_SCHED` and `STATIC_STREAK`.
 #[cfg(not(test))]
 pub(crate) unsafe fn sched_init_demo_static(gate: &IrqGuard) {
     STATIC_SCHED = Scheduler::demo_armed_scheduler(gate);
+    STATIC_STREAK = 0;
 }
+
+/// IRQ-owned live-backoff streak (S08 slice25, guest-only).
+///
+/// `static mut`, guest-only: the consecutive-failure count the live helper
+/// owns (`&mut u64` param host-side). IRQ-owned like `STATIC_SCHED` so the
+/// future periodic IRQ handler can pass it from IRQ context without
+/// borrowing bring-up's stack; this slice the task-context live poll owns
+/// it under `cli` + `&IrqGuard`. Host tests never touch this (the pure
+/// streak rule is pinned by `live_backoff_*` + live-helper tests).
+#[cfg(not(test))]
+static mut STATIC_STREAK: u64 = 0;
 
 /// Guest-only static poll (S07 slice 19): drain `ticks` into `STATIC_SCHED`
 /// via [`Scheduler::drain_then_dispatch_gated`] (bulk credit to the
 /// pre-dispatch current, then at most one gated dispatch on expiry).
+/// Retained for the task-context retry-spin reference; the guest bring-up
+/// path now polls via [`sched_poll_live_static`] (S08 slice25).
 ///
 /// # Safety
 /// Post-EBS guest only, `cli` in effect, `gate` proves the critical
 /// section; single-threaded boot owns `STATIC_SCHED` and `ticks`.
 #[cfg(not(test))]
+#[allow(dead_code)]
 pub(crate) unsafe fn sched_poll_static(
     ticks: &mut TimerTicks,
     gate: &IrqGuard,
 ) -> (u64, Option<Result<u64, SwitchError>>) {
     (&mut *core::ptr::addr_of_mut!(STATIC_SCHED)).drain_then_dispatch_gated(ticks, gate)
+}
+
+/// Guest-only static LIVE poll (S08 slice25): drain `ticks` into
+/// `STATIC_SCHED` via [`Scheduler::drain_then_dispatch_live_gated`] with the
+/// IRQ-owned `STATIC_STREAK` (3-on-1-off throttle, auto-recovery probe).
+/// Still task-context polled this slice (`cli` + `gate`); the IRQ-handler
+/// move (calling this same wrapper from `timer_irq_rust`) rides with the
+/// next S08 slice together with EOI/reentrancy + QEMU TICK proof.
+///
+/// Slice-24 parity makes this behavior-neutral on the demo table: while
+/// unsuppressed the live helper agrees exactly with the task helper (same
+/// drain/dispatch/state, streak `0 -> live_backoff_next`), and the demo
+/// table never fails, so the streak stays `0` and the `TICK` line is
+/// unchanged.
+///
+/// # Safety
+/// Post-EBS guest only, `cli` in effect, `gate` proves the critical
+/// section; single-threaded boot owns `STATIC_SCHED`, `STATIC_STREAK`,
+/// and `ticks`.
+#[cfg(not(test))]
+pub(crate) unsafe fn sched_poll_live_static(
+    ticks: &mut TimerTicks,
+    gate: &IrqGuard,
+) -> (u64, Option<Result<u64, SwitchError>>) {
+    (&mut *core::ptr::addr_of_mut!(STATIC_SCHED)).drain_then_dispatch_live_gated(
+        ticks,
+        gate,
+        &mut *core::ptr::addr_of_mut!(STATIC_STREAK),
+    )
 }
 
 #[cfg(test)]
@@ -2323,6 +2369,26 @@ mod tests {
             (s.trace_at(0), s.trace_at(1), s.trace_at(2)),
             (Some(2), Some(3), Some(1))
         );
+    }
+
+    #[test]
+    fn live_poll_shape_on_demo_table_stays_unsuppressed() {
+        // S08 slice25: the guest bring-up live poll (demo-armed table +
+        // IRQ-owned streak starting at 0) drains the QEMU first-tick batch
+        // without dispatching and stays unsuppressed, so the `TICK` line is
+        // unchanged from the task-helper path (slice-24 parity). Streak
+        // reset (not hold) is the init rule `sched_init_demo_static` owns.
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut s = Scheduler::demo_armed_scheduler(&gate);
+        let mut streak = 0u64;
+        let mut one = TimerTicks::new();
+        one.tick();
+        let (drained, res) = s.drain_then_dispatch_live_gated(&mut one, &gate, &mut streak);
+        assert_eq!((drained, res.is_none()), (1, true));
+        assert_eq!(streak, 0);
+        assert_eq!(s.current(), 2);
+        assert_eq!(s.cpu_ticks_of(2), Some(1));
+        assert_eq!(s.quantum_left(), QUANTUM_TICKS - 1);
     }
 
     #[test]
