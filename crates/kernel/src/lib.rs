@@ -276,18 +276,24 @@ core::arch::global_asm!(de_isr_stub_asm!());
 #[cfg(not(test))]
 core::arch::global_asm!(pf_isr_stub_asm!());
 
-/// Guest-only CPU bring-up + timer first-tick + scheduler quantum feed +
-/// live `#PF` proof (S07 slice15; slice19: IRQ-owned static scheduler): load
+/// Guest-only CPU bring-up + timer multi-tick + scheduler quantum feed +
+/// live `#PF` proof (S07 slice15; slice19: IRQ-owned static scheduler;
+/// S08 slice26: multi-tick task-context live poll): load
 /// GDT, load IDT (now covering `#DE` + `#PF` + timer IRQ0 vector 32), remap
 /// the PIC, arm the PIT at 100 Hz
 /// (fail-closed: `pit_program_writes() == None` skips `program` + `sti` and
 /// emits `TICK ok=0 ticks=0` before the `#PF` probe — REVIEW #458 residue
-/// 1), `sti`, wait for the first IRQ0 tick, feed the drained HW ticks into
+/// 1), `sti`, wait for `QUANTUM_TICKS + 1` IRQ0 ticks (multi-tick periodic
+/// proof: one full quantum plus one, so the bulk drain expires and owes
+/// exactly one resched), feed the drained HW ticks into
 /// the IRQ-owned static demo scheduler quantum via `timer::poll_timer_dispatch`
 /// (S07 slice 17 combined drain-then-dispatch, slice 18 delegating directly
 /// to `Scheduler::drain_then_dispatch_gated` so the wrapper cannot drift,
 /// slice 19 static-only over `TIMER_TICKS` + `STATIC_SCHED` so no
-/// stack-local table remains for the future live IRQ handler),
+/// stack-local table remains for the future live IRQ handler;
+/// S08 slice25 live helper with the IRQ-owned streak static, still
+/// task-context polled — the IRQ-handler move rides next with its
+/// cumulative-drained counter + EOI/reentrancy proof),
 /// emit
 /// `TICK ok=1 ticks=<n>`, then volatile-read [`PF_PROBE_ADDR`] (unmapped
 /// guard → not-present `#PF`).
@@ -330,10 +336,18 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
     } else {
         timer::program_pit();
         cpu::sti();
-        // First-tick wait: `hlt` until the IRQ-side gated tick lands.
+        // Multi-tick wait (S08 slice26): `hlt` until `QUANTUM_TICKS + 1`
+        // IRQ-side gated ticks land (one full quantum plus one, so the
+        // task-context live drain expires and owes exactly one resched).
+        // Const-driven: a quantum change moves the target with it; the ps1
+        // `ticks=[1-9]` gate accepts any positive count. Still task-context
+        // polled — the IRQ-handler move needs a cumulative-drained static
+        // first (per-tick handler drain would hold `pending` at 0 and this
+        // wait would never fire), so it rides next with EOI/reentrancy.
+        let wait_target = crate::sched::QUANTUM_TICKS + 1;
         let mut spins = 0u32;
         loop {
-            if timer::pending_snapshot() > 0 {
+            if timer::pending_snapshot() >= wait_target {
                 break;
             }
             if spins >= 200 {
