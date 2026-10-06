@@ -550,6 +550,12 @@ static mut TIMER_TICKS: TimerTicks = TimerTicks::new();
 /// `Scheduler::new(NULL_THREAD)`: unknown-current drains consume the counter
 /// with no dispatch owed, slice-20 backoff by construction).
 ///
+/// S07 slice34 (REVIEW #501 risk 1 pin): the ignored dispatch result is a
+/// DEFERRED-resched request, never an immediate stack switch — safe only
+/// while `crate::sched::IRQ_STACK_SWITCH_PERMITTED == false` (dispatch is
+/// metadata-only state flips, no RSP switch). The real-switch slice must
+/// convert this path to record-then-defer.
+///
 /// S07 slice12: IRQ side uses the gated form (`tick_gated` under
 /// `IrqGuard::enter()` — the interrupt gate clears IF, so the `cli`
 /// proof holds on entry). Raw `tick()` stays for host parity tests only;

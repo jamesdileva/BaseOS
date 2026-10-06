@@ -166,6 +166,19 @@ pub const fn live_backoff_next(consecutive_failures: u64, failed: bool) -> u64 {
     }
 }
 
+/// IRQ stack-switch gate (S07 slice34, REVIEW #501 risk 1 pin).
+///
+/// `false` while IRQ-context dispatch is metadata-only (Ready<->Running
+/// state flips + quantum rearm, no RSP/register switch). `timer_irq_rust`
+/// dispatches via `drain_then_dispatch_live_gated` and IGNORES the result
+/// (`let _ =`) — safe only while this is `false`: the ignored `Ok(next)`
+/// is a deferred-resched request, never an immediate stack switch. The
+/// slice that lands a real RSP switch MUST flip this to `true` AND convert
+/// the IRQ path to record-then-defer (no in-IRQ switch); any guest edit
+/// that switches stacks while this is `false` violates the gate. Pure
+/// `core`-only so host tests pin it.
+pub const IRQ_STACK_SWITCH_PERMITTED: bool = false;
+
 impl Scheduler {
     /// New empty scheduler with `current` preset (usually the boot thread
     /// id, or `NULL_THREAD` when no thread runs yet). `current` is NOT
@@ -2599,5 +2612,27 @@ mod tests {
             li += 1;
         }
         let _ = in_code;
+    }
+
+    #[test]
+    fn irq_dispatch_result_is_deferred_never_stack_switch() {
+        // S07 slice34 (REVIEW #501 risk 1 pin): IRQ-context dispatch is
+        // metadata-only while `IRQ_STACK_SWITCH_PERMITTED == false`. The
+        // `timer_irq_rust` path ignores the dispatch `Ok(next)` — that
+        // ignore is a deferral, never an immediate RSP switch. Pin both
+        // halves: the gate stays closed, and the gated dispatch on the demo
+        // table mutates only state/current/quantum (no stack primitive to
+        // call — there is none in-tree, so this test pins the observable
+        // metadata shape the IRQ path defers). `black_box` keeps the gate
+        // assert runtime so `clippy -D warnings`
+        // (`assertions_on_constants`) stays clean.
+        assert!(!core::hint::black_box(IRQ_STACK_SWITCH_PERMITTED));
+        let gate = unsafe { IrqGuard::enter() };
+        let mut s = Scheduler::demo_armed_scheduler(&gate);
+        assert_eq!(s.current(), 2);
+        let next = s.dispatch_gated(&gate).expect("demo table always Ready");
+        assert!(!core::hint::black_box(IRQ_STACK_SWITCH_PERMITTED));
+        assert_eq!(next, s.current());
+        assert_eq!(s.quantum_left(), QUANTUM_TICKS);
     }
 }
