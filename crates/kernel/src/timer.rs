@@ -242,6 +242,21 @@ pub(crate) unsafe fn program_pit() {
     }
 }
 
+/// Pure cumulative-tick observation (S07 slice28 IRQ-move precondition).
+///
+/// `pending + drained_total` (saturating): the `sti` spin-wait must observe
+/// total ticks ever produced, not just the undrained pending count. A future
+/// per-tick IRQ-handler drain would hold `pending` near 0 forever and the
+/// `pending_snapshot`-only wait would never fire; waiting on the cumulative
+/// keeps the same target working before and after the handler move.
+/// Pure `core`-only so host tests pin the saturating rule; the guest
+/// [`cumulative_snapshot`] reads both statics volatile under the same
+/// single-copy `u64` note as [`pending_snapshot`].
+#[must_use]
+pub const fn cumulative_total(pending: u64, drained_total: u64) -> u64 {
+    pending.saturating_add(drained_total)
+}
+
 /// Guest-only volatile tick snapshot (S07 slice14).
 ///
 /// Volatile whole-struct read of `TIMER_TICKS` so the `sti` spin-wait
@@ -255,8 +270,53 @@ pub(crate) unsafe fn program_pit() {
 /// # Safety
 /// Guest IRQ-enabled window only; single-threaded boot owns the read.
 #[cfg(not(test))]
+#[allow(dead_code)] // S07 slice28: wait moved to cumulative; kept for pending-only diff/QEMU
 pub(crate) unsafe fn pending_snapshot() -> u64 {
     core::ptr::addr_of!(TIMER_TICKS).read_volatile().pending()
+}
+
+/// Guest-only cumulative drained total (S07 slice28, IRQ-move precondition).
+///
+/// `static mut`, guest-only: total ticks ever drained by
+/// [`poll_timer_dispatch`] (saturating). IRQ-owned like `TIMER_TICKS` so a
+/// future periodic IRQ handler can accumulate from IRQ context without
+/// borrowing bring-up's stack; this slice the task-context poll owns it
+/// under `cli` + `&IrqGuard`. Host tests never touch this (the pure
+/// [`cumulative_total`] rule is pinned host-side; the static wiring is
+/// proven by QEMU).
+#[cfg(not(test))]
+static mut TOTAL_DRAINED: u64 = 0;
+
+/// Guest-only cumulative observation (S07 slice28).
+///
+/// Volatile `pending + drained_total` via [`cumulative_total`] so the `sti`
+/// wait survives the future per-tick handler drain (pending-only would stall
+/// at 0 once the handler drains every tick). Two volatile reads, each
+/// single-copy on x86-64; the drain-side accumulation runs gated under
+/// `cli` + `IrqGuard` anyway.
+///
+/// # Safety
+/// Guest IRQ-enabled window (wait) or `cli`-gated drain path only;
+/// single-threaded boot owns both statics.
+#[cfg(not(test))]
+pub(crate) unsafe fn cumulative_snapshot() -> u64 {
+    let pending = core::ptr::addr_of!(TIMER_TICKS).read_volatile().pending();
+    let drained: u64 = core::ptr::addr_of!(TOTAL_DRAINED).read_volatile();
+    cumulative_total(pending, drained)
+}
+
+/// Guest-only cumulative reset (S07 slice28).
+///
+/// Zeroes `TOTAL_DRAINED` before the `sti` window so the wait target starts
+/// from a known base on every boot (static starts 0 anyway; explicit reset
+/// keeps a future warm-reuse honest).
+///
+/// # Safety
+/// Post-EBS guest only, `cli` in effect (pre-`sti`), single-threaded boot
+/// owns `TOTAL_DRAINED`.
+#[cfg(not(test))]
+pub(crate) unsafe fn reset_total_drained() {
+    core::ptr::addr_of_mut!(TOTAL_DRAINED).write(0);
 }
 
 /// Guest-only combined PIT-handler step (S07 slice 17; slice 18 delegates
@@ -297,7 +357,17 @@ pub(crate) unsafe fn pending_snapshot() -> u64 {
 pub(crate) unsafe fn poll_timer_dispatch(
     gate: &IrqGuard,
 ) -> (u64, Option<Result<u64, crate::thread::SwitchError>>) {
-    crate::sched::sched_poll_live_static(&mut (*core::ptr::addr_of_mut!(TIMER_TICKS)), gate)
+    let (drained, dispatch) =
+        crate::sched::sched_poll_live_static(&mut (*core::ptr::addr_of_mut!(TIMER_TICKS)), gate);
+    // S07 slice28 cumulative precondition: every drained batch is added to
+    // `TOTAL_DRAINED` (saturating) so `cumulative_snapshot` keeps counting
+    // across drains. This slice drains once (task-context), so the total
+    // equals that batch; the future per-tick IRQ handler accumulates the
+    // same way and the `sti` wait (now cumulative) survives the move.
+    let total_ptr = core::ptr::addr_of_mut!(TOTAL_DRAINED);
+    let total = total_ptr.read();
+    total_ptr.write(total.saturating_add(drained));
+    (drained, dispatch)
 }
 
 /// Shared IRQ0 ISR stub source (AT&T). Same Win64-ABI contract as the
@@ -776,5 +846,28 @@ mod tests {
             stub.contains("iretq"),
             "returning stub must iretq, never park: {stub}"
         );
+    }
+
+    #[test]
+    fn cumulative_total_survives_handler_drain() {
+        // S07 slice28 IRQ-move precondition: the `sti` wait must observe
+        // total ticks ever produced, not just undrained pending. A future
+        // per-tick handler drain holds pending near 0; pending-only would
+        // stall the wait at 0 while total keeps counting.
+        assert_eq!(cumulative_total(0, 0), 0);
+        assert_eq!(cumulative_total(5, 0), 5);
+        // Handler-drained shape: pending drained to 0-1, total carries the
+        // history — the wait target still fires.
+        assert_eq!(cumulative_total(0, 5), 5);
+        assert_eq!(cumulative_total(1, 4), 5);
+        assert_eq!(cumulative_total(5, 3), 8);
+        // Saturates, never wraps (u64::MAX is ~5 Gyr at 100 Hz).
+        assert_eq!(cumulative_total(u64::MAX, 1), u64::MAX);
+        assert_eq!(cumulative_total(u64::MAX - 1, 5), u64::MAX);
+        // Wait-target shape: QUANTUM_TICKS + 1 fires on pending-only today
+        // (drained 0) and on drained-heavy totals after the handler move.
+        assert!(cumulative_total(crate::sched::QUANTUM_TICKS + 1, 0) > crate::sched::QUANTUM_TICKS);
+        assert!(cumulative_total(0, crate::sched::QUANTUM_TICKS + 1) > crate::sched::QUANTUM_TICKS);
+        assert!(cumulative_total(1, crate::sched::QUANTUM_TICKS) > crate::sched::QUANTUM_TICKS);
     }
 }

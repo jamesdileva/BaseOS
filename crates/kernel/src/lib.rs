@@ -335,19 +335,22 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         write_tick_line(false, 0);
     } else {
         timer::program_pit();
+        timer::reset_total_drained();
         cpu::sti();
-        // Multi-tick wait (S07 slice26): `hlt` until `QUANTUM_TICKS + 1`
-        // IRQ-side gated ticks land (one full quantum plus one, so the
-        // task-context live drain expires and owes exactly one resched).
-        // Const-driven: a quantum change moves the target with it; the ps1
-        // `ticks=[1-9]` gate accepts any positive count. Still task-context
-        // polled — the IRQ-handler move needs a cumulative-drained static
-        // first (per-tick handler drain would hold `pending` at 0 and this
-        // wait would never fire), so it rides next with EOI/reentrancy.
+        // Multi-tick wait (S07 slice26; slice28 cumulative): `hlt` until
+        // `QUANTUM_TICKS + 1` total ticks are observed (one full quantum
+        // plus one, so the task-context live drain expires and owes exactly
+        // one resched). Cumulative (`pending + drained_total`) instead of
+        // pending-only: a future per-tick IRQ-handler drain would hold
+        // `pending` at 0 and a pending-only wait would never fire. This
+        // slice still drains once after the wait (total == 0 until then),
+        // so the behavior is unchanged and the handler move inherits the
+        // wait shape. Const-driven: a quantum change moves the target; the
+        // ps1 `ticks=[1-9]` gate accepts any positive count.
         let wait_target = crate::sched::QUANTUM_TICKS + 1;
         let mut spins = 0u32;
         loop {
-            if timer::pending_snapshot() >= wait_target {
+            if timer::cumulative_snapshot() >= wait_target {
                 break;
             }
             if spins >= 200 {
