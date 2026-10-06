@@ -291,9 +291,9 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 /// to `Scheduler::drain_then_dispatch_gated` so the wrapper cannot drift,
 /// slice 19 static-only over `TIMER_TICKS` + `STATIC_SCHED` so no
 /// stack-local table remains for the future live IRQ handler;
-/// S07 slice25 live helper with the IRQ-owned streak static, still
-/// task-context polled — the IRQ-handler move rides next with its
-/// cumulative-drained counter + EOI/reentrancy proof),
+/// S07 slice25 live helper with the IRQ-owned streak static, S07 slice30
+/// per-tick IRQ drain live (`timer_irq_rust` drains via the same helper;
+/// task-context remainder ~0, TICK reports the gated cumulative total),
 /// emit
 /// `TICK ok=1 ticks=<n>`, then volatile-read [`PF_PROBE_ADDR`] (unmapped
 /// guard → not-present `#PF`).

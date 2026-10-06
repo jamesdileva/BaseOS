@@ -391,13 +391,15 @@ pub(crate) unsafe fn reset_total_drained() {
 /// 3-on-1-off backoff cap) and
 /// returns `(drained, dispatch)` — `dispatch` is `None` when no expiry
 /// (nothing to do) and `Some(Ok/Err)` when one resched was attempted.
-/// Single call site (`bring_up_cpu_and_prove_exception`) so the guest can
-/// never dispatch without draining first (REVIEW #462 risk 1), and the
-/// helper owns the order so this wrapper cannot drift from it (REVIEW #464
-/// nit 1). The `TICK` line still reports `drained` only; the dispatch result
-/// is intentionally ignored (demo table always has a `Ready` target, so the
-/// streak stays `0` and slice-24 parity keeps this identical to the task
-/// helper on this table).
+/// Two call sites (`timer_irq_rust` per-tick + `bring_up_cpu_and_prove_exception`
+/// remainder) share this same helper so the guest can never dispatch without
+/// draining first (REVIEW #462 risk 1), and the helper owns the order so this
+/// wrapper cannot drift from it (REVIEW #464 nit 1). The `TICK` proof line
+/// reports the gated cumulative total, never `drained`-only (REVIEW #495 tail
+/// 1: the per-tick drain holds the task-context remainder near 0); the
+/// dispatch result is intentionally ignored (demo table always has a `Ready`
+/// target, so the streak stays `0` and slice-24 parity keeps this identical
+/// to the task helper on this table).
 ///
 /// Throttle note (S08 slice25): a failed resched bumps the IRQ-owned streak
 /// (suppressed every 4th consecutive failure drains without dispatching, then
@@ -407,10 +409,10 @@ pub(crate) unsafe fn reset_total_drained() {
 /// Static note (S07 slice 19): both ends are IRQ-owned statics now — the
 /// counter (`TIMER_TICKS`) and the table (`sched::STATIC_SCHED`, armed once
 /// via `sched_init_demo_static` which also resets `sched::STATIC_STREAK`).
-/// No stack-local scheduler remains, so the future live periodic IRQ handler
-/// can call this same live path from IRQ context (still task-context polled
-/// this slice; the handler move rides with the next S08 slice together with
-/// its EOI/reentrancy + QEMU TICK proof).
+/// No stack-local scheduler remains; S07 slice30 calls this same live path
+/// per-tick from IRQ context (`timer_irq_rust`), with the task-context
+/// remainder proving the gated cumulative total (QEMU TICK re-run owed per
+/// REVIEW #497).
 ///
 /// # Safety
 /// Post-EBS guest only, `cli` in effect, `gate` proves the critical

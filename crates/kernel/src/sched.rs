@@ -798,12 +798,13 @@ pub(crate) unsafe fn sched_poll_static(
     (&mut *core::ptr::addr_of_mut!(STATIC_SCHED)).drain_then_dispatch_gated(ticks, gate)
 }
 
-/// Guest-only static LIVE poll (S08 slice25): drain `ticks` into
-/// `STATIC_SCHED` via [`Scheduler::drain_then_dispatch_live_gated`] with the
-/// IRQ-owned `STATIC_STREAK` (3-on-1-off throttle, auto-recovery probe).
-/// Still task-context polled this slice (`cli` + `gate`); the IRQ-handler
-/// move (calling this same wrapper from `timer_irq_rust`) rides with the
-/// next S08 slice together with EOI/reentrancy + QEMU TICK proof.
+/// Guest-only static LIVE poll (S08 slice25; S07 slice30 per-tick IRQ live):
+/// drain `ticks` into `STATIC_SCHED` via
+/// [`Scheduler::drain_then_dispatch_live_gated`] with the IRQ-owned
+/// `STATIC_STREAK` (3-on-1-off throttle, auto-recovery probe). Called
+/// per-tick from `timer_irq_rust` (IRQ context) plus the task-context
+/// remainder in `bring_up_cpu_and_prove_exception`; QEMU TICK re-run owed
+/// per REVIEW #497.
 ///
 /// Slice-24 parity makes this behavior-neutral on the demo table: while
 /// unsuppressed the live helper agrees exactly with the task helper (same
@@ -2127,6 +2128,38 @@ mod tests {
         assert!(ru.is_none());
         assert_eq!(streak, 0);
         assert_eq!(u.total_cpu_ticks(), 0);
+    }
+
+    #[test]
+    fn pre_init_null_current_drain_consumes_without_dispatch() {
+        // REVIEW #497 risk 4: pre-`sched_init_demo_static` the IRQ-owned
+        // `STATIC_SCHED` is `Scheduler::new(NULL_THREAD)` (unknown current).
+        // A per-tick IRQ drain there must consume the counter with no dispatch
+        // owed, on both the task and live paths (safe by construction).
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut pre = Scheduler::new(NULL_THREAD);
+        assert!(pre.spawn(mk(1, 0x1000_0000)));
+        let mut hw = TimerTicks::new();
+        hw.tick();
+        hw.tick();
+        hw.tick();
+        let (d, disp) = pre.drain_then_dispatch_gated(&mut hw, &gate);
+        assert_eq!(d, 3);
+        assert!(disp.is_none());
+        assert_eq!(hw.pending(), 0);
+        assert_eq!(pre.total_cpu_ticks(), 0);
+        let mut pre_live = Scheduler::new(NULL_THREAD);
+        assert!(pre_live.spawn(mk(1, 0x1000_0000)));
+        let mut hw_live = TimerTicks::new();
+        hw_live.tick();
+        hw_live.tick();
+        let mut streak = 2u64;
+        let (dl, res) = pre_live.drain_then_dispatch_live_gated(&mut hw_live, &gate, &mut streak);
+        assert_eq!(dl, 2);
+        assert!(res.is_none());
+        assert_eq!(streak, 0);
+        assert_eq!(hw_live.pending(), 0);
+        assert_eq!(pre_live.total_cpu_ticks(), 0);
     }
 
     #[test]
