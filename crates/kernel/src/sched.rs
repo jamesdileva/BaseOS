@@ -272,6 +272,24 @@ impl Scheduler {
         None
     }
 
+    /// Scheduling priority of one spawned thread (`None` when unknown id).
+    /// Read-only data query (S07 slice40, data-only): `spawn` carries the
+    /// descriptor's priority through, `dispatch`/`exit_current` ignore it
+    /// (round-robin preserved until the policy slice).
+    #[must_use]
+    pub fn priority_of(&self, id: u64) -> Option<u8> {
+        let mut i = 0;
+        while i < self.len {
+            if let Some(t) = self.table[i] {
+                if t.id() == id {
+                    return Some(t.priority());
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// Total successful dispatches (saturating sum over spawned slots).
     #[must_use]
     pub fn total_dispatches(&self) -> u64 {
@@ -892,6 +910,41 @@ mod tests {
         assert_eq!(s.current(), 2);
         assert_eq!(s.dispatch(), Ok(3));
         assert_eq!(s.dispatch(), Ok(1));
+    }
+
+    #[test]
+    fn priority_is_data_only_round_robin_preserved() {
+        // S07 slice40 — priority rides as data (default 0, any u8 settable,
+        // spawn carries it, unknown id is None); the pick/dispatch order
+        // IGNORES it this slice (round-robin preserved). A priority-aware
+        // policy that reorders must update this test, never stay green
+        // while the guest diverges.
+        let mut t = mk(1, 0x1000_0000);
+        assert_eq!(t.priority(), 0);
+        t.set_priority(200);
+        assert_eq!(t.priority(), 200);
+        t.set_priority(0);
+        assert_eq!(t.priority(), 0);
+        let mut hi = mk(2, 0x2000_0000);
+        hi.set_priority(255);
+        let mut lo = mk(1, 0x1000_0000);
+        lo.set_priority(1);
+        let mut mid = mk(3, 0x3000_0000);
+        mid.set_priority(128);
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(lo));
+        assert!(s.spawn(hi));
+        assert!(s.spawn(mid));
+        assert_eq!(s.priority_of(1), Some(1));
+        assert_eq!(s.priority_of(2), Some(255));
+        assert_eq!(s.priority_of(3), Some(128));
+        assert_eq!(s.priority_of(99), None);
+        // Mixed priorities dispatch in id round-robin order, not priority
+        // order (hi=255 does NOT jump the queue).
+        assert_eq!(s.dispatch(), Ok(2));
+        assert_eq!(s.dispatch(), Ok(3));
+        assert_eq!(s.dispatch(), Ok(1));
+        assert_eq!(s.fairness_spread(), 0);
     }
 
     #[test]

@@ -90,6 +90,11 @@ pub enum SwitchError {
 
 /// One kernel thread descriptor (data only, no registers yet).
 /// Fields are private: construct only via [`Thread::new`].
+///
+/// S07 slice40 — scheduling priority (data-only): `priority` defaults to `0`
+/// (normal) at `new()`; any `u8` is valid (no fail-closed gate — there is no
+/// bad priority). The scheduler pick still ignores it this slice
+/// (round-robin preserved); a priority-aware policy lands in a later slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Thread {
     /// Small thread id (index into a future table).
@@ -102,6 +107,8 @@ pub struct Thread {
     stack_size: u64,
     /// Entry point address (guest `fn()` target).
     entry: u64,
+    /// Scheduling priority (higher = more urgent once policy lands).
+    priority: u8,
 }
 
 /// Shared stack+entry gate: the exact `new()` invariants for the
@@ -165,6 +172,7 @@ impl Thread {
             stack_base,
             stack_size,
             entry,
+            priority: 0,
         })
     }
 
@@ -196,6 +204,19 @@ impl Thread {
     #[must_use]
     pub const fn entry(self) -> u64 {
         self.entry
+    }
+
+    /// Scheduling priority (S07 slice40, data-only): `0` at `new()`.
+    /// Read-only query; the pick ignores it until the policy slice.
+    #[must_use]
+    pub const fn priority(self) -> u8 {
+        self.priority
+    }
+
+    /// Set scheduling priority (S07 slice40, data-only, infallible: any
+    /// `u8` is valid; no lifecycle/state interaction, never refused).
+    pub fn set_priority(&mut self, priority: u8) {
+        self.priority = priority;
     }
 
     /// Cooperative state transition (the picker itself never mutates;
@@ -1334,6 +1355,7 @@ mod tests {
             state: ThreadState::Ready,
             stack_base: 0x3000_0000,
             stack_size: 8192,
+            priority: 0,
             entry: 0x3000,
         };
         assert_eq!(
@@ -1371,6 +1393,7 @@ mod tests {
                 state: ThreadState::Ready,
                 stack_base: 0x2000_0000,
                 stack_size: 8192,
+                priority: 0,
                 entry: 0,
             },
             // Null stack base.
@@ -1379,6 +1402,7 @@ mod tests {
                 state: ThreadState::Ready,
                 stack_base: 0,
                 stack_size: 8192,
+                priority: 0,
                 entry: 0x2000,
             },
             // Sub-page size (16-byte aligned, so the old top-only gate
@@ -1388,6 +1412,7 @@ mod tests {
                 state: ThreadState::Ready,
                 stack_base: 0x2000_0000,
                 stack_size: 16,
+                priority: 0,
                 entry: 0x2000,
             },
             // Misaligned base with an aligned top (base 1 + size 8191 =
@@ -1397,6 +1422,7 @@ mod tests {
                 state: ThreadState::Ready,
                 stack_base: 0x2000_0001,
                 stack_size: 8191,
+                priority: 0,
                 entry: 0x2000,
             },
             // Misaligned size.
@@ -1405,6 +1431,7 @@ mod tests {
                 state: ThreadState::Ready,
                 stack_base: 0x2000_0000,
                 stack_size: 5000,
+                priority: 0,
                 entry: 0x2000,
             },
         ];
@@ -1632,6 +1659,7 @@ mod tests {
             state: ThreadState::Ready,
             stack_base: 0x2000_0000,
             stack_size: 16,
+            priority: 0,
             entry: 0x2000,
         };
         assert!(check_jump_entry(thin_top, thin.entry()));
@@ -1641,6 +1669,7 @@ mod tests {
             state: ThreadState::Ready,
             stack_base: 0x2000_0001,
             stack_size: 8191,
+            priority: 0,
             entry: 0x2000,
         };
         assert!(check_jump_entry(skew_top, skew.entry()));
