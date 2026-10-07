@@ -662,6 +662,71 @@ impl Scheduler {
         crate::thread::switch_stub(&packed[..self.len], self.current)
     }
 
+    /// Priority-aware pick (S07 slice41, opt-in — RR default preserved).
+    ///
+    /// Highest-priority `Ready` thread excluding `current`; ties break in
+    /// RR slice order (first max-prio candidate after `current`, wrapping).
+    /// Same refusal set as `switch_stub`: empty/unknown-current →
+    /// `Unknown`, corrupt table → `InvalidTable`, no other `Ready` →
+    /// `NoSwitch` (current `Ready`) / `NotReady` (current not `Ready`).
+    /// Read-only, never mutates. `dispatch`/`dispatch_gated` keep RR until
+    /// a policy slice flips the default; use `dispatch_priority` for the
+    /// policy path.
+    pub fn pick_next_priority(&self) -> Result<u64, SwitchError> {
+        if self.len == 0 {
+            return Err(SwitchError::Unknown);
+        }
+        let packed = self.packed();
+        validate_threads(&packed[..self.len])?;
+        let mut start: Option<usize> = None;
+        let mut i = 0;
+        while i < self.len {
+            if packed[i].id() == self.current {
+                start = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        let start = match start {
+            Some(idx) => idx,
+            None => return Err(SwitchError::Unknown),
+        };
+        // Max priority among other Ready threads (O(n), same class as
+        // `priority_of`; perf-first note: policy pick is linear, recorded
+        // for the S08 measurement slice, not the hot path yet).
+        let mut best: Option<u8> = None;
+        let mut k = 0;
+        while k < self.len {
+            let t = packed[k];
+            if t.id() != self.current && t.state() == ThreadState::Ready {
+                let p = t.priority();
+                if best.is_none() || p > best.unwrap() {
+                    best = Some(p);
+                }
+            }
+            k += 1;
+        }
+        let best = match best {
+            Some(p) => p,
+            None => {
+                if packed[start].state() == ThreadState::Ready {
+                    return Err(SwitchError::NoSwitch);
+                }
+                return Err(SwitchError::NotReady);
+            }
+        };
+        // RR tie-break: first max-prio candidate after current, wrapping.
+        let mut step = 1;
+        while step <= self.len {
+            let t = packed[(start + step) % self.len];
+            if t.id() != self.current && t.state() == ThreadState::Ready && t.priority() == best {
+                return Ok(t.id());
+            }
+            step += 1;
+        }
+        Err(SwitchError::NotReady)
+    }
+
     /// Pick the next `Ready` thread and move it Ready→Running, parking the
     /// previous `Running` thread back to Ready (cooperative yield). The
     /// previous `Done` thread stays `Done`. On pick refusal returns the
@@ -703,6 +768,41 @@ impl Scheduler {
     /// the gated path is required (guest `chain_leg`, join/exit probe).
     pub fn dispatch_gated(&mut self, _gate: &IrqGuard) -> Result<u64, SwitchError> {
         self.dispatch()
+    }
+
+    /// Priority-aware dispatch (S07 slice41, opt-in): same Ready→Running
+    /// state moves + quantum rearm + trace as [`Scheduler::dispatch`], but
+    /// the target comes from [`Scheduler::pick_next_priority`]. Refusals
+    /// mutate nothing (counter untouched). RR stays the default; the guest
+    /// probe stays on `dispatch_gated` this slice.
+    pub fn dispatch_priority(&mut self) -> Result<u64, SwitchError> {
+        let next = self.pick_next_priority()?;
+        let mut i = 0;
+        while i < self.len {
+            if let Some(ref mut t) = self.table[i] {
+                if t.id() == next {
+                    if t.state() != ThreadState::Ready {
+                        return Err(SwitchError::NotReady);
+                    }
+                    let _ = t.set_state(ThreadState::Running);
+                    self.runs[i] = self.runs[i].saturating_add(1);
+                } else if t.id() == self.current && t.state() == ThreadState::Running {
+                    let _ = t.set_state(ThreadState::Ready);
+                }
+            }
+            i += 1;
+        }
+        self.record_trace(next);
+        self.current = next;
+        self.ticks_left = QUANTUM_TICKS;
+        Ok(next)
+    }
+
+    /// IRQ-gated priority dispatch: same `&IrqGuard` proof as
+    /// [`Scheduler::dispatch_gated`], policy target from
+    /// [`Scheduler::pick_next_priority`].
+    pub fn dispatch_priority_gated(&mut self, _gate: &IrqGuard) -> Result<u64, SwitchError> {
+        self.dispatch_priority()
     }
 
     /// Mark `id` observed-finished (S06 slice27 join): read-only query,
@@ -945,6 +1045,58 @@ mod tests {
         assert_eq!(s.dispatch(), Ok(3));
         assert_eq!(s.dispatch(), Ok(1));
         assert_eq!(s.fairness_spread(), 0);
+    }
+
+    #[test]
+    fn priority_aware_pick_jumps_queue_rr_preserved() {
+        // S07 slice41 — opt-in policy: `pick_next_priority` /
+        // `dispatch_priority` prefer the highest-priority Ready thread
+        // (hi=255 jumps the queue), while `pick_next`/`dispatch` stay RR.
+        // Order [lo(1), mid(128), hi(255)], current=1: RR gives 2, policy
+        // gives 3. Fairness tension recorded: one policy dispatch holds
+        // spread 1 (only hi ran) vs RR full-round spread 0.
+        let mut lo = mk(1, 0x1000_0000);
+        lo.set_priority(1);
+        let mut mid = mk(2, 0x2000_0000);
+        mid.set_priority(128);
+        let mut hi = mk(3, 0x3000_0000);
+        hi.set_priority(255);
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(lo));
+        assert!(s.spawn(mid));
+        assert!(s.spawn(hi));
+        assert_eq!(s.pick_next(), Ok(2));
+        assert_eq!(s.pick_next_priority(), Ok(3));
+        assert_eq!(s.dispatch_priority(), Ok(3));
+        assert_eq!(s.current(), 3);
+        assert_eq!(s.fairness_spread(), 1);
+        // Next policy target: highest Ready excluding hi(3) is mid(2).
+        assert_eq!(s.pick_next_priority(), Ok(2));
+        assert_eq!(s.dispatch_priority(), Ok(2));
+        // Tie-break is RR slice order: equal max prio picks the first
+        // candidate after current, wrapping.
+        let mut a = mk(1, 0x1000_0000);
+        a.set_priority(10);
+        let mut b = mk(2, 0x2000_0000);
+        b.set_priority(10);
+        let mut c = mk(3, 0x3000_0000);
+        c.set_priority(10);
+        let mut t = Scheduler::new(1);
+        assert!(t.spawn(a));
+        assert!(t.spawn(b));
+        assert!(t.spawn(c));
+        assert_eq!(t.pick_next_priority(), Ok(2));
+        // Refusal parity with switch_stub: empty/unknown/solo/NoSwitch.
+        let e = Scheduler::new(NULL_THREAD);
+        assert_eq!(e.pick_next_priority(), Err(SwitchError::Unknown));
+        let mut u = Scheduler::new(99);
+        assert!(u.spawn(mk(1, 0x1000_0000)));
+        assert_eq!(u.pick_next_priority(), Err(SwitchError::Unknown));
+        let mut solo = Scheduler::new(1);
+        assert!(solo.spawn(mk(1, 0x1000_0000)));
+        assert_eq!(solo.pick_next_priority(), Err(SwitchError::NoSwitch));
+        assert_eq!(solo.dispatch_priority(), Err(SwitchError::NoSwitch));
+        assert_eq!(solo.current(), 1);
     }
 
     #[test]
