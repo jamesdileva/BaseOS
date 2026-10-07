@@ -744,35 +744,40 @@ impl Scheduler {
     /// guarantees a `Ready` target, so phase-1 refusal is defensive
     /// unreachable via either pick, never a new behavior.
     fn commit_next(&mut self, next: u64) -> Result<u64, SwitchError> {
-        let mut target_ready = false;
+        // S07 slice44 (REVIEW #525 risk 2): single index scan, then O(1)
+        // moves by index; refusal still precedes any mutation.
+        let mut next_idx: Option<usize> = None;
+        let mut cur_idx: Option<usize> = None;
         let mut i = 0;
         while i < self.len {
             if let Some(t) = self.table[i] {
                 if t.id() == next {
-                    if t.state() != ThreadState::Ready {
-                        return Err(SwitchError::NotReady);
-                    }
-                    target_ready = true;
-                    break;
+                    next_idx = Some(i);
+                } else if t.id() == self.current {
+                    cur_idx = Some(i);
                 }
             }
             i += 1;
         }
-        if !target_ready {
-            return Err(SwitchError::NotReady);
+        let n = match next_idx {
+            Some(n) => n,
+            None => return Err(SwitchError::NotReady),
+        };
+        match self.table[n] {
+            Some(t) if t.state() == ThreadState::Ready => {}
+            _ => return Err(SwitchError::NotReady),
         }
-        let mut j = 0;
-        while j < self.len {
-            if let Some(ref mut t) = self.table[j] {
-                if t.id() == next {
-                    let _ = t.set_state(ThreadState::Running);
-                    self.runs[j] = self.runs[j].saturating_add(1);
-                } else if t.id() == self.current && t.state() == ThreadState::Running {
+        if let Some(c) = cur_idx {
+            if let Some(ref mut t) = self.table[c] {
+                if t.state() == ThreadState::Running {
                     let _ = t.set_state(ThreadState::Ready);
                 }
             }
-            j += 1;
         }
+        if let Some(ref mut t) = self.table[n] {
+            let _ = t.set_state(ThreadState::Running);
+        }
+        self.runs[n] = self.runs[n].saturating_add(1);
         self.record_trace(next);
         self.current = next;
         self.ticks_left = QUANTUM_TICKS;
@@ -1163,6 +1168,40 @@ mod tests {
         assert!(one.spawn(h));
         assert!(one.spawn(l));
         assert_eq!(one.dispatch_priority(), Ok(2));
+    }
+
+    #[test]
+    fn priority_single_hi_is_capped_at_half_share_yield_contract() {
+        // S07 slice44 — REVIEW #525 risk 1. Contract: "highest among
+        // non-current" (yield semantics: current never re-wins). So 1 hi +
+        // 2 lo gives hi every other dispatch (~50%), NOT ~100%. Worse: the
+        // tie-break is anchored on `current`, which is always hi when a lo
+        // is picked, so the FIRST lo after hi in slice order takes every
+        // lo slot and the second lo starves (runs == 0). Pinned as KNOWN;
+        // reason the priority path stays opt-in with RR default.
+        const FLOOD: u64 = 300;
+        let mut h = mk(1, 0x1000_0000);
+        h.set_priority(200);
+        let mut l1 = mk(2, 0x2000_0000);
+        l1.set_priority(1);
+        let mut l2 = mk(3, 0x3000_0000);
+        l2.set_priority(1);
+        let mut s = Scheduler::new(1);
+        assert!(s.spawn(h));
+        assert!(s.spawn(l1));
+        assert!(s.spawn(l2));
+        let mut i = 0;
+        while i < FLOOD {
+            assert!(s.dispatch_priority().is_ok());
+            i += 1;
+        }
+        let hi = s.runs_of(1).unwrap();
+        let a = s.runs_of(2).unwrap();
+        let b = s.runs_of(3).unwrap();
+        assert_eq!(hi + a + b, FLOOD);
+        assert!(hi.abs_diff(FLOOD / 2) <= 1);
+        assert_eq!(b, 0);
+        assert_eq!(a, FLOOD - hi);
     }
 
     #[test]
