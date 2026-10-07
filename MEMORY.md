@@ -3,9 +3,9 @@
 Review before each work segment. Keep ≤20 lines, compact.
 
 - Goal: perf-first x86-64 UEFI desktop OS, Rust-first; docs in repo root.
-- Now: S07 slice19 committed, 220 green (21+35+154+4+4+2), fmt+clippy clean, QEMU PASS x2 1667B TICK ok=1 ticks=1 + PF/EXC, tree clean. #20 stays active (live periodic IRQ dispatch + failure backoff owed).
-- Board: #9 done, #16 done, #17 done (S06 multi-hop chain); #19 preempt-IRQ gate done; S07 #20 active; resume per #79/#80.
-- Slice19: IRQ-owned STATIC_SCHED + sched_init_demo_static/sched_poll_static, poll_timer_dispatch static-only (no stack sched), demo_armed_scheduler pinned host-side. Next: live periodic handler + backoff/cap (REVIEW #466 risk) + unknown-quantum policy.
+- Now: S07 slice46 host pick baseline (7 batches x 10k calls, release Instant) n=4 RR 33/37/47 priority 54/70/110; n=16 RR 202/219/363 priority 239/247/315 ns/op min/median/max. MAX_THREADS=16; 64 invalid. Host-only, not kernel IRQ timing. Both picks O(n^2) due validate_threads; S12 is storage not SMP.
+- Verification: 240 workspace tests passed, 1 ignored opt-in bench; fmt + kernel clippy clean. #20 active until #21 gate; #21 proposed, atomic flip + record-then-defer with yield/preempt semantics resolved/deferred; no QEMU this host-only slice.
+- Board: S06 #9/#16/#17/#19 done; S07 #20 active, #21 proposed; resume per #79/#80.
 - Conventions: STRUCTURAL_FAIL = usize::MAX; ASCII .ps1; raw EFI;
   ST+96/BS+56/64/232/320 efiapi; 16KiB map+slack 4096; serial hard-req
   BOOTINFO/MEMMAP+budget/GOP/KERNEL/EBS/FRAMEALLOC/EXC=0.

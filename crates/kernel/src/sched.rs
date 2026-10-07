@@ -697,9 +697,8 @@ impl Scheduler {
             Some(idx) => idx,
             None => return Err(SwitchError::Unknown),
         };
-        // Max priority among other Ready threads (O(n), same class as
-        // `priority_of`; perf-first note: policy pick is linear, recorded
-        // for the S08 measurement slice, not the hot path yet).
+        // Max priority among other Ready threads (O(n) after the shared
+        // O(n^2) table validation; end-to-end pick is O(n^2)).
         let mut best: Option<u8> = None;
         let mut k = 0;
         while k < self.len {
@@ -3127,5 +3126,43 @@ mod tests {
         // Wait-target linkage: guest waits QUANTUM_TICKS + 1 ticks, so the
         // e2e TICK count must be one past the quantum (currently 5).
         assert_eq!(q + 1, 5);
+    }
+
+    #[test]
+    #[ignore]
+    fn measure_host_priority_pick_against_round_robin() {
+        fn sample(s: &Scheduler, pick: fn(&Scheduler) -> Result<u64, SwitchError>) -> [u128; 3] {
+            const ITERATIONS: u128 = 10_000;
+            const RUNS: usize = 7;
+            let mut samples = [0u128; RUNS];
+            for sample in &mut samples {
+                for _ in 0..1_000 {
+                    core::hint::black_box(pick(core::hint::black_box(s)).unwrap());
+                }
+                let start = std::time::Instant::now();
+                for _ in 0..ITERATIONS {
+                    core::hint::black_box(pick(core::hint::black_box(s)).unwrap());
+                }
+                *sample = start.elapsed().as_nanos() / ITERATIONS;
+            }
+            samples.sort_unstable();
+            [samples[0], samples[RUNS / 2], samples[RUNS - 1]]
+        }
+
+        for n in [4, MAX_THREADS] {
+            let mut s = Scheduler::new(1);
+            for id in 1..=n {
+                let mut t = mk(id as u64, 0x1000_0000 + (id as u64) * 0x1_0000);
+                t.set_priority(if id == n { 255 } else { 1 });
+                assert!(s.spawn(t));
+            }
+            assert_eq!(s.pick_next(), Ok(2));
+            assert_eq!(s.pick_next_priority(), Ok(n as u64));
+            let rr = sample(&s, Scheduler::pick_next);
+            let priority = sample(&s, Scheduler::pick_next_priority);
+            std::println!(
+                "host pick n={n} runs=7 iters=10000 ns/op min/median/max RR={rr:?} priority={priority:?}"
+            );
+        }
     }
 }

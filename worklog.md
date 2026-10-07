@@ -4475,9 +4475,19 @@ Format per entry (per `implementation-guide.md` §31):
 - **Final:** Opt-in priority with RR default, no aging, is the final S07 decision. Risk 2 closed. Risk 3 (NotReady masking InvalidTable in commit) is still owed. #20 remainder: affinity + O(n) measurement.
 
 ### S07 slice45 - #20 risk 3 documented, pin flagged known-bad, affinity deferred
-- **Decision:** (1) Risk 3: `pick_next_priority` validates before any NotReady, so InvalidTable is never masked on the pick path; `commit_next` (private) returns NotReady for bad target without re-validating, unreachable via picks, documented in rustdoc. (2) Test `priority_single_hi_is_capped_at_half_share_yield_contract` annotated: 2nd-lo runs==0 is a known-bad pin, a per-priority cursor should flip it. (3) Affinity DEFERRED: single-CPU kernel (no AP bring-up before S12-class SMP work), so a mask has nothing to select among; revisit with SMP.
+- **Decision:** (1) Risk 3: `pick_next_priority` validates before any NotReady, so InvalidTable is never masked on the pick path; `commit_next` (private) returns NotReady for bad target without re-validating, unreachable via picks, documented in rustdoc. (2) Test `priority_single_hi_is_capped_at_half_share_yield_contract` annotated: 2nd-lo runs==0 is a known-bad pin, a per-priority cursor should flip it. (3) Affinity DEFERRED: single-CPU kernel (S12 is Block Device Layer, not SMP), so a mask has nothing to select among; revisit when AP bring-up is scoped.
 - **Why:** REVIEW #527 items 1-2 + pin-readability concern.
 - **Alternatives:** Add affinity mask field now (rejected: no consumer, untestable semantics).
 - **Measured:** kernel 174/174 host tests; fmt + `clippy -p baseos-kernel` clean; doc/comment-only change.
-- **Final:** Owed on #20: O(n) pick measurement (several runs + spread). #21 gate still required before S07 done.
+- **Final:** Owed on #20: pick measurement (several runs + spread). #21 gate still required before S07 done.
+
+### S07 slice46 - bounded host pick measurement and roadmap-label correction
+- **Decision:** Add an opt-in ignored host release test for `pick_next_priority` versus RR `pick_next` at 4 and 16 threads (`MAX_THREADS=16`; 64 is invalid), seven timed batches of 10,000 picks each after 1,000 warmups per batch. Correct the slice45 S12 SMP label: S12 is Block Device Layer, and no SMP sprint is assigned. Correct the policy scan's complexity note: finding max priority is O(n), but `validate_threads` is O(n^2) on every pick; both end-to-end picks are O(n^2).
+- **Why:** #20 needs a repeatable cost baseline and spread, not a best-only number or a misleading linear-cost claim. The single-CPU affinity deferral is valid, but tying it to S12 was not.
+- **Alternatives:** Report 64 threads by bypassing the 16-entry cap (rejected: measures a path the scheduler rejects); claim host results as kernel IRQ timing (rejected: host clock and target differ); enable the benchmark in default unit tests (rejected: noisy timing on every test invocation).
+- **Expected:** RR and policy pick valid targets without mutation at both sizes, at least five batches with min/median/max, default workspace tests unchanged, fmt + kernel clippy clean.
+- **Measured (2026-10-06, Win11 host, `cargo test -p baseos-kernel --lib --release measure_host_priority_pick_against_round_robin -- --ignored --nocapture`):** `std::time::Instant` around 10,000 picks per batch, `black_box` on scheduler reference and result; seven batches per size/policy, integer ns/op (elapsed/batch operations): n=4 RR 33/37/47, priority 54/70/110; n=16 RR 202/219/363, priority 239/247/315 (min/median/max). This is host-only timing, not kernel switch latency or IRQ timing; QEMU TSC would be noisy and was not sampled. Thread creation and warmups excluded; picks include copying/validating the table. Batch noise is visible, so no best-only performance claim. `cargo test --workspace`: 240 passed, 1 ignored (21+35+174+4+4+2); `cargo fmt --all -- --check` and `cargo clippy -p baseos-kernel --all-targets -- -D warnings` clean.
+- **Final:** Retain opt-in policy, RR default; n=16 bound limits scaling inference and the priority increment varies by batch. S07 is not done: #21 must land the atomic IRQ record-then-defer gate flip, with yield/preempt semantics decided or explicitly deferred.
+
+
 
