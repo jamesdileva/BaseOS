@@ -2682,18 +2682,41 @@ mod tests {
 
     #[test]
     fn quantum_const_linkage_pins_script_literals() {
-        // S07 slice38 (REVIEW #514 risk 2): `TICK ticks=5` assumes
-        // `QUANTUM_TICKS=4` (`wait_target = QUANTUM_TICKS + 1` in
-        // `bring_up_cpu_and_prove_exception`) and `boot-uefi.ps1` hard-requires
-        // the literals `SCHED-TICK ok=1 q=4 used=4 expired=1 next=3` plus the
-        // `TICK ok=1 ticks=[1-9]` shape. All in-tree countdowns are
-        // const-driven, so a quantum change would stay green host-side while
-        // the guest/script diverge silently. Pin the literals here:
-        // changing the const MUST update `tools/qemu/boot-uefi.ps1` (`q=4`
-        // line), the `TICK ticks=5` expectation, and the serial doc examples.
-        // `black_box` keeps `clippy -D warnings`
-        // (`assertions_on_constants`) clean, same as the irq-gate pins.
-        assert_eq!(core::hint::black_box(super::QUANTUM_TICKS), 4);
-        assert_eq!(core::hint::black_box(super::QUANTUM_TICKS + 1), 5);
+        // S07 slice38 (REVIEW #514 risk 2) + slice39 (REVIEW #516 risk 1):
+        // true linkage pin — `TICK ticks=5` assumes `QUANTUM_TICKS=4`
+        // (`wait_target = QUANTUM_TICKS + 1` in `lib.rs`) and
+        // `boot-uefi.ps1` hard-requires the literal
+        // `SCHED-TICK ok=1 q=4 used=4 expired=1 next=3`. The slice38
+        // version only asserted the const values, so a ps1-only drift
+        // stayed green. This version `include_str!`s the script and
+        // asserts the const-derived literal is present: changing either
+        // side alone goes red (disconfirmed slice39: ps1 `q=4`->`q=5`
+        // fails this test; revert restores green). Guest countdowns stay
+        // const-driven (`used == QUANTUM_TICKS`, looped ticks), so a
+        // quantum change must update the const + ps1 literal + serial
+        // doc examples together. `black_box` on the const keeps
+        // `clippy -D warnings` (`assertions_on_constants`) clean; the
+        // script-content assert is never on a constant.
+        // Disconfirm record (slice39, same tree): with ps1 `q=4 used=4`
+        // temporarily edited to `q=5 used=5`, this test FAILS
+        // (`script pins quantum literals` assert); reverted to `q=4`
+        // before commit, test green again.
+        let q = core::hint::black_box(super::QUANTUM_TICKS);
+        let script = include_str!("../../../tools/qemu/boot-uefi.ps1");
+        // Const value pin (changing QUANTUM_TICKS alone must trip the
+        // match arm below, which panics with the update checklist).
+        match q {
+            4 => {}
+            _ => panic!("QUANTUM_TICKS changed — update tools/qemu/boot-uefi.ps1 SCHED-TICK literal + TICK ticks expectation + serial doc examples"),
+        }
+        // Script linkage pin: the const-derived literal must be present
+        // verbatim in the enforcing script.
+        assert!(
+            script.contains("SCHED-TICK ok=1 q=4 used=4 expired=1 next=3"),
+            "script pins quantum literals"
+        );
+        // Wait-target linkage: guest waits QUANTUM_TICKS + 1 ticks, so the
+        // e2e TICK count must be one past the quantum (currently 5).
+        assert_eq!(q + 1, 5);
     }
 }
