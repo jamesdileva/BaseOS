@@ -4508,7 +4508,15 @@ Format per entry (per `implementation-guide.md` Â§31):
 ### S07 slice48 - per-op latency sample buffer (#21, REVIEW #533 C1)
 - **Decision:** Add `crates/kernel/src/latency.rs`: a fixed `[u64; 1024]` `LatencySamples` buffer with `record` and `reduce` (min, lower median, nearest-rank p99, max). Once full it does not wrap: extra samples are counted in `dropped`. `p99_valid` is set only when n >= 1000. It uses `core` only, so the guest links it.
 - **Why:** The scheduler trace is an 8-entry id prefix with no timestamps, so it cannot carry a tail (REVIEW #533 C1). The guest rdtsc switch timing in #21 needs a place to collect per-op samples so that 'tail' is a real p99 and not a batch max.
-- **Alternatives:** A ring buffer that overwrites old samples (rejected: it silently biases toward late samples). Streaming estimators such as P² (rejected: approximate, and more code than 8 KB of exact samples).
+- **Alternatives:** A ring buffer that overwrites old samples (rejected: it silently biases toward late samples). Streaming estimators such as Pï¿½ (rejected: approximate, and more code than 8 KB of exact samples).
 - **Tests:** 5 new host tests: empty, single sample (p99 invalid), 1..1000 nearest-rank (median 500, p99 990), tail outliers visible in p99 but not in the median, and overflow counts drops without wrapping. Workspace: 245 passed, 1 ignored. `clippy -p baseos-kernel --all-targets` is clean. The UEFI guest builds.
 - **Measured:** n/a. This adds the instrument only; the gate flip, guest wiring, WHPX vs TCG (C2) and fairness re-labelling (C3) follow in #21.
+
+### S07 slice49 - p99 boundary pin and terminal reduction (#21, REVIEW #535)
+- **Decision:** Pin nearest-rank p99 at n=1000 with 9, 10 and 11 high outliers. Treat `LatencySamples::reduce` as terminal: call once after all recording; it sorts the recorded prefix in place, so recording afterward cannot preserve temporal order. The guest consumer must follow this contract.
+- **Why:** An outlier-heavy test does not distinguish rank-boundary errors. With rank 990, 990 baseline observations and 10 high observations still yield the baseline; 989 baseline observations and 11 high observations yield the high value. The review's suggested 10-outlier expected value was off by one.
+- **Alternatives:** Clone an 8 KiB buffer for reduction (rejected: guest stack budget and unnecessary copy); silently continue recording after reduction (rejected: loses temporal ordering).
+- **Expected:** Boundary pin passes for 9/10/11; 246 workspace tests pass, 1 ignored; formatting, kernel clippy and UEFI-target build remain green. No guest measurement or IRQ gate change in this slice.
+- **Measured (2026-10-06, Win11):** `cargo test --workspace`: 246 passed, 1 ignored; `cargo fmt --all -- --check`, `cargo clippy -p baseos-kernel --all-targets -- -D warnings`, and `cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi` passed.
+- **Final:** Keep nearest-rank p99 and terminal reduction. #21 remains active: place guest buffer outside kernel-thread stacks, add fenced TSC/floor/warmup, compare TCG/WHPX when available, then record-then-defer IRQ gate flip.
 

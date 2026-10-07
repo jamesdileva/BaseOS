@@ -161,6 +161,22 @@ mod tests {
     }
 
     #[test]
+    fn nearest_rank_boundary_at_one_percent_outliers() {
+        for outliers in [9, 10, 11] {
+            let mut s = LatencySamples::new();
+            for _ in 0..(1000 - outliers) {
+                assert!(s.record(100));
+            }
+            for _ in 0..outliers {
+                assert!(s.record(10_000));
+            }
+            let r = s.reduce().unwrap();
+            assert!(r.p99_valid);
+            assert_eq!(r.p99, if outliers == 11 { 10_000 } else { 100 });
+        }
+    }
+
+    #[test]
     fn overflow_counts_drops_never_wraps() {
         let mut s = LatencySamples::new();
         for i in 0..SAMPLE_CAP as u64 {
