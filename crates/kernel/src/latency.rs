@@ -38,6 +38,7 @@ pub struct LatencySamples {
     buf: [u64; SAMPLE_CAP],
     len: usize,
     dropped: u64,
+    reduced: bool,
 }
 
 impl Default for LatencySamples {
@@ -54,11 +55,17 @@ impl LatencySamples {
             buf: [0; SAMPLE_CAP],
             len: 0,
             dropped: 0,
+            reduced: false,
         }
     }
 
     /// Record one sample; returns `false` (and counts a drop) when full.
+    /// Also returns `false` (no drop counted) once [`Self::reduce`] has run:
+    /// reduction sorts in place, so the buffer is terminal (REVIEW #537 N2).
     pub fn record(&mut self, delta: u64) -> bool {
+        if self.reduced {
+            return false;
+        }
         if self.len < SAMPLE_CAP {
             self.buf[self.len] = delta;
             self.len += 1;
@@ -87,10 +94,17 @@ impl LatencySamples {
         self.dropped
     }
 
+    /// `true` once [`Self::reduce`] has run; further `record` calls are refused.
+    #[must_use]
+    pub const fn is_reduced(&self) -> bool {
+        self.reduced
+    }
+
     /// Sort the recorded population in place and reduce it. `None` when
-    /// empty. Median is the lower median; p99 is nearest-rank
+    /// empty. Terminal: later `record` calls return `false`. Median is the lower median; p99 is nearest-rank
     /// (`ceil(0.99 * n)`-th smallest).
     pub fn reduce(&mut self) -> Option<LatencyStats> {
+        self.reduced = true;
         let n = self.len;
         if n == 0 {
             return None;
@@ -174,6 +188,19 @@ mod tests {
             assert!(r.p99_valid);
             assert_eq!(r.p99, if outliers == 11 { 10_000 } else { 100 });
         }
+    }
+
+    #[test]
+    fn record_after_reduce_is_refused() {
+        let mut s = LatencySamples::new();
+        assert!(s.record(5));
+        assert!(!s.is_reduced());
+        let first = s.reduce().unwrap();
+        assert!(s.is_reduced());
+        assert!(!s.record(1));
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.dropped(), 0);
+        assert_eq!(s.reduce(), Some(first));
     }
 
     #[test]

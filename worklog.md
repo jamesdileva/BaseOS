@@ -4508,7 +4508,7 @@ Format per entry (per `implementation-guide.md` §31):
 ### S07 slice48 - per-op latency sample buffer (#21, REVIEW #533 C1)
 - **Decision:** Add `crates/kernel/src/latency.rs`: a fixed `[u64; 1024]` `LatencySamples` buffer with `record` and `reduce` (min, lower median, nearest-rank p99, max). Once full it does not wrap: extra samples are counted in `dropped`. `p99_valid` is set only when n >= 1000. It uses `core` only, so the guest links it.
 - **Why:** The scheduler trace is an 8-entry id prefix with no timestamps, so it cannot carry a tail (REVIEW #533 C1). The guest rdtsc switch timing in #21 needs a place to collect per-op samples so that 'tail' is a real p99 and not a batch max.
-- **Alternatives:** A ring buffer that overwrites old samples (rejected: it silently biases toward late samples). Streaming estimators such as P� (rejected: approximate, and more code than 8 KB of exact samples).
+- **Alternatives:** A ring buffer that overwrites old samples (rejected: it silently biases toward late samples). Streaming estimators such as P² (rejected: approximate, and more code than 8 KB of exact samples).
 - **Tests:** 5 new host tests: empty, single sample (p99 invalid), 1..1000 nearest-rank (median 500, p99 990), tail outliers visible in p99 but not in the median, and overflow counts drops without wrapping. Workspace: 245 passed, 1 ignored. `clippy -p baseos-kernel --all-targets` is clean. The UEFI guest builds.
 - **Measured:** n/a. This adds the instrument only; the gate flip, guest wiring, WHPX vs TCG (C2) and fairness re-labelling (C3) follow in #21.
 
@@ -4520,3 +4520,11 @@ Format per entry (per `implementation-guide.md` §31):
 - **Measured (2026-10-06, Win11):** `cargo test --workspace`: 246 passed, 1 ignored; `cargo fmt --all -- --check`, `cargo clippy -p baseos-kernel --all-targets -- -D warnings`, and `cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi` passed.
 - **Final:** Keep nearest-rank p99 and terminal reduction. #21 remains active: place guest buffer outside kernel-thread stacks, add fenced TSC/floor/warmup, compare TCG/WHPX when available, then record-then-defer IRQ gate flip.
 
+
+### S07 slice50 - enforce terminal reduce + worklog encoding fix (#21, REVIEW #537 N1/N2)
+- **Decision:** `LatencySamples` gains a `reduced` flag. `reduce()` sets it, after which `record()` returns `false` without counting a drop, and `is_reduced()` exposes it. Restored the slice48 'P²' that an earlier tool write had re-encoded to U+FFFD. A scan of worklog.md finds no other U+FFFD.
+- **Why:** R4 was enforced only by documentation (N2). With the flag, the API refuses misuse.
+- **Alternatives:** `reduce(self)`, which consumes the buffer (rejected: R2 places the buffer in a static, and a static cannot be moved out of).
+- **Expected:** 7 latency tests pass; workspace 247 passed, 1 ignored; fmt, kernel clippy and the UEFI build stay green.
+- **Measured (2026-10-06, Win11):** `cargo test --workspace`: 247 passed, 1 ignored. `cargo fmt --all -- --check`, `cargo clippy -p baseos-kernel --all-targets -- -D warnings` and the UEFI-target build all passed.
+- **Final:** Keep the flag. #21 still needs R2 (static guest buffer), R3 (fenced TSC, floor, warm-ups), C2, C3 and the IRQ gate flip.
