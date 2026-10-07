@@ -4489,5 +4489,19 @@ Format per entry (per `implementation-guide.md` §31):
 - **Measured (2026-10-06, Win11 host, `cargo test -p baseos-kernel --lib --release measure_host_priority_pick_against_round_robin -- --ignored --nocapture`):** `std::time::Instant` around 10,000 picks per batch, `black_box` on scheduler reference and result; seven batches per size/policy, integer ns/op (elapsed/batch operations): n=4 RR 33/37/47, priority 54/70/110; n=16 RR 202/219/363, priority 239/247/315 (min/median/max). This is host-only timing, not kernel switch latency or IRQ timing; QEMU TSC would be noisy and was not sampled. Thread creation and warmups excluded; picks include copying/validating the table. Batch noise is visible, so no best-only performance claim. `cargo test --workspace`: 240 passed, 1 ignored (21+35+174+4+4+2); `cargo fmt --all -- --check` and `cargo clippy -p baseos-kernel --all-targets -- -D warnings` clean.
 - **Final:** Retain opt-in policy, RR default; n=16 bound limits scaling inference and the priority increment varies by batch. S07 is not done: #21 must land the atomic IRQ record-then-defer gate flip, with yield/preempt semantics decided or explicitly deferred.
 
+### S07 slice47 - verification ledger: environment for slice46 + per-metric baseline/deferral
+- **Decision:** Record the slice46 benchmark environment (architecture.md:558-574) and an explicit status for each sprint-roadmap.md S07 verification metric. Docs-only.
+- **Slice46 environment:** commit `2920840` (clean tree), `--release` profile of `baseos-kernel` lib tests on host; AMD Ryzen 5 5500 (6C/12T, 3.6 GHz base), 16 GB RAM, Windows 11 Home build 26300; toolchain per `research/benchmarks/host-toolchain.txt` (rustc 1.98.0 88d9e12ae, cargo 1.98.0). No CPU pinning, power plan default, background load uncontrolled -> spread reported, not best-only.
+- **Metric ledger (S07 Verification):**
+  - *Context switch latency* - DEFERRED to #21. Host pick timing is not a switch. Needs guest `rdtsc` around the live `switch_context` path; under QEMU TCG the TSC is emulated, so any number must be labelled emulator-relative. Lands with the gate flip so the measured path is the real one.
+  - *Throughput* - PARTIAL baseline: host pick throughput derivable from slice46 medians (n=4 RR ~27M picks/s, priority ~14M/s; n=16 RR ~4.6M/s, priority ~4.0M/s). Guest dispatches/s DEFERRED to #21 (same instrumentation).
+  - *Fairness* - BASELINE (deterministic, counted shares, not timed): RR equal share pinned by tests; priority 1hi+2lo pins hi=150/300 (+-1) and 2nd lo=0 (known-bad, slice44/45); 2hi+1lo starves lo (slice43). Opt-in priority is documented not starvation-safe.
+  - *Tail latency* - DEFERRED: slice46 only has batch max (n=16 RR 363 ns/op), which is a batch mean, not a per-op p99. Needs per-op samples; do with guest switch timing in #21 so the tail is of the real path.
+  - *Interactive response* - DEFERRED past S07: no input device, no interactive workload, and timer-driven preemption is not enabled until #21. Revisit when an input/event path exists (framework sprints).
+- **Why:** REVIEW #531: #21 alone does not satisfy the S07 verification list; host pick timing covers none of the five metrics directly.
+- **Alternatives:** Add guest TSC sampling now on the pre-gate path (rejected: measures a path #21 changes; redo cost). Close S07 with host-only numbers (rejected: mislabels).
+- **Measured:** n/a (docs-only).
+- **Final:** S07 close requires #21 + switch latency, guest throughput, and per-op tail samples; interactive response is a justified deferral.
+
 
 
