@@ -39,7 +39,7 @@ use baseos_kernel::cpu::{cr3_pml4_base, efer_nxe_enabled, read_cr3, read_efer, I
 #[cfg(not(test))]
 use baseos_kernel::cpu::{empty_tsc_pair, read_tsc_fenced, switch_sample_delta, warm_tsc};
 use baseos_kernel::kernel_entry;
-use baseos_kernel::latency::LatencySamples;
+use baseos_kernel::latency::{LatencySamples, LatencyStats};
 use baseos_kernel::page_table::{
     guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
     walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
@@ -1260,6 +1260,80 @@ fn write_sched_line<E>(
     write_str(emit, " to=")?;
     write_u64_dec(emit, to)?;
     write_str(emit, "\n")
+}
+
+/// Emit the one-line `SWITCH-LAT` diagnostic (S07 slice54, #21 R3 reduce
+/// half): `SWITCH-LAT ok=<0|1> count=<n> min=<n> med=<n> p99=<n> max=<n>
+/// valid=<0|1> dropped=<n>` — terminal [`LatencySamples::reduce`] of the
+/// static `SWITCH_LATENCIES` population. `ok` is 1 only when the buffer is
+/// non-empty (failure zeroes count/stats so an empty buffer cannot pass).
+/// `valid` mirrors `p99_valid` (1 only when count >= 1000); with the
+/// current single sample per boot it is 0 by design. A `min` of 0 means
+/// floor-limited (raw switch delta below the empty-pair overhead floor,
+/// common on coarse/emulated TSC — see `switch_sample_delta`), not a true
+/// zero-cost switch; 0 samples are kept in the population, never dropped.
+#[allow(clippy::too_many_arguments)]
+fn write_switch_lat_line<E>(
+    ok: bool,
+    count: u64,
+    min: u64,
+    med: u64,
+    p99: u64,
+    max: u64,
+    p99_valid: bool,
+    dropped: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "SWITCH-LAT ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " count=")?;
+    write_u64_dec(emit, count)?;
+    write_str(emit, " min=")?;
+    write_u64_dec(emit, min)?;
+    write_str(emit, " med=")?;
+    write_u64_dec(emit, med)?;
+    write_str(emit, " p99=")?;
+    write_u64_dec(emit, p99)?;
+    write_str(emit, " max=")?;
+    write_u64_dec(emit, max)?;
+    write_str(emit, " valid=")?;
+    write_u64_dec(emit, u64::from(p99_valid))?;
+    write_str(emit, " dropped=")?;
+    write_u64_dec(emit, dropped)?;
+    write_str(emit, "\n")
+}
+
+/// Reduce a latency population and emit the `SWITCH-LAT` line (S07
+/// slice54, #21 R3 reduce half). Terminal: [`LatencySamples::reduce`]
+/// sorts in place, so the buffer refuses further records after this call.
+/// Empty (or already-consumed-and-empty) populations emit the zeroed
+/// `ok=0` shape and return `Ok(false)`; otherwise emits `ok=1` from the
+/// stats and returns `Ok(true)`. Never panics.
+fn report_switch_latencies<E>(
+    samples: &mut LatencySamples,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<bool, E> {
+    match samples.reduce() {
+        None => {
+            write_switch_lat_line::<E>(false, 0, 0, 0, 0, 0, false, samples.dropped(), emit)?;
+            Ok(false)
+        }
+        Some(st) => {
+            let s: LatencyStats = st;
+            write_switch_lat_line::<E>(
+                true,
+                s.count as u64,
+                s.min,
+                s.median,
+                s.p99,
+                s.max,
+                s.p99_valid,
+                s.dropped,
+                emit,
+            )?;
+            Ok(true)
+        }
+    }
 }
 
 /// Minimal scheduler-driven switch post-`ExitBootServices`: build the same
@@ -2646,6 +2720,13 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // S06 slice18: minimal scheduler-driven switch — SCHED-SWITCH
             // ok=1 from=1 to=2 (fail-loud on dispatch/triple mismatch).
             let _ = probe_sched_switch::<Infallible>(&mut emit);
+            // S07 slice54 (#21 R3 reduce half): terminal reduce of the one
+            // static switch sample + SWITCH-LAT line. Best-effort report:
+            // an empty buffer emits ok=0 without failing the boot.
+            let _ = report_switch_latencies::<Infallible>(
+                &mut *core::ptr::addr_of_mut!(SWITCH_LATENCIES),
+                &mut emit,
+            );
             // S06 slice22 R2: forced-refusal demo first — emits
             // `THREAD-JUMP ok=0 id=0` through the refusal funnel on a corrupt
             // triple, then falls through (PF/EXC still fire downstream).
@@ -3650,6 +3731,44 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "SCHED-SWITCH ok=0 from=1 to=2\n"
         );
+    }
+
+    #[test]
+    fn switch_lat_report_shapes_host() {
+        // S07 slice54 (#21 R3 reduce half): the SWITCH-LAT writer + reduce
+        // helper shapes. Empty emits zeroed ok=0; a single (possibly
+        // 0-floored) sample emits ok=1 with count=1 and valid=0 (n=1 never
+        // carries a p99 tail); reduction is terminal (further records
+        // refused).
+        let mut out: Vec<u8> = Vec::new();
+        let mut empty = LatencySamples::new();
+        assert!(
+            !report_switch_latencies::<core::convert::Infallible>(&mut empty, &mut |b| {
+                out.push(b);
+                Ok(())
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SWITCH-LAT ok=0 count=0 min=0 med=0 p99=0 max=0 valid=0 dropped=0\n"
+        );
+        let mut one = LatencySamples::new();
+        assert!(one.record(0), "sub-floor 0 sample is kept, not dropped");
+        let mut out: Vec<u8> = Vec::new();
+        assert!(
+            report_switch_latencies::<core::convert::Infallible>(&mut one, &mut |b| {
+                out.push(b);
+                Ok(())
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SWITCH-LAT ok=1 count=1 min=0 med=0 p99=0 max=0 valid=0 dropped=0\n"
+        );
+        assert!(one.is_reduced());
+        assert!(!one.record(99), "terminal: no records after reduce");
     }
 
     #[test]
