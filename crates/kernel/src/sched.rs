@@ -2679,4 +2679,21 @@ mod tests {
             panic!("IRQ stack switch permitted while gate must stay closed");
         }
     }
+
+    #[test]
+    fn quantum_const_linkage_pins_script_literals() {
+        // S07 slice38 (REVIEW #514 risk 2): `TICK ticks=5` assumes
+        // `QUANTUM_TICKS=4` (`wait_target = QUANTUM_TICKS + 1` in
+        // `bring_up_cpu_and_prove_exception`) and `boot-uefi.ps1` hard-requires
+        // the literals `SCHED-TICK ok=1 q=4 used=4 expired=1 next=3` plus the
+        // `TICK ok=1 ticks=[1-9]` shape. All in-tree countdowns are
+        // const-driven, so a quantum change would stay green host-side while
+        // the guest/script diverge silently. Pin the literals here:
+        // changing the const MUST update `tools/qemu/boot-uefi.ps1` (`q=4`
+        // line), the `TICK ticks=5` expectation, and the serial doc examples.
+        // `black_box` keeps `clippy -D warnings`
+        // (`assertions_on_constants`) clean, same as the irq-gate pins.
+        assert_eq!(core::hint::black_box(super::QUANTUM_TICKS), 4);
+        assert_eq!(core::hint::black_box(super::QUANTUM_TICKS + 1), 5);
+    }
 }
