@@ -724,7 +724,59 @@ impl Scheduler {
             }
             step += 1;
         }
+        // S07 slice42 (REVIEW #521 nit): `best == Some` means a max-prio
+        // Ready candidate exists, so the scan above must find it — reaching
+        // here is a logic bug. Fail closed (no panic: scheduler never
+        // panics) with `NotReady`, and `debug_assert` for the host pin.
+        debug_assert!(false, "priority pick found best but missed the target");
         Err(SwitchError::NotReady)
+    }
+
+    /// Shared pick-then-mark commit (S07 slice42, REVIEW #521 risk 1):
+    /// single owner of the Ready→Running move + previous-Running park +
+    /// quantum rearm + trace used by both [`Scheduler::dispatch`] (RR pick)
+    /// and [`Scheduler::dispatch_priority`] (policy pick), so a future
+    /// quantum/trace fix touches one place. Two-phase for fail-closed
+    /// refusal: phase 1 verifies the target slot is `Ready` (unknown id or
+    /// non-`Ready` target refuses with NO mutation — strictly stronger than
+    /// a mark-then-check order, which could park `current` before seeing a
+    /// bad target); phase 2 performs the state moves. The pick already
+    /// guarantees a `Ready` target, so phase-1 refusal is defensive
+    /// unreachable via either pick, never a new behavior.
+    fn commit_next(&mut self, next: u64) -> Result<u64, SwitchError> {
+        let mut target_ready = false;
+        let mut i = 0;
+        while i < self.len {
+            if let Some(t) = self.table[i] {
+                if t.id() == next {
+                    if t.state() != ThreadState::Ready {
+                        return Err(SwitchError::NotReady);
+                    }
+                    target_ready = true;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        if !target_ready {
+            return Err(SwitchError::NotReady);
+        }
+        let mut j = 0;
+        while j < self.len {
+            if let Some(ref mut t) = self.table[j] {
+                if t.id() == next {
+                    let _ = t.set_state(ThreadState::Running);
+                    self.runs[j] = self.runs[j].saturating_add(1);
+                } else if t.id() == self.current && t.state() == ThreadState::Running {
+                    let _ = t.set_state(ThreadState::Ready);
+                }
+            }
+            j += 1;
+        }
+        self.record_trace(next);
+        self.current = next;
+        self.ticks_left = QUANTUM_TICKS;
+        Ok(next)
     }
 
     /// Pick the next `Ready` thread and move it Ready→Running, parking the
@@ -738,25 +790,7 @@ impl Scheduler {
     /// counter untouched.
     pub fn dispatch(&mut self) -> Result<u64, SwitchError> {
         let next = self.pick_next()?;
-        let mut i = 0;
-        while i < self.len {
-            if let Some(ref mut t) = self.table[i] {
-                if t.id() == next {
-                    if t.state() != ThreadState::Ready {
-                        return Err(SwitchError::NotReady);
-                    }
-                    let _ = t.set_state(ThreadState::Running);
-                    self.runs[i] = self.runs[i].saturating_add(1);
-                } else if t.id() == self.current && t.state() == ThreadState::Running {
-                    let _ = t.set_state(ThreadState::Ready);
-                }
-            }
-            i += 1;
-        }
-        self.record_trace(next);
-        self.current = next;
-        self.ticks_left = QUANTUM_TICKS;
-        Ok(next)
+        self.commit_next(next)
     }
 
     /// IRQ-gated dispatch (S06 preempt-IRQ gate, task #19): identical
@@ -770,32 +804,15 @@ impl Scheduler {
         self.dispatch()
     }
 
-    /// Priority-aware dispatch (S07 slice41, opt-in): same Ready→Running
-    /// state moves + quantum rearm + trace as [`Scheduler::dispatch`], but
-    /// the target comes from [`Scheduler::pick_next_priority`]. Refusals
-    /// mutate nothing (counter untouched). RR stays the default; the guest
-    /// probe stays on `dispatch_gated` this slice.
+    /// Priority-aware dispatch (S07 slice41, opt-in; slice42 dedup via
+    /// `commit_next`): same Ready→Running state moves + quantum rearm +
+    /// trace as [`Scheduler::dispatch`], but the target comes from
+    /// [`Scheduler::pick_next_priority`]. Refusals mutate nothing (counter
+    /// untouched). RR stays the default; the guest probe stays on
+    /// `dispatch_gated` this slice.
     pub fn dispatch_priority(&mut self) -> Result<u64, SwitchError> {
         let next = self.pick_next_priority()?;
-        let mut i = 0;
-        while i < self.len {
-            if let Some(ref mut t) = self.table[i] {
-                if t.id() == next {
-                    if t.state() != ThreadState::Ready {
-                        return Err(SwitchError::NotReady);
-                    }
-                    let _ = t.set_state(ThreadState::Running);
-                    self.runs[i] = self.runs[i].saturating_add(1);
-                } else if t.id() == self.current && t.state() == ThreadState::Running {
-                    let _ = t.set_state(ThreadState::Ready);
-                }
-            }
-            i += 1;
-        }
-        self.record_trace(next);
-        self.current = next;
-        self.ticks_left = QUANTUM_TICKS;
-        Ok(next)
+        self.commit_next(next)
     }
 
     /// IRQ-gated priority dispatch: same `&IrqGuard` proof as
@@ -1097,6 +1114,96 @@ mod tests {
         assert_eq!(solo.pick_next_priority(), Err(SwitchError::NoSwitch));
         assert_eq!(solo.dispatch_priority(), Err(SwitchError::NoSwitch));
         assert_eq!(solo.current(), 1);
+    }
+
+    #[test]
+    fn priority_refusal_parity_matches_rr_and_leaves_table_untouched() {
+        // S07 slice42 (REVIEW #521 risk 2 cheapest disconfirm): the
+        // slice41 pin covered Unknown/NoSwitch only. The priority path
+        // must refuse EXACTLY like `switch_stub`/RR on the full set —
+        // corrupt table → InvalidTable, current-not-Ready + no other
+        // Ready → NotReady — and every refusal must leave
+        // current/ticks/runs/trace/state untouched (commit places the
+        // target-state check before any mark, so a bad target cannot park
+        // `current` first).
+        fn snapshot(s: &Scheduler) -> (u64, u64, u64, usize, u64) {
+            (
+                s.current(),
+                s.quantum_left(),
+                s.total_dispatches(),
+                s.trace_len(),
+                s.fairness_spread(),
+            )
+        }
+        // NotReady: current Running, other Done (no other Ready).
+        let mut run = mk(1, 0x1000_0000);
+        assert!(run.set_state(ThreadState::Running));
+        let mut done = mk(2, 0x2000_0000);
+        assert!(done.set_state(ThreadState::Done));
+        let mut nr = Scheduler::new(1);
+        assert!(nr.spawn(run));
+        assert!(nr.spawn(done));
+        assert_eq!(nr.pick_next(), Err(SwitchError::NotReady));
+        assert_eq!(nr.pick_next_priority(), Err(SwitchError::NotReady));
+        let before = snapshot(&nr);
+        assert_eq!(nr.dispatch_priority(), Err(SwitchError::NotReady));
+        assert_eq!(snapshot(&nr), before);
+        assert_eq!(nr.current(), 1);
+        assert_eq!(nr.state_of(1), Some(ThreadState::Running));
+        assert_eq!(nr.state_of(2), Some(ThreadState::Done));
+        assert_eq!(nr.len(), 2);
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        assert_eq!(
+            nr.dispatch_priority_gated(&gate),
+            Err(SwitchError::NotReady)
+        );
+        assert_eq!(snapshot(&nr), before);
+        // NoSwitch with a non-current Done peer: current Ready, other Done.
+        let mut ns = Scheduler::new(1);
+        assert!(ns.spawn(mk(1, 0x1000_0000)));
+        assert!(ns.spawn(mk(2, 0x2000_0000)));
+        // Force the peer to Done post-spawn (spawn carries Ready through;
+        // Ready→Done is the legal cancel edge).
+        assert!(ns.table[1].as_mut().unwrap().set_state(ThreadState::Done));
+        assert_eq!(ns.state_of(1), Some(ThreadState::Ready));
+        assert_eq!(ns.state_of(2), Some(ThreadState::Done));
+        assert_eq!(ns.pick_next(), Err(SwitchError::NoSwitch));
+        assert_eq!(ns.pick_next_priority(), Err(SwitchError::NoSwitch));
+        let before_ns = snapshot(&ns);
+        assert_eq!(ns.dispatch_priority(), Err(SwitchError::NoSwitch));
+        assert_eq!(snapshot(&ns), before_ns);
+        assert_eq!(ns.current(), 1);
+        // InvalidTable: duplicate id forced via test-child field access
+        // (spawn refuses it, so reach it by corrupting a healthy table).
+        let mut c = Scheduler::new(1);
+        assert!(c.spawn(mk(1, 0x1000_0000)));
+        assert!(c.spawn(mk(2, 0x2000_0000)));
+        c.table[1] = Some(mk(1, 0x3000_0000));
+        assert_eq!(c.pick_next(), Err(SwitchError::InvalidTable));
+        assert_eq!(c.pick_next_priority(), Err(SwitchError::InvalidTable));
+        let before_c = snapshot(&c);
+        assert_eq!(c.dispatch_priority(), Err(SwitchError::InvalidTable));
+        assert_eq!(snapshot(&c), before_c);
+        assert_eq!(c.current(), 1);
+        // Armed refusal: a success arms quantum+trace, then a forced
+        // nothing-Ready refusal must preserve the armed counter, counts,
+        // and prefix (counter-untouched disconfirm).
+        let mut a = Scheduler::new(1);
+        assert!(a.spawn(mk(1, 0x1000_0000)));
+        assert!(a.spawn(mk(2, 0x2000_0000)));
+        assert_eq!(a.dispatch_priority(), Ok(2));
+        assert_eq!(a.quantum_left(), QUANTUM_TICKS);
+        assert_eq!(a.trace_len(), 1);
+        assert!(a.table[0].as_mut().unwrap().set_state(ThreadState::Done));
+        assert_eq!(a.pick_next_priority(), Err(SwitchError::NotReady));
+        let armed = snapshot(&a);
+        assert_eq!(a.dispatch_priority(), Err(SwitchError::NotReady));
+        assert_eq!(snapshot(&a), armed);
+        assert_eq!(a.current(), 2);
+        assert_eq!(a.quantum_left(), QUANTUM_TICKS);
+        assert_eq!(a.trace_len(), 1);
+        assert_eq!(a.trace_at(0), Some(2));
+        assert_eq!(a.runs_of(2), Some(1));
     }
 
     #[test]
