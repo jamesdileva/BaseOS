@@ -4528,3 +4528,11 @@ Format per entry (per `implementation-guide.md` §31):
 - **Expected:** 7 latency tests pass; workspace 247 passed, 1 ignored; fmt, kernel clippy and the UEFI build stay green.
 - **Measured (2026-10-06, Win11):** `cargo test --workspace`: 247 passed, 1 ignored. `cargo fmt --all -- --check`, `cargo clippy -p baseos-kernel --all-targets -- -D warnings` and the UEFI-target build all passed.
 - **Final:** Keep the flag. #21 still needs R2 (static guest buffer), R3 (fenced TSC, floor, warm-ups), C2, C3 and the IRQ gate flip.
+
+### S07 slice51 - static guest switch-latency storage (#21 R2)
+- **Decision:** Place `SWITCH_LATENCIES: LatencySamples` in boot-UEFI static storage, outside the three 8 KiB thread stacks. The live scheduler-switch probe refuses with `SCHED-SWITCH ok=0` if its address range overlaps any stack or an address computation overflows. No samples are recorded yet; measurement wiring belongs to R3.
+- **Why:** A local 8 KiB sample buffer on a thread stack would consume the entire stack before the switch timing even starts; disjoint static storage makes the later in-place reduction safe without a second 8 KiB stack copy.
+- **Alternatives:** Stack-local samples (rejected: 8 KiB stack exhaustion); heap allocation (rejected: no guest heap); clone-for-reduction (rejected: another 8 KiB stack copy).
+- **Expected:** One new host test covers real static addresses, adjacent ranges, overlap and arithmetic overflow; the existing guest switch and exception proof remain intact. Zero runtime sampling cost until R3.
+- **Measured (2026-10-06, Win11):** `cargo test --workspace`: 248 passed, 1 ignored. `cargo fmt --all -- --check`, kernel all-targets clippy, UEFI-target clippy, UEFI-target build all pass. QEMU `tools/qemu/boot-uefi.ps1 -TimeoutSec 20`: UEFI BOOT PASS, `SCHED-SWITCH ok=1 from=1 to=2`, `TICK ok=1`, `PF ok=1`, `EXC ok=1`; serial 1667 bytes, guest 138752 bytes. No latency samples or throughput measurements yet.
+- **Final:** Keep static placement and fail-closed range check. #21 remains active: R3 fenced TSC/floor/warm-ups, C2 emulator comparison, C3 starvation classification, and record-then-defer IRQ gate flip are still owed.

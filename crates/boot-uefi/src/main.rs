@@ -37,6 +37,7 @@
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
 use baseos_kernel::cpu::{cr3_pml4_base, efer_nxe_enabled, read_cr3, read_efer, IrqGuard};
 use baseos_kernel::kernel_entry;
+use baseos_kernel::latency::LatencySamples;
 use baseos_kernel::page_table::{
     guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
     walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
@@ -865,6 +866,31 @@ struct AlignedStack([u8; 8192]);
 static mut THREAD_STACK_A: AlignedStack = AlignedStack([0; 8192]);
 static mut THREAD_STACK_B: AlignedStack = AlignedStack([0; 8192]);
 static mut THREAD_STACK_C: AlignedStack = AlignedStack([0; 8192]);
+static mut SWITCH_LATENCIES: LatencySamples = LatencySamples::new();
+
+fn storage_disjoint(storage: usize, size: usize, stacks: &[usize; 3], stack_size: usize) -> bool {
+    let Some(end) = storage.checked_add(size) else {
+        return false;
+    };
+    stacks.iter().all(|&start| {
+        start
+            .checked_add(stack_size)
+            .is_some_and(|stack_end| end <= start || stack_end <= storage)
+    })
+}
+
+fn switch_latency_storage_disjoint() -> bool {
+    storage_disjoint(
+        core::ptr::addr_of!(SWITCH_LATENCIES) as usize,
+        core::mem::size_of::<LatencySamples>(),
+        &[
+            core::ptr::addr_of!(THREAD_STACK_A) as usize,
+            core::ptr::addr_of!(THREAD_STACK_B) as usize,
+            core::ptr::addr_of!(THREAD_STACK_C) as usize,
+        ],
+        core::mem::size_of::<AlignedStack>(),
+    )
+}
 
 /// Caller-owned two-way save slot (S06 slice 12): `run_on_thread_stack_
 /// with_save` spills the boot `RSP` here before switching, so the save
@@ -1260,6 +1286,10 @@ fn write_sched_line<E>(
 /// e2e-only, same pattern as `probe_thread_save`).
 #[cfg(not(test))]
 unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<bool, E> {
+    if !switch_latency_storage_disjoint() {
+        write_sched_line::<E>(false, 1, 0, emit)?;
+        return Ok(false);
+    }
     let base_a = core::ptr::addr_of!(THREAD_STACK_A) as u64;
     let base_b = core::ptr::addr_of!(THREAD_STACK_B) as u64;
     let entry_b = thread_b_entry as *const () as u64;
@@ -2675,6 +2705,35 @@ fn panic(_info: &PanicInfo) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switch_latency_buffer_is_separate_from_all_thread_stacks() {
+        assert!(switch_latency_storage_disjoint());
+        assert!(storage_disjoint(
+            0x3000,
+            0x1000,
+            &[0x1000, 0x5000, 0x7000],
+            0x1000
+        ));
+        assert!(!storage_disjoint(
+            0x3000,
+            0x1000,
+            &[0x1000, 0x3fff, 0x7000],
+            0x1000
+        ));
+        assert!(!storage_disjoint(
+            usize::MAX,
+            2,
+            &[0x1000, 0x5000, 0x7000],
+            0x1000
+        ));
+        assert!(!storage_disjoint(
+            0x3000,
+            0x1000,
+            &[0x1000, usize::MAX, 0x7000],
+            0x1000
+        ));
+    }
 
     unsafe extern "efiapi" fn dummy_get_map(
         _a: *mut usize,
