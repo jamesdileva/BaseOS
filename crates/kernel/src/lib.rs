@@ -27,6 +27,7 @@ use baseos_boot_info::{write_str, write_u64_dec, write_u64_hex, BootInfo};
 /// `cpu::probe_addr_valid` without an `unsafe` block.
 pub mod cpu;
 pub mod frame_alloc;
+pub mod latency;
 pub mod page_table;
 pub mod sched;
 pub mod sync;

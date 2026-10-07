@@ -4505,3 +4505,10 @@ Format per entry (per `implementation-guide.md` ยง31):
 
 
 
+### S07 slice48 - per-op latency sample buffer (#21, REVIEW #533 C1)
+- **Decision:** Add `crates/kernel/src/latency.rs`: a fixed `[u64; 1024]` `LatencySamples` buffer with `record` and `reduce` (min, lower median, nearest-rank p99, max). Once full it does not wrap: extra samples are counted in `dropped`. `p99_valid` is set only when n >= 1000. It uses `core` only, so the guest links it.
+- **Why:** The scheduler trace is an 8-entry id prefix with no timestamps, so it cannot carry a tail (REVIEW #533 C1). The guest rdtsc switch timing in #21 needs a place to collect per-op samples so that 'tail' is a real p99 and not a batch max.
+- **Alternatives:** A ring buffer that overwrites old samples (rejected: it silently biases toward late samples). Streaming estimators such as Pฒ (rejected: approximate, and more code than 8 KB of exact samples).
+- **Tests:** 5 new host tests: empty, single sample (p99 invalid), 1..1000 nearest-rank (median 500, p99 990), tail outliers visible in p99 but not in the median, and overflow counts drops without wrapping. Workspace: 245 passed, 1 ignored. `clippy -p baseos-kernel --all-targets` is clean. The UEFI guest builds.
+- **Measured:** n/a. This adds the instrument only; the gate flip, guest wiring, WHPX vs TCG (C2) and fairness re-labelling (C3) follow in #21.
+
