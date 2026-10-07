@@ -578,6 +578,15 @@ pub extern "C" fn timer_irq_rust() {
         // S07 slice35 (REVIEW #505): enforce the IRQ stack-switch gate at the
         // IRQ site (not docs-only) — while closed this must defer, never
         // switch stacks in IRQ context.
+        // S07 slice36 (REVIEW #510): release-active fail-closed guard —
+        // explicit `if` (enforces in release, unlike `debug_assert!`).
+        // Gate still closed, so this never fires today; if a future slice
+        // flips the const without landing record-then-defer, IRQ fails
+        // closed here (tick drained, dispatch deferred) in all profiles.
+        if !crate::sched::irq_dispatch_must_defer() {
+            (*core::ptr::addr_of_mut!(TIMER_TICKS)).tick_gated(&gate);
+            return;
+        }
         debug_assert!(
             crate::sched::irq_dispatch_must_defer(),
             "IRQ stack switch forbidden while gate closed"

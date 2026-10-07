@@ -2659,4 +2659,24 @@ mod tests {
         assert!(core::hint::black_box(super::irq_dispatch_must_defer()));
         assert!(!core::hint::black_box(super::IRQ_STACK_SWITCH_PERMITTED));
     }
+
+    #[test]
+    fn irq_gate_fail_closed_release_refuses_switch() {
+        // S07 slice36 (REVIEW #510): release-active disconfirm — explicit
+        // `if` branches (enforce in release, unlike `debug_assert!`), so
+        // this test proves the IRQ path refuses a stack switch with the
+        // gate closed in every profile. Mirrors the `if
+        // !irq_dispatch_must_defer() { tick; return; }` fail-closed guard
+        // at the top of guest `timer_irq_rust`. Branches panic instead of
+        // returning bool literals so `clippy -D warnings`
+        // (`needless_bool`) stays clean.
+        if core::hint::black_box(super::irq_dispatch_must_defer()) {
+            // Gate closed: IRQ must defer — expected today.
+        } else {
+            panic!("IRQ gate open without record-then-defer");
+        }
+        if core::hint::black_box(super::IRQ_STACK_SWITCH_PERMITTED) {
+            panic!("IRQ stack switch permitted while gate must stay closed");
+        }
+    }
 }
