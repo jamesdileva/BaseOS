@@ -311,6 +311,86 @@ pub unsafe fn read_efer() -> u64 {
     (u64::from(hi) << 32) | u64::from(lo)
 }
 
+/// TSC warm-up iterations before a latency run (S07 slice52, #21 R3).
+///
+/// Warms the branch predictor / i-cache on the `lfence; rdtsc` path so the
+/// first recorded sample is not a cold outlier. Discarded reads only; the
+/// guest runs this before filling `SWITCH_LATENCIES`.
+pub const TSC_WARMUP_ITERS: usize = 128;
+
+/// Raw `rdtsc` read (S07 slice52, #21 R3).
+///
+/// Unfenced: callers that need ordering must use [`read_tsc_fenced`].
+/// User-mode legal on x86-64; host tests may call this.
+///
+/// # Safety
+/// No privilege requirement, but the value is only meaningful on x86-64
+/// with a running TSC. Guest: post-EBS boot thread. Host: test harness.
+pub unsafe fn read_tsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    core::arch::asm!(
+        "rdtsc",
+        out("eax") lo,
+        out("edx") hi,
+        options(nomem, nostack, preserves_flags),
+    );
+    (u64::from(hi) << 32) | u64::from(lo)
+}
+
+/// Fenced `rdtsc` read (S07 slice52, #21 R3): `lfence` before and after
+/// so the timestamp brackets exactly the intended region and prior loads
+/// cannot bleed into the sample.
+///
+/// # Safety
+/// Same contract as [`read_tsc`].
+pub unsafe fn read_tsc_fenced() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    core::arch::asm!(
+        "lfence",
+        "rdtsc",
+        "lfence",
+        out("eax") lo,
+        out("edx") hi,
+        options(nomem, nostack, preserves_flags),
+    );
+    (u64::from(hi) << 32) | u64::from(lo)
+}
+
+/// Saturating TSC delta (S07 slice52, #21 R3): `end - start`, floored at 0
+/// so a reordered/coarse pair never underflows; pure so host tests pin it.
+#[inline(always)]
+#[must_use]
+pub const fn tsc_delta(start: u64, end: u64) -> u64 {
+    end.saturating_sub(start)
+}
+
+/// Empty-pair overhead floor (S07 slice52, #21 R3): two back-to-back
+/// fenced reads with no work between; the delta is the per-sample
+/// measurement overhead the guest subtracts (saturating) from raw switch
+/// deltas before recording into `LatencySamples`.
+///
+/// # Safety
+/// Same contract as [`read_tsc_fenced`].
+pub unsafe fn empty_tsc_pair() -> u64 {
+    let a = read_tsc_fenced();
+    let b = read_tsc_fenced();
+    tsc_delta(a, b)
+}
+
+/// Discard `TSC_WARMUP_ITERS` fenced reads (S07 slice52, #21 R3).
+///
+/// # Safety
+/// Same contract as [`read_tsc_fenced`].
+pub unsafe fn warm_tsc() {
+    let mut i = 0usize;
+    while i < TSC_WARMUP_ITERS {
+        let _ = read_tsc_fenced();
+        i += 1;
+    }
+}
+
 // Forward-declared asm stubs (defined in `global_asm!` in the parent).
 #[cfg(not(test))]
 extern "C" {
@@ -533,5 +613,47 @@ mod tests {
         let sti_fn: unsafe fn() = sti;
         let _ = sti_fn;
         unsafe { sti() };
+    }
+
+    #[test]
+    fn tsc_reads_are_unsafe_fn_and_delta_saturates() {
+        // S07 slice52 (#21 R3): fenced/unfenced reads stay `unsafe fn`;
+        // `tsc_delta` is a pure saturating `const fn` (reorder -> 0).
+        let raw: unsafe fn() -> u64 = read_tsc;
+        let fenced: unsafe fn() -> u64 = read_tsc_fenced;
+        let pair: unsafe fn() -> u64 = empty_tsc_pair;
+        let warm: unsafe fn() = warm_tsc;
+        let _ = (raw, fenced, pair, warm);
+        assert_eq!(TSC_WARMUP_ITERS, 128);
+        let d: fn(u64, u64) -> u64 = tsc_delta;
+        assert_eq!(d(10, 25), 15);
+        assert_eq!(d(25, 25), 0);
+        assert_eq!(d(25, 10), 0);
+        assert_eq!(d(0, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn fenced_tsc_is_monotonic_with_finite_empty_floor() {
+        // S07 slice52 (#21 R3): warm-up completes, back-to-back fenced
+        // pairs are monotonic with a finite floor. No tight upper bound:
+        // hosted TSC granularity varies (TCG/WHPX comparison is C2).
+        unsafe {
+            warm_tsc();
+            let a = read_tsc_fenced();
+            let b = read_tsc_fenced();
+            assert!(b >= a);
+            assert_eq!(tsc_delta(a, b), b - a);
+            let mut worst = 0u64;
+            let mut i = 0usize;
+            while i < 16 {
+                let floor = empty_tsc_pair();
+                assert!(floor <= 10_000_000, "empty pair must stay finite");
+                if floor > worst {
+                    worst = floor;
+                }
+                i += 1;
+            }
+            let _ = worst;
+        }
     }
 }
