@@ -36,6 +36,8 @@
 
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
 use baseos_kernel::cpu::{cr3_pml4_base, efer_nxe_enabled, read_cr3, read_efer, IrqGuard};
+#[cfg(not(test))]
+use baseos_kernel::cpu::{empty_tsc_pair, read_tsc_fenced, switch_sample_delta, warm_tsc};
 use baseos_kernel::kernel_entry;
 use baseos_kernel::latency::LatencySamples;
 use baseos_kernel::page_table::{
@@ -1335,7 +1337,17 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
             return Ok(false);
         }
     };
+    // S07 slice53 (#21 R3 guest half): one overhead-corrected switch sample
+    // into static storage. Warmed fenced reads bracket ONLY the already-proven
+    // live hop above, so the timing cannot change the ok=1 path; the record
+    // is best-effort (a full/terminal buffer must not flip the line).
+    warm_tsc();
+    let floor = empty_tsc_pair();
+    let start = read_tsc_fenced();
     run_on_thread_stack(top, func);
+    let end = read_tsc_fenced();
+    let sample = switch_sample_delta(start, end, floor);
+    let _ = (&mut *core::ptr::addr_of_mut!(SWITCH_LATENCIES)).record(sample);
     // Persistent-table proof: second hop 2->1 agrees with the B->A triple.
     let next2 = match sched.dispatch_gated(&gate) {
         Ok(n) => n,
@@ -2714,6 +2726,19 @@ mod tests {
             0x1000,
             &[0x1000, 0x5000, 0x7000],
             0x1000
+        ));
+        // REVIEW #542 gap 1: full containment either way is overlap.
+        assert!(!storage_disjoint(
+            0x1000,
+            0x5000,
+            &[0x2000, 0x9000, 0xB000],
+            0x1000
+        ));
+        assert!(!storage_disjoint(
+            0x2000,
+            0x1000,
+            &[0x1000, 0x9000, 0xB000],
+            0x5000
         ));
         assert!(!storage_disjoint(
             0x3000,

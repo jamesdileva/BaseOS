@@ -366,6 +366,17 @@ pub const fn tsc_delta(start: u64, end: u64) -> u64 {
     end.saturating_sub(start)
 }
 
+/// Overhead-corrected switch sample (S07 slice53, #21 R3): raw
+/// [`tsc_delta`] minus the [`empty_tsc_pair`] floor, saturating to 0 so a
+/// sub-floor sample (coarse/emulated TSC) records 0 instead of underflowing.
+/// Pure so host tests pin it; the guest records the result into
+/// `SWITCH_LATENCIES`.
+#[inline(always)]
+#[must_use]
+pub const fn switch_sample_delta(start: u64, end: u64, floor: u64) -> u64 {
+    tsc_delta(start, end).saturating_sub(floor)
+}
+
 /// Empty-pair overhead floor (S07 slice52, #21 R3): two back-to-back
 /// fenced reads with no work between; the delta is the per-sample
 /// measurement overhead the guest subtracts (saturating) from raw switch
@@ -630,6 +641,11 @@ mod tests {
         assert_eq!(d(25, 25), 0);
         assert_eq!(d(25, 10), 0);
         assert_eq!(d(0, u64::MAX), u64::MAX);
+        // S07 slice53 (#21 R3): overhead-corrected sample floors at 0.
+        let s: fn(u64, u64, u64) -> u64 = switch_sample_delta;
+        assert_eq!(s(10, 110, 20), 80);
+        assert_eq!(s(10, 25, 100), 0);
+        assert_eq!(s(25, 10, 0), 0);
     }
 
     #[test]
