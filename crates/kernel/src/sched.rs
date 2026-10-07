@@ -669,6 +669,12 @@ impl Scheduler {
     /// Same refusal set as `switch_stub`: empty/unknown-current →
     /// `Unknown`, corrupt table → `InvalidTable`, no other `Ready` →
     /// `NoSwitch` (current `Ready`) / `NotReady` (current not `Ready`).
+    /// Refusal precedence: `validate_threads` runs first, so a corrupt table
+    /// always reports `InvalidTable` here, never `NotReady`. `NotReady`/
+    /// `NoSwitch` only describe a VALID table. (`commit_next` also returns
+    /// `NotReady` for a bad target without re-validating; that can mask
+    /// `InvalidTable` only if called directly with a corrupt table -- it is
+    /// private and both pick paths validate first, so unreachable today.)
     /// Read-only, never mutates. `dispatch`/`dispatch_gated` keep RR until
     /// a policy slice flips the default; use `dispatch_priority` for the
     /// policy path.
@@ -1179,6 +1185,9 @@ mod tests {
         // is picked, so the FIRST lo after hi in slice order takes every
         // lo slot and the second lo starves (runs == 0). Pinned as KNOWN;
         // reason the priority path stays opt-in with RR default.
+        // NOT A REQUIREMENT: runs==0 for the 2nd lo is a known-bad pin. A
+        // per-priority tie-break cursor is expected to flip it (2nd lo > 0);
+        // update this assertion deliberately when that lands.
         const FLOOD: u64 = 300;
         let mut h = mk(1, 0x1000_0000);
         h.set_priority(200);

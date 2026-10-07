@@ -4473,3 +4473,11 @@ Format per entry (per `implementation-guide.md` §31):
 - **Expected:** 240 tests; kernel fmt + clippy clean; guest untouched.
 - **Measured (2026-10-08, Win11):** `cargo test --workspace` 240/240 (21 + 35 + 174 + 4 + 4 + 2); `cargo fmt --check` clean; `cargo clippy -p baseos-kernel --all-targets -- -D warnings` clean (workspace `--all-targets` bootx64 host-test "unwinding panics" error is pre-existing, same on the stashed tree). Guest untouched.
 - **Final:** Opt-in priority with RR default, no aging, is the final S07 decision. Risk 2 closed. Risk 3 (NotReady masking InvalidTable in commit) is still owed. #20 remainder: affinity + O(n) measurement.
+
+### S07 slice45 - #20 risk 3 documented, pin flagged known-bad, affinity deferred
+- **Decision:** (1) Risk 3: `pick_next_priority` validates before any NotReady, so InvalidTable is never masked on the pick path; `commit_next` (private) returns NotReady for bad target without re-validating, unreachable via picks, documented in rustdoc. (2) Test `priority_single_hi_is_capped_at_half_share_yield_contract` annotated: 2nd-lo runs==0 is a known-bad pin, a per-priority cursor should flip it. (3) Affinity DEFERRED: single-CPU kernel (no AP bring-up before S12-class SMP work), so a mask has nothing to select among; revisit with SMP.
+- **Why:** REVIEW #527 items 1-2 + pin-readability concern.
+- **Alternatives:** Add affinity mask field now (rejected: no consumer, untestable semantics).
+- **Measured:** kernel 174/174 host tests; fmt + `clippy -p baseos-kernel` clean; doc/comment-only change.
+- **Final:** Owed on #20: O(n) pick measurement (several runs + spread). #21 gate still required before S07 done.
+
