@@ -4458,3 +4458,10 @@ Format per entry (per `implementation-guide.md` §31):
 - **Expected:** `cargo test --workspace` 237 (236 + 1); fmt + host clippy clean; guest untouched (no size/QEMU change; prior 137216B / 1667B TICK ticks=5 stands).
 - **Measured (2026-10-07, Win11):** `cargo test --workspace` 237/237 (21 + 35 + 171 incl. new policy pin + 4 + 4 + 2); `cargo fmt --check` clean (one auto-format of the pick condition); `cargo clippy --all-targets -- -D warnings` clean. Guest untouched (pure host policy + test; `dispatch`/`dispatch_gated` paths byte-identical behavior).
 - **Final:** Opt-in priority policy landed with the RR-vs-policy flip pinned (2 RR vs 3 policy, spread 0 vs 1). #20 stays active (default-policy flip or guest policy wiring, affinity, measurements + rule 1; #21 stays proposed).
+
+### S07 slice43 - priority starvation pinned
+- **Decision:** Pin known starvation of opt-in priority dispatch with a host test (2 hi + 1 lo, 300 dispatches: lo runs==0, spread >= 150; RR spread <= 1; single hi does not starve lo).
+- **Why:** REVIEW #523 risk 1 - no aging/inversion bound exists; evidence before a policy-flip or aging slice.
+- **Alternatives:** Add aging now (rejected: scope growth, rides next slice).
+- **Measured:** cargo test --workspace 239/239; fmt + clippy clean.
+- **Final:** Starvation is documented behavior; aging/flip decision owed in #20.

@@ -1117,6 +1117,55 @@ mod tests {
     }
 
     #[test]
+    fn priority_starvation_is_unbounded_without_aging_rr_is_not() {
+        // S07 slice43 — REVIEW #523 risk 1 disconfirm. Two high-prio
+        // threads alternate (current is excluded from the pick) so a
+        // low-prio thread never runs under `dispatch_priority`: no aging /
+        // inversion bound exists. Pinned as KNOWN behavior; RR default has
+        // spread <= 1 over the same flood. A single hi thread does NOT
+        // starve lo (current excluded), so >=2 hi are required.
+        const FLOOD: u64 = 300;
+        let build = || {
+            let mut h1 = mk(1, 0x1000_0000);
+            h1.set_priority(200);
+            let mut h2 = mk(2, 0x2000_0000);
+            h2.set_priority(200);
+            let mut lo = mk(3, 0x3000_0000);
+            lo.set_priority(1);
+            let mut s = Scheduler::new(1);
+            assert!(s.spawn(h1));
+            assert!(s.spawn(h2));
+            assert!(s.spawn(lo));
+            s
+        };
+        let mut p = build();
+        let mut i = 0;
+        while i < FLOOD {
+            assert!(p.dispatch_priority().is_ok());
+            i += 1;
+        }
+        assert_eq!(p.runs_of(3), Some(0));
+        assert_eq!(p.runs_of(1).unwrap() + p.runs_of(2).unwrap(), FLOOD);
+        assert!(p.fairness_spread() >= FLOOD / 2);
+        let mut r = build();
+        let mut i = 0;
+        while i < FLOOD {
+            assert!(r.dispatch().is_ok());
+            i += 1;
+        }
+        assert!(r.runs_of(3).unwrap() >= FLOOD / 3 - 1);
+        assert!(r.fairness_spread() <= 1);
+        let mut one = Scheduler::new(1);
+        let mut h = mk(1, 0x1000_0000);
+        h.set_priority(200);
+        let mut l = mk(2, 0x2000_0000);
+        l.set_priority(1);
+        assert!(one.spawn(h));
+        assert!(one.spawn(l));
+        assert_eq!(one.dispatch_priority(), Ok(2));
+    }
+
+    #[test]
     fn priority_refusal_parity_matches_rr_and_leaves_table_untouched() {
         // S07 slice42 (REVIEW #521 risk 2 cheapest disconfirm): the
         // slice41 pin covered Unknown/NoSwitch only. The priority path
