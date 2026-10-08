@@ -213,6 +213,11 @@ if ($serialText -and $serialText.Contains($marker)) {
   $threadPong = "THREAD-PONG ok=1"
   $threadPongRun = "THREAD-PONG-RUN id=1"
   $schedSwitch = "SCHED-SWITCH ok=1 from=1 to=2"
+  # S07 slice58 (QEMU count=16 confirm, REVIEW #554 risk 1): the N-loop emits
+  # 16 timed hops per boot, so e2e must pin the population count, not just
+  # presence -- `count=16` fails if sampling regresses to n=1 or balloons.
+  # `valid=0` rides along (no tail yet until N grows toward 1000).
+  $switchLat = "SWITCH-LAT ok=1 count=16"
   $threadJump = "THREAD-JUMP ok=1 id=2"
   $threadJumpRun = "THREAD-JUMP-RUN id=2"
   # S06 slice22 R3 (REVIEW #368 fail-loud refusal): the forced-refusal demo
@@ -304,6 +309,7 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasThreadPong = $serialText.Contains($threadPong)
   $hasThreadPongRun = $serialText.Contains($threadPongRun)
   $hasSchedSwitch = $serialText.Contains($schedSwitch)
+  $hasSwitchLat = $serialText.Contains($switchLat)
   $hasThreadJump = $serialText.Contains($threadJump)
   $hasThreadJumpRun = $serialText.Contains($threadJumpRun)
   $hasThreadJumpRefusal = $serialText.Contains($threadJumpRefusal)
@@ -327,9 +333,9 @@ if ($serialText -and $serialText.Contains($marker)) {
   }
   $hasPf = [regex]::IsMatch($serialText, $pfPat)
   $hasExc = $serialText.Contains($exc)
-   if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasTick -and $hasThreadJump -and $hasThreadJumpRun -and $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and $hasPf -and $hasExc) {
+   if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSwitchLat -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasTick -and $hasThreadJump -and $hasThreadJumpRun -and $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and $hasPf -and $hasExc) {
     Write-Output ("Boot summary: FOUND (" + $bootinfo + " + " + $memmap + " + " + $notrunc + " + " + $mapsize + " + " + $descsize + " + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SWITCH-LAT ok=1 count=16 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -353,6 +359,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "THREAD-PONG ok=1 present=$hasThreadPong, " +
       "THREAD-PONG-RUN id=1 present=$hasThreadPongRun, " +
       "SCHED-SWITCH ok=1 from=1 to=2 present=$hasSchedSwitch, " +
+      "SWITCH-LAT ok=1 count=16 present=$hasSwitchLat, " +
       "SCHED-EXIT ok=1 exited=2 resumed=3 present=$hasSchedExit, " +
       "SCHED-JOIN ok=1 joined=2 present=$hasSchedJoin, " +
       "SCHED-STAT ok=1 present=$hasSchedStat, " +
