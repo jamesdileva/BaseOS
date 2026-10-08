@@ -166,6 +166,19 @@ pub const fn live_backoff_next(consecutive_failures: u64, failed: bool) -> u64 {
     }
 }
 
+/// S07 slice65 — starvation classification (C3, #21).
+///
+/// | Path | Class | Bound |
+/// |------|-------|-------|
+/// | RR `dispatch`/`dispatch_gated` | BOUNDED (no starvation while Ready) | full-round `fairness_spread() <= 1` |
+/// | Opt-in `dispatch_priority` | UNBOUNDED DEFECT (documented, not default) | 2 hi starve 1 lo, 1 hi starves 2nd lo (slices 43/44) |
+/// | Live backoff drain-only | BOUNDED deferral (not starvation) | at most 3 failed picks, then 1 drain-only skip + streak reset; ticks always drained |
+///
+/// RR is the default and the only guest path; priority stays opt-in precisely
+/// because its starvation is unbounded with no aging. Backoff never loses
+/// ticks (drain always runs), so suppression is a bounded probe throttle.
+pub const STARVATION_RR_BOUNDED: bool = true;
+
 /// IRQ stack-switch gate (S07 slice34, REVIEW #501 risk 1 pin).
 ///
 /// `false` while IRQ-context dispatch is metadata-only (Ready<->Running
@@ -2460,6 +2473,73 @@ mod tests {
         assert_eq!(live_backoff_next(streak, false), 0);
         assert!(!live_backoff_suppresses(live_backoff_next(streak, false)));
         assert_eq!(live_backoff_next(u64::MAX, true), u64::MAX);
+    }
+
+    #[test]
+    fn starvation_classification_rr_bounded_priority_unbounded_backoff_bounded() {
+        // S07 slice65 — C3 starvation classification (#21): one test, three
+        // classes. RR bounded, priority unbounded DEFECT, backoff bounded
+        // deferral with ticks never lost.
+        // RR: 3 Ready threads, 300 dispatches -> each runs ~100, spread <= 1.
+        let mut r = Scheduler::new(1);
+        assert!(r.spawn(mk(1, 0x1000_0000)));
+        assert!(r.spawn(mk(2, 0x2000_0000)));
+        assert!(r.spawn(mk(3, 0x3000_0000)));
+        let mut i = 0;
+        while i < 300 {
+            assert!(r.dispatch().is_ok());
+            i += 1;
+        }
+        assert!(r.runs_of(1).unwrap() >= 99);
+        assert!(r.runs_of(2).unwrap() >= 99);
+        assert!(r.runs_of(3).unwrap() >= 99);
+        assert!(r.fairness_spread() <= 1);
+        // Priority opt-in: 2 hi starve 1 lo (unbounded DEFECT, slices 43/44).
+        let mut h1 = mk(1, 0x1000_0000);
+        h1.set_priority(200);
+        let mut h2 = mk(2, 0x2000_0000);
+        h2.set_priority(200);
+        let mut lo = mk(3, 0x3000_0000);
+        lo.set_priority(1);
+        let mut p = Scheduler::new(1);
+        assert!(p.spawn(h1));
+        assert!(p.spawn(h2));
+        assert!(p.spawn(lo));
+        let mut j = 0;
+        while j < 300 {
+            assert!(p.dispatch_priority().is_ok());
+            j += 1;
+        }
+        assert_eq!(p.runs_of(3), Some(0));
+        // Backoff: all-Done table -> 3x Some(Err), then 1 drain-only None
+        // with streak reset and ticks still drained (bounded deferral).
+        let gate = unsafe { crate::cpu::IrqGuard::enter() };
+        let mut b = Scheduler::new(1);
+        let mut run = mk(1, 0x1000_0000);
+        assert!(run.set_state(ThreadState::Running));
+        let mut done = mk(2, 0x2000_0000);
+        assert!(done.set_state(ThreadState::Done));
+        assert!(b.spawn(run));
+        assert!(b.spawn(done));
+        let mut streak = 0u64;
+        let mut k = 0;
+        while k < LIVE_MAX_CONSECUTIVE_FAILURES {
+            let mut hw = TimerTicks::new();
+            hw.tick();
+            let (drained, res) = b.drain_then_dispatch_live_gated(&mut hw, &gate, &mut streak);
+            assert_eq!(drained, 1);
+            assert_eq!(res, Some(Err(SwitchError::NotReady)));
+            k += 1;
+        }
+        assert!(live_backoff_suppresses(streak));
+        let mut hw_skip = TimerTicks::new();
+        hw_skip.tick();
+        hw_skip.tick();
+        let (drained_skip, res_skip) =
+            b.drain_then_dispatch_live_gated(&mut hw_skip, &gate, &mut streak);
+        assert_eq!(drained_skip, 2);
+        assert_eq!(res_skip, None);
+        assert_eq!(streak, 0);
     }
 
     #[test]
