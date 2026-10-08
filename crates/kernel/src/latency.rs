@@ -243,6 +243,17 @@ mod tests {
         assert_ordered(&[0]);
         let ramp: Vec<u64> = (0..16).map(|i| 900 + i * 10).collect();
         assert_ordered(&ramp);
+        // N=16 < MIN_SAMPLES_FOR_P99: tail is reported but unpublishable
+        // (REVIEW #560 R2). Pin !p99_valid so no reader copies the shape
+        // as a publishable tail.
+        {
+            let mut s = LatencySamples::new();
+            for &v in &ramp {
+                assert!(s.record(v));
+            }
+            let r = s.reduce().unwrap();
+            assert!(!r.p99_valid, "N=16 p99 must stay unpublishable: {r:?}");
+        }
         let mut outliers = [100u64; 1000];
         outliers[999] = 10_000;
         assert_ordered(&outliers);
@@ -270,5 +281,9 @@ mod tests {
             "floor<=min<=med: {r:?}"
         );
         assert!(r.p99 >= r.median, "p99>=med: {r:?}");
+        assert!(
+            !r.p99_valid,
+            "synthetic N=16 p99 unpublishable (n < MIN_SAMPLES_FOR_P99): {r:?}"
+        );
     }
 }
