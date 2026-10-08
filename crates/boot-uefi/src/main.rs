@@ -37,7 +37,9 @@
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
 use baseos_kernel::cpu::{cr3_pml4_base, efer_nxe_enabled, read_cr3, read_efer, IrqGuard};
 #[cfg(not(test))]
-use baseos_kernel::cpu::{empty_tsc_pair, read_tsc_fenced, switch_sample_delta, warm_tsc};
+use baseos_kernel::cpu::{
+    empty_tsc_pair, read_tsc_fenced, switch_sample_delta, tsc_delta, warm_tsc,
+};
 use baseos_kernel::kernel_entry;
 use baseos_kernel::latency::{LatencySamples, LatencyStats};
 use baseos_kernel::page_table::{
@@ -870,6 +872,19 @@ static mut THREAD_STACK_B: AlignedStack = AlignedStack([0; 8192]);
 static mut THREAD_STACK_C: AlignedStack = AlignedStack([0; 8192]);
 static mut SWITCH_LATENCIES: LatencySamples = LatencySamples::new();
 
+/// Same-boot empty-pair floor + raw switch delta backing the `SWITCH-LAT`
+/// `floor=` / `raw=` fields (S07 slice55, #21 R3 floor-visibility half).
+/// Written once by the guest `probe_sched_switch` alongside the corrected
+/// sample (`raw = tsc_delta(start, end)`, corrected = `raw` saturating-sub
+/// `floor`); read once by the `report_switch_latencies` call site. Zero
+/// until the probe runs, so an un-sampled boot still emits an explicit
+/// `floor=0 raw=0` pair instead of a missing field. Single-threaded boot
+/// owns both statics (same `cli` contract as `SWITCH_LATENCIES`; kept
+/// unconditional like `SWITCH_LATENCIES` so the host-test build of the
+/// report call site compiles — the host probe never writes them).
+static mut SWITCH_LAST_FLOOR: u64 = 0;
+static mut SWITCH_LAST_RAW: u64 = 0;
+
 fn storage_disjoint(storage: usize, size: usize, stacks: &[usize; 3], stack_size: usize) -> bool {
     let Some(end) = storage.checked_add(size) else {
         return false;
@@ -1263,15 +1278,22 @@ fn write_sched_line<E>(
 }
 
 /// Emit the one-line `SWITCH-LAT` diagnostic (S07 slice54, #21 R3 reduce
-/// half): `SWITCH-LAT ok=<0|1> count=<n> min=<n> med=<n> p99=<n> max=<n>
-/// valid=<0|1> dropped=<n>` — terminal [`LatencySamples::reduce`] of the
-/// static `SWITCH_LATENCIES` population. `ok` is 1 only when the buffer is
-/// non-empty (failure zeroes count/stats so an empty buffer cannot pass).
-/// `valid` mirrors `p99_valid` (1 only when count >= 1000); with the
-/// current single sample per boot it is 0 by design. A `min` of 0 means
+/// half; slice55 adds `floor=` / `raw=`): `SWITCH-LAT ok=<0|1> count=<n>
+/// min=<n> med=<n> p99=<n> max=<n> valid=<0|1> dropped=<n> floor=<n>
+/// raw=<n>` — terminal [`LatencySamples::reduce`] of the static
+/// `SWITCH_LATENCIES` population plus the same-boot measurement context.
+/// `ok` is 1 only when the buffer is non-empty (failure zeroes count/stats
+/// so an empty buffer cannot pass). `valid` mirrors `p99_valid` (1 only
+/// when count >= 1000); with the current single sample per boot it is 0 by
+/// design. `floor` is the `empty_tsc_pair` overhead subtracted from `raw`
+/// (`raw` is the uncorrected `tsc_delta(start, end)`); the corrected sample
+/// recorded is `raw` saturating-sub `floor`. A `min` of 0 means
 /// floor-limited (raw switch delta below the empty-pair overhead floor,
 /// common on coarse/emulated TSC — see `switch_sample_delta`), not a true
 /// zero-cost switch; 0 samples are kept in the population, never dropped.
+/// The `floor=` / `raw=` suffix is appended after `dropped=` so existing
+/// `SWITCH-LAT ok=1` / `count=` / `dropped=` substring gates stay
+/// byte-identical.
 #[allow(clippy::too_many_arguments)]
 fn write_switch_lat_line<E>(
     ok: bool,
@@ -1282,6 +1304,8 @@ fn write_switch_lat_line<E>(
     max: u64,
     p99_valid: bool,
     dropped: u64,
+    floor: u64,
+    raw: u64,
     emit: &mut impl FnMut(u8) -> Result<(), E>,
 ) -> Result<(), E> {
     write_str(emit, "SWITCH-LAT ok=")?;
@@ -1300,22 +1324,42 @@ fn write_switch_lat_line<E>(
     write_u64_dec(emit, u64::from(p99_valid))?;
     write_str(emit, " dropped=")?;
     write_u64_dec(emit, dropped)?;
+    write_str(emit, " floor=")?;
+    write_u64_dec(emit, floor)?;
+    write_str(emit, " raw=")?;
+    write_u64_dec(emit, raw)?;
     write_str(emit, "\n")
 }
 
 /// Reduce a latency population and emit the `SWITCH-LAT` line (S07
-/// slice54, #21 R3 reduce half). Terminal: [`LatencySamples::reduce`]
-/// sorts in place, so the buffer refuses further records after this call.
-/// Empty (or already-consumed-and-empty) populations emit the zeroed
-/// `ok=0` shape and return `Ok(false)`; otherwise emits `ok=1` from the
-/// stats and returns `Ok(true)`. Never panics.
+/// slice54, #21 R3 reduce half; slice55 threads `floor` / `raw` through).
+/// Terminal: [`LatencySamples::reduce`] sorts in place, so the buffer
+/// refuses further records after this call. Empty (or
+/// already-consumed-and-empty) populations emit the zeroed `ok=0` shape
+/// (with the caller-provided `floor` / `raw` context) and return
+/// `Ok(false)`; otherwise emits `ok=1` from the stats and returns
+/// `Ok(true)`. Never panics.
 fn report_switch_latencies<E>(
     samples: &mut LatencySamples,
+    floor: u64,
+    raw: u64,
     emit: &mut impl FnMut(u8) -> Result<(), E>,
 ) -> Result<bool, E> {
     match samples.reduce() {
         None => {
-            write_switch_lat_line::<E>(false, 0, 0, 0, 0, 0, false, samples.dropped(), emit)?;
+            write_switch_lat_line::<E>(
+                false,
+                0,
+                0,
+                0,
+                0,
+                0,
+                false,
+                samples.dropped(),
+                floor,
+                raw,
+                emit,
+            )?;
             Ok(false)
         }
         Some(st) => {
@@ -1329,6 +1373,8 @@ fn report_switch_latencies<E>(
                 s.max,
                 s.p99_valid,
                 s.dropped,
+                floor,
+                raw,
                 emit,
             )?;
             Ok(true)
@@ -1420,8 +1466,13 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
     let start = read_tsc_fenced();
     run_on_thread_stack(top, func);
     let end = read_tsc_fenced();
+    let raw = tsc_delta(start, end);
     let sample = switch_sample_delta(start, end, floor);
     let _ = (&mut *core::ptr::addr_of_mut!(SWITCH_LATENCIES)).record(sample);
+    // S07 slice55 (#21 R3 floor-visibility half): stash same-boot context
+    // for the SWITCH-LAT floor=/raw= suffix (best-effort, never flips ok).
+    *core::ptr::addr_of_mut!(SWITCH_LAST_FLOOR) = floor;
+    *core::ptr::addr_of_mut!(SWITCH_LAST_RAW) = raw;
     // Persistent-table proof: second hop 2->1 agrees with the B->A triple.
     let next2 = match sched.dispatch_gated(&gate) {
         Ok(n) => n,
@@ -2723,8 +2774,14 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // S07 slice54 (#21 R3 reduce half): terminal reduce of the one
             // static switch sample + SWITCH-LAT line. Best-effort report:
             // an empty buffer emits ok=0 without failing the boot.
+            // Slice55 threads the same-boot floor/raw context (0/0 when
+            // the probe never ran) so min=0 can be checked as floor-limited.
+            let floor = *core::ptr::addr_of!(SWITCH_LAST_FLOOR);
+            let raw = *core::ptr::addr_of!(SWITCH_LAST_RAW);
             let _ = report_switch_latencies::<Infallible>(
                 &mut *core::ptr::addr_of_mut!(SWITCH_LATENCIES),
+                floor,
+                raw,
                 &mut emit,
             );
             // S06 slice22 R2: forced-refusal demo first — emits
@@ -3735,37 +3792,45 @@ mod tests {
 
     #[test]
     fn switch_lat_report_shapes_host() {
-        // S07 slice54 (#21 R3 reduce half): the SWITCH-LAT writer + reduce
-        // helper shapes. Empty emits zeroed ok=0; a single (possibly
-        // 0-floored) sample emits ok=1 with count=1 and valid=0 (n=1 never
-        // carries a p99 tail); reduction is terminal (further records
-        // refused).
+        // S07 slice54 (#21 R3 reduce half; slice55 threads floor/raw): the
+        // SWITCH-LAT writer + reduce helper shapes. Empty emits zeroed ok=0
+        // with the caller context (0/0 = un-sampled boot); a single
+        // (possibly 0-floored) sample emits ok=1 with count=1 and valid=0
+        // (n=1 never carries a p99 tail); reduction is terminal (further
+        // records refused). floor/raw are display-only (raw saturating-sub
+        // floor == recorded sample), pinned with non-zero values below.
         let mut out: Vec<u8> = Vec::new();
         let mut empty = LatencySamples::new();
-        assert!(
-            !report_switch_latencies::<core::convert::Infallible>(&mut empty, &mut |b| {
+        assert!(!report_switch_latencies::<core::convert::Infallible>(
+            &mut empty,
+            0,
+            0,
+            &mut |b| {
                 out.push(b);
                 Ok(())
-            })
-            .unwrap()
-        );
+            }
+        )
+        .unwrap());
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "SWITCH-LAT ok=0 count=0 min=0 med=0 p99=0 max=0 valid=0 dropped=0\n"
+            "SWITCH-LAT ok=0 count=0 min=0 med=0 p99=0 max=0 valid=0 dropped=0 floor=0 raw=0\n"
         );
         let mut one = LatencySamples::new();
         assert!(one.record(0), "sub-floor 0 sample is kept, not dropped");
         let mut out: Vec<u8> = Vec::new();
-        assert!(
-            report_switch_latencies::<core::convert::Infallible>(&mut one, &mut |b| {
+        assert!(report_switch_latencies::<core::convert::Infallible>(
+            &mut one,
+            123,
+            456,
+            &mut |b| {
                 out.push(b);
                 Ok(())
-            })
-            .unwrap()
-        );
+            }
+        )
+        .unwrap());
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "SWITCH-LAT ok=1 count=1 min=0 med=0 p99=0 max=0 valid=0 dropped=0\n"
+            "SWITCH-LAT ok=1 count=1 min=0 med=0 p99=0 max=0 valid=0 dropped=0 floor=123 raw=456\n"
         );
         assert!(one.is_reduced());
         assert!(!one.record(99), "terminal: no records after reduce");
