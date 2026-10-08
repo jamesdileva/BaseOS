@@ -465,9 +465,15 @@ pub(crate) unsafe fn poll_timer_dispatch(
 /// REVIEW #446 R1 (returning-IRQ frame): unlike `#DE`/`#PF` (never return),
 /// IRQ0 MUST return via `iretq`, so the stub MUST NOT use the destructive
 /// `and rsp, -16` (loses the entry RSP, `iretq` pops the wrong frame ->
-/// triple fault) and MUST preserve caller state. Entry pushes the 7
-/// Win64-volatile regs (`rax rcx rdx r8-r11`), then `sub rsp, 32` only
-/// (no `and`), so `add rsp, 32` + pops restore the exact entry frame.
+/// triple fault) and MUST preserve caller state. Entry pushes the 9-reg
+/// Win64+SysV volatile superset (`rax rcx rdx rsi rdi r8-r11`): Win64
+/// needs `rax rcx rdx r8-r11` while SysV callers also need `rsi/rdi`
+/// (TASK #24 / REVIEW #579 note 1 — the old 7-reg frame silently corrupted
+/// `rsi/rdi` on any non-`hlt` interruptible path); callee-saved
+/// (`rbx rbp r12-r15`) stay owned by `timer_irq_rust` under both ABIs.
+/// Then `sub rsp, 32` only (no `and`), so `add rsp, 32` + pops restore
+/// the exact entry frame (9 pushes + 32 = 104 bytes, `% 16 == 8`, so the
+/// pre-`call` `RSP` stays 16-aligned exactly like the old 7-reg frame).
 /// EOI runs BEFORE the pops (while the saved `rax` still sits on the
 /// stack), so `mov al, 0x20` cannot clobber the caller's `rax`.
 //
@@ -483,6 +489,8 @@ macro_rules! timer_isr_stub_asm {
         push rax
         push rcx
         push rdx
+        push rsi
+        push rdi
         push r8
         push r9
         push r10
@@ -496,6 +504,8 @@ macro_rules! timer_isr_stub_asm {
         pop r10
         pop r9
         pop r8
+        pop rdi
+        pop rsi
         pop rdx
         pop rcx
         pop rax
@@ -973,10 +983,12 @@ mod tests {
         // return (a parking stub would hang the timer; a missing EOI
         // would wedge IRQ0 after the first tick).
         // REVIEW #446 R1: returning-IRQ frame — the stub MUST save/restore
-        // the Win64-volatiles and MUST NOT use destructive `and rsp, -16`
-        // (loses entry RSP, `iretq` pops the wrong frame -> triple fault
-        // on the first tick); EOI must precede the pops so `mov al`
-        // cannot clobber the caller's restored rax.
+        // the Win64+SysV volatile superset and MUST NOT use destructive
+        // `and rsp, -16` (loses entry RSP, `iretq` pops the wrong frame ->
+        // triple fault on the first tick); EOI must precede the pops so
+        // `mov al` cannot clobber the caller's restored rax. TASK #24:
+        // `rsi`/`rdi` are SysV-volatiles (Win64-callee-saved) — the old
+        // 7-reg frame silently corrupted them on any non-`hlt` path.
         let stub = timer_stub_text();
         assert!(
             stub.contains("baseos_isr_timer"),
@@ -991,22 +1003,27 @@ mod tests {
             "returning IRQ stub must not destroy RSP with andq: {stub}"
         );
         for reg in [
-            "push rax", "push rcx", "push rdx", "push r8", "push r9", "push r10", "push r11",
+            "push rax", "push rcx", "push rdx", "push rsi", "push rdi", "push r8", "push r9",
+            "push r10", "push r11",
         ] {
             assert!(stub.contains(reg), "stub must save {reg}: {stub}");
         }
         for reg in [
-            "pop r11", "pop r10", "pop r9", "pop r8", "pop rdx", "pop rcx", "pop rax",
+            "pop r11", "pop r10", "pop r9", "pop r8", "pop rdi", "pop rsi", "pop rdx", "pop rcx",
+            "pop rax",
         ] {
             assert!(stub.contains(reg), "stub must restore {reg}: {stub}");
         }
-        // REVIEW #448 residual 1: pin all 7 + LIFO order — a dropped r10/r11
-        // or a swapped push/pop pair must fail here, not pass silently.
+        // REVIEW #448 residual 1 + TASK #24: pin all 9 + LIFO order — a
+        // dropped rsi/rdi/r10/r11 or a swapped push/pop pair must fail
+        // here, not pass silently.
         let pushes = [
-            "push rax", "push rcx", "push rdx", "push r8", "push r9", "push r10", "push r11",
+            "push rax", "push rcx", "push rdx", "push rsi", "push rdi", "push r8", "push r9",
+            "push r10", "push r11",
         ];
         let pops = [
-            "pop r11", "pop r10", "pop r9", "pop r8", "pop rdx", "pop rcx", "pop rax",
+            "pop r11", "pop r10", "pop r9", "pop r8", "pop rdi", "pop rsi", "pop rdx", "pop rcx",
+            "pop rax",
         ];
         let mut last = 0;
         for reg in pushes {
@@ -1063,6 +1080,11 @@ mod tests {
             stub.contains("iretq"),
             "returning stub must iretq, never park: {stub}"
         );
+        // TASK #24: 9 pushes + 32-byte shadow = 104 bytes, `% 16 == 8`, so
+        // the pre-`call` RSP stays 16-aligned exactly like the old 7-reg
+        // frame (88 bytes, `% 16 == 8`). Even-count frames would misalign.
+        assert_eq!(9 * 8 + 32, 104);
+        assert_eq!((9 * 8 + 32) % 16, 8);
     }
 
     #[test]
