@@ -400,7 +400,8 @@ pub(crate) unsafe fn reset_total_drained() {
 /// Guest-only combined PIT-handler step (S07 slice 17; slice 18 delegates
 /// to the helper instead of re-implementing it; slice 19 is static-only;
 /// S08 slice25 polls the LIVE helper with the IRQ-owned streak static;
-/// S07 slice30 calls this same helper per-tick from `timer_irq_rust`).
+/// S07 slice66 record-then-defer flip: sole call site is the task-context
+/// remainder — `timer_irq_rust` records one tick and returns, never drains).
 ///
 /// Drains the IRQ-owned static `TIMER_TICKS` into the IRQ-owned static
 /// scheduler via [`crate::sched::sched_poll_live_static`] (bulk credit to the
@@ -408,12 +409,13 @@ pub(crate) unsafe fn reset_total_drained() {
 /// 3-on-1-off backoff cap) and
 /// returns `(drained, dispatch)` — `dispatch` is `None` when no expiry
 /// (nothing to do) and `Some(Ok/Err)` when one resched was attempted.
-/// Two call sites (`timer_irq_rust` per-tick + `bring_up_cpu_and_prove_exception`
-/// remainder) share this same helper so the guest can never dispatch without
-/// draining first (REVIEW #462 risk 1), and the helper owns the order so this
-/// wrapper cannot drift from it (REVIEW #464 nit 1). The `TICK` proof line
+/// Single call site (`bring_up_cpu_and_prove_exception` remainder) owns the
+/// dispatch so the guest can never dispatch without draining first
+/// (REVIEW #462 risk 1), and the helper owns the order so this wrapper
+/// cannot drift from it (REVIEW #464 nit 1). The `TICK` proof line
 /// reports the gated cumulative total, never `drained`-only (REVIEW #495 tail
-/// 1: the per-tick drain holds the task-context remainder near 0); the
+/// 1; S07 slice66: the IRQ path no longer drains, so the task-context batch
+/// carries the full wait window); the
 /// dispatch result is intentionally ignored (demo table always has a `Ready`
 /// target, so the streak stays `0` and slice-24 parity keeps this identical
 /// to the task helper on this table).
@@ -426,10 +428,9 @@ pub(crate) unsafe fn reset_total_drained() {
 /// Static note (S07 slice 19): both ends are IRQ-owned statics now — the
 /// counter (`TIMER_TICKS`) and the table (`sched::STATIC_SCHED`, armed once
 /// via `sched_init_demo_static` which also resets `sched::STATIC_STREAK`).
-/// No stack-local scheduler remains; S07 slice30 calls this same live path
-/// per-tick from IRQ context (`timer_irq_rust`), with the task-context
-/// remainder proving the gated cumulative total (QEMU TICK re-run owed per
-/// REVIEW #497).
+/// No stack-local scheduler remains; S07 slice66 retires the slice30
+/// per-tick IRQ drain (`timer_irq_rust` is record-only), and the
+/// task-context remainder proves the gated cumulative total.
 ///
 /// # Safety
 /// Post-EBS guest only, `cli` in effect, `gate` proves the critical
@@ -531,16 +532,18 @@ core::arch::global_asm!(timer_isr_stub_asm!());
 #[cfg(not(test))]
 static mut TIMER_TICKS: TimerTicks = TimerTicks::new();
 
-/// Rust body of the IRQ0 stub (S07 slice11, guest-only; slice30 per-tick drain).
+/// Rust body of the IRQ0 stub (S07 slice11, guest-only; S07 slice66
+/// record-then-defer flip, #21 close).
 ///
 /// Called from `baseos_isr_timer` with the Win64-volatile frame saved and
 /// 32-byte shadow space reserved; the stub performs the single master EOI
 /// AFTER this returns (while the saved `rax` still sits on the stack) and
-/// `iretq`s. Body records exactly one saturating tick and drains it the same
-/// way the task-context poll does (same [`poll_timer_dispatch`] helper, so
-/// the two paths cannot drift) — never parks, never touches ports (EOI
-/// lives in the stub so `mov al` cannot clobber the caller's `rax` before
-/// the pops).
+/// `iretq`s. Body records exactly one saturating tick and returns — never
+/// drains, never dispatches, never parks, never touches ports (EOI lives in
+/// the stub so `mov al` cannot clobber the caller's `rax` before the pops).
+/// The task-context `bring_up_cpu_and_prove_exception` remainder owns the
+/// single drain-then-dispatch via [`poll_timer_dispatch`], so the two paths
+/// cannot drift (one recorder, one drainer).
 ///
 /// Reentrancy: safe by construction — the CPU clears IF on entry (interrupt
 /// gate) and the PIC withholds this IRQ until the stub's EOI, so no nested
@@ -550,18 +553,14 @@ static mut TIMER_TICKS: TimerTicks = TimerTicks::new();
 /// `Scheduler::new(NULL_THREAD)`: unknown-current drains consume the counter
 /// with no dispatch owed, slice-20 backoff by construction).
 ///
-/// S07 slice34 (REVIEW #501 risk 1 pin): the ignored dispatch result is a
-/// DEFERRED-resched request, never an immediate stack switch — safe only
-/// while `crate::sched::IRQ_STACK_SWITCH_PERMITTED == false` (dispatch is
-/// metadata-only state flips, no RSP switch). The real-switch slice must
-/// convert this path to record-then-defer.
-///
-/// S07 slice35 (REVIEW #505 enforcement): the IRQ path `debug_assert!`s
-/// `crate::sched::irq_dispatch_must_defer()` on entry (code reference to the
-/// gate, not docs-only) — a future real-switch slice cannot switch stacks
-/// here while the gate is closed without tripping the debug assert; the
-/// real-switch slice flips the const AND converts this path to
-/// record-then-defer together.
+/// S07 slice34–36 history (REVIEW #501/#505/#510): the gate era pinned
+/// `IRQ_STACK_SWITCH_PERMITTED == false` with in-IRQ metadata dispatch
+/// (`let _ = poll_timer_dispatch`), a `debug_assert!(must_defer)`, then a
+/// release-active `if !must_defer { tick; return; }` fail-closed guard. S07
+/// slice66 flips the gate OPEN (`== true`) and retires that dispatch path:
+/// the guard branch (record-only) is now the whole body, and the in-IRQ
+/// dispatch + asserts are deleted, not left as dead code. Any guest edit
+/// that dispatches inside this body violates the open gate.
 ///
 /// S07 slice12: IRQ side uses the gated form (`tick_gated` under
 /// `IrqGuard::enter()` — the interrupt gate clears IF, so the `cli`
@@ -575,31 +574,9 @@ pub extern "C" fn timer_irq_rust() {
     // the gated drain. Host builds never link this symbol.
     unsafe {
         let gate = IrqGuard::enter();
-        // S07 slice35 (REVIEW #505): enforce the IRQ stack-switch gate at the
-        // IRQ site (not docs-only) — while closed this must defer, never
-        // switch stacks in IRQ context.
-        // S07 slice36 (REVIEW #510): release-active fail-closed guard —
-        // explicit `if` (enforces in release, unlike `debug_assert!`).
-        // Gate still closed, so this never fires today; if a future slice
-        // flips the const without landing record-then-defer, IRQ fails
-        // closed here (tick drained, dispatch deferred) in all profiles.
-        if !crate::sched::irq_dispatch_must_defer() {
-            (*core::ptr::addr_of_mut!(TIMER_TICKS)).tick_gated(&gate);
-            return;
-        }
-        debug_assert!(
-            crate::sched::irq_dispatch_must_defer(),
-            "IRQ stack switch forbidden while gate closed"
-        );
+        // S07 slice66 (#21 close): record-then-defer — record one tick,
+        // return; the task-context poll owns the dispatch.
         (*core::ptr::addr_of_mut!(TIMER_TICKS)).tick_gated(&gate);
-        // S07 slice30 per-tick drain: same combined drain-then-dispatch the
-        // task-context poll uses (scheduler credit + TOTAL_DRAINED
-        // accumulate + at most one backoff-capped dispatch). Holds pending
-        // near 0 by design — the `sti` wait survives via cumulative, and the
-        // post-`cli` TICK line reports the cumulative total (never the ~0
-        // task-context remainder). Dispatch result ignored in IRQ context
-        // (demo table always has a `Ready` target while unsuppressed).
-        let _ = poll_timer_dispatch(&gate);
     }
 }
 

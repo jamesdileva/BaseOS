@@ -292,10 +292,10 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 /// to `Scheduler::drain_then_dispatch_gated` so the wrapper cannot drift,
 /// slice 19 static-only over `TIMER_TICKS` + `STATIC_SCHED` so no
 /// stack-local table remains for the future live IRQ handler;
-/// S07 slice25 live helper with the IRQ-owned streak static, S07 slice30
-/// per-tick IRQ drain live (`timer_irq_rust` drains via the same helper;
-/// task-context remainder ~0, TICK reports the gated cumulative total),
-/// emit
+/// S07 slice25 live helper with the IRQ-owned streak static, S07 slice66
+/// record-then-defer flip live (`timer_irq_rust` records one tick and
+/// returns with no in-IRQ dispatch; the task-context batch below carries the
+/// full wait window, TICK reports the gated cumulative total), emit
 /// `TICK ok=1 ticks=<n>`, then volatile-read [`PF_PROBE_ADDR`] (unmapped
 /// guard → not-present `#PF`).
 /// The `#PF` gate jumps to [`exception_handler_pf_rust`], which emits
@@ -343,12 +343,16 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         // helper): `hlt` until `QUANTUM_TICKS + 1` total ticks are observed
         // (one full quantum plus one, so the task-context live drain expires
         // and owes exactly one resched). Cumulative (`pending + drained_total`)
-        // instead of pending-only: a future per-tick IRQ-handler drain would
-        // hold `pending` at 0 and a pending-only wait would never fire. The
+        // instead of pending-only (S07 slice28; S07 slice66: IRQ records
+        // without draining, so pending carries the window until the task
+        // batch moves it to drained_total — either order sums the same). The
         // target check routes through `timer::cumulative_wait_ready` (`>=`,
         // never `==`): the storm fallback is non-monotonic by construction
         // (REVIEW #501 risk 2), so exact equality could miss its wakeup after
-        // a step-back. Const-driven: a quantum change moves the target; the
+        // a step-back. Cumulative (not pending-only) since S07 slice28; S07
+        // slice66 keeps it: IRQ records without draining, so pending carries
+        // the window and drained_total carries the task batch — the sum is
+        // the proof either way. Const-driven: a quantum change moves the target; the
         // ps1 `ticks=[1-9]` gate accepts any positive count.
         let wait_target = crate::sched::QUANTUM_TICKS + 1;
         let mut spins = 0u32;
@@ -376,12 +380,11 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         // pre-dispatch current before the pick, so the backlog can never
         // misattribute to the new current). Dispatch result ignored: the
         // demo table always has a Ready target when expiry fires.
-        // S07 slice30 per-tick IRQ drain: `timer_irq_rust` already drains
-        // every tick via this same helper, so this task-context remainder is
-        // ~0 by design — the proof line reports the CUMULATIVE total via the
-        // gated snapshot (pending + drained_total under `cli` + gate), never
-        // the drained-only remainder (which would print ok=0 while the
-        // cumulative wait correctly fired — REVIEW #495 tail 1). This also
+        // S07 slice66 record-then-defer flip: `timer_irq_rust` records one
+        // tick per IRQ and returns (no in-IRQ drain), so this task-context
+        // batch carries the full wait window — the proof line reports the
+        // CUMULATIVE total via the gated snapshot (pending + drained_total
+        // under `cli` + gate), never the drained-only remainder. This also
         // wires `cumulative_snapshot_gated` into the guest proof (REVIEW
         // #495 tail 3: the gated path is the one used under `cli`).
         let (_drained, _dispatched) = timer::poll_timer_dispatch(&gate);

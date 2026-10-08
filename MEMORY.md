@@ -3,8 +3,8 @@
 Review before each work segment. Keep ≤20 lines, compact.
 
 - Goal: perf-first x86-64 UEFI desktop OS, Rust-first; docs in repo root.
-- Now: S07 #21 active per #79. Slice52 R3-host adds cpu fenced TSC (lfence;rdtsc;lfence), saturating tsc_delta, empty-pair floor, 128 warm-ups; guest sampling unwired. Slice51 R2 static SWITCH_LATENCIES outside thread stacks. Slice46 host pick n=4 RR 33/37/47 priority 54/70/110; n=16 RR 202/219/363 priority 239/247/315 ns/op; host-only.
-- Verification: 250 workspace tests passed, 1 ignored; fmt, kernel clippy, UEFI clippy/build green; no guest edit so no QEMU this host-only slice. Next #21: R3 guest sampling + C2 TCG/WHPX + C3 starvation->DEFECT, then record-then-defer IRQ gate flip. Peer #539 approved slice50; empty-reduce terminal test remains nonblocking.
+- Now: S07 #21 flip landed, pending b-side re-verify. Slice66 opens the IRQ gate (record-then-defer live: IRQ tick-only, task-context owns the drain+dispatch) + asserts STARVATION_RR_BOUNDED (closes REVIEW #572 weakness). Slice65 C3 pin, slice64 WHPX n=3 holds.
+- Verification: 254 workspace tests passed, 1 ignored; fmt, kernel clippy, UEFI clippy/build green; QEMU TCG x2 UEFI BOOT PASS (2022B serial, guest 166400B = slice59 baseline), TICK ticks=5 + SCHED-TICK q=4 + SWITCH-LAT count=16 on both; gate-test 41/41.
 - Board: S06 #9/#16/#17/#19 done; S07 #20 done, #21 active; resume per #79/#80.
 - Conventions: STRUCTURAL_FAIL = usize::MAX; ASCII .ps1; raw EFI;
   ST+96/BS+56/64/232/320 efiapi; 16KiB map+slack 4096; serial hard-req

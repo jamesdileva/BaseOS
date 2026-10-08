@@ -179,27 +179,25 @@ pub const fn live_backoff_next(consecutive_failures: u64, failed: bool) -> u64 {
 /// ticks (drain always runs), so suppression is a bounded probe throttle.
 pub const STARVATION_RR_BOUNDED: bool = true;
 
-/// IRQ stack-switch gate (S07 slice34, REVIEW #501 risk 1 pin).
+/// IRQ stack-switch gate (S07 slice34, REVIEW #501 risk 1 pin;
+/// S07 slice66 flip, #21 close).
 ///
-/// `false` while IRQ-context dispatch is metadata-only (Ready<->Running
-/// state flips + quantum rearm, no RSP/register switch). `timer_irq_rust`
-/// dispatches via `drain_then_dispatch_live_gated` and IGNORES the result
-/// (`let _ =`) — safe only while this is `false`: the ignored `Ok(next)`
-/// is a deferred-resched request, never an immediate stack switch. The
-/// slice that lands a real RSP switch MUST flip this to `true` AND convert
-/// the IRQ path to record-then-defer (no in-IRQ switch); any guest edit
-/// that switches stacks while this is `false` violates the gate. Pure
-/// `core`-only so host tests pin it.
-pub const IRQ_STACK_SWITCH_PERMITTED: bool = false;
+/// `true` now that IRQ-context dispatch is record-then-defer (no in-IRQ
+/// dispatch at all): `timer_irq_rust` records one tick and returns, and the
+/// task-context `poll_timer_dispatch` owns the single drain-then-dispatch.
+/// The ignored-`Ok(next)` metadata-only era (gate `false`, dispatch in IRQ)
+/// is history — any guest edit that dispatches inside `timer_irq_rust`
+/// violates the gate. Pure `core`-only so host tests pin it.
+pub const IRQ_STACK_SWITCH_PERMITTED: bool = true;
 
-/// IRQ-gate enforcement helper (S07 slice35, REVIEW #505 enforcement).
+/// IRQ-gate enforcement helper (S07 slice35, REVIEW #505 enforcement;
+/// S07 slice66: gate open, helper `false`).
 ///
-/// `true` while IRQ-context dispatch must defer (`!IRQ_STACK_SWITCH_PERMITTED`).
-/// Pure `core`-only so host tests pin it; the guest `timer_irq_rust` IRQ path
-/// `debug_assert!`s this (code reference to the gate, not docs-only), so a
-/// future real-switch slice that flips the const without converting the IRQ
-/// path to record-then-defer fails the IRQ debug build instead of silently
-/// switching stacks in IRQ context.
+/// `false` now that IRQ-context dispatch defers by construction
+/// (`IRQ_STACK_SWITCH_PERMITTED == true`). The guest `timer_irq_rust` IRQ
+/// path no longer dispatches in IRQ context at all (record one tick, return;
+/// task-context `poll_timer_dispatch` owns the dispatch), so there is no
+/// in-IRQ switch to guard. Pure `core`-only so host tests pin it.
 #[must_use]
 pub const fn irq_dispatch_must_defer() -> bool {
     !IRQ_STACK_SWITCH_PERMITTED
@@ -982,13 +980,13 @@ pub(crate) unsafe fn sched_poll_static(
     (&mut *core::ptr::addr_of_mut!(STATIC_SCHED)).drain_then_dispatch_gated(ticks, gate)
 }
 
-/// Guest-only static LIVE poll (S08 slice25; S07 slice30 per-tick IRQ live):
-/// drain `ticks` into `STATIC_SCHED` via
+/// Guest-only static LIVE poll (S08 slice25; S07 slice66 record-then-defer:
+/// sole call site is the task-context remainder in
+/// `bring_up_cpu_and_prove_exception` — `timer_irq_rust` records one tick
+/// and returns, never polls): drain `ticks` into `STATIC_SCHED` via
 /// [`Scheduler::drain_then_dispatch_live_gated`] with the IRQ-owned
-/// `STATIC_STREAK` (3-on-1-off throttle, auto-recovery probe). Called
-/// per-tick from `timer_irq_rust` (IRQ context) plus the task-context
-/// remainder in `bring_up_cpu_and_prove_exception`; QEMU TICK re-run owed
-/// per REVIEW #497.
+/// `STATIC_STREAK` (3-on-1-off throttle, auto-recovery probe). QEMU TICK
+/// re-run owed per REVIEW #497 (slice66 flip re-proves it).
 ///
 /// Slice-24 parity makes this behavior-neutral on the demo table: while
 /// unsuppressed the live helper agrees exactly with the task helper (same
@@ -2480,6 +2478,9 @@ mod tests {
         // S07 slice65 — C3 starvation classification (#21): one test, three
         // classes. RR bounded, priority unbounded DEFECT, backoff bounded
         // deferral with ticks never lost.
+        // S07 slice66 (REVIEW #572 weakness): assert the RR-bounded const
+        // itself (doc-only before) so a classification drift trips this pin.
+        assert!(core::hint::black_box(super::STARVATION_RR_BOUNDED));
         // RR: 3 Ready threads, 300 dispatches -> each runs ~100, spread <= 1.
         let mut r = Scheduler::new(1);
         assert!(r.spawn(mk(1, 0x1000_0000)));
@@ -3117,54 +3118,55 @@ mod tests {
 
     #[test]
     fn irq_dispatch_result_is_deferred_never_stack_switch() {
-        // S07 slice34 (REVIEW #501 risk 1 pin): IRQ-context dispatch is
-        // metadata-only while `IRQ_STACK_SWITCH_PERMITTED == false`. The
-        // `timer_irq_rust` path ignores the dispatch `Ok(next)` — that
-        // ignore is a deferral, never an immediate RSP switch. Pin both
-        // halves: the gate stays closed, and the gated dispatch on the demo
-        // table mutates only state/current/quantum (no stack primitive to
-        // call — there is none in-tree, so this test pins the observable
-        // metadata shape the IRQ path defers). `black_box` keeps the gate
-        // assert runtime so `clippy -D warnings`
+        // S07 slice34 (REVIEW #501 risk 1 pin); S07 slice66 flip (#21 close):
+        // gate OPEN — IRQ records one tick and returns with no in-IRQ
+        // dispatch at all, and the task-context poll owns the single
+        // drain-then-dispatch. Pin both halves: the gate reads permitted,
+        // and the gated dispatch on the demo table (the shape the
+        // task-context poll runs) mutates only state/current/quantum (no
+        // stack primitive to call — there is none in-tree, so this test pins
+        // the observable metadata shape the deferred poll produces).
+        // `black_box` keeps the gate assert runtime so `clippy -D warnings`
         // (`assertions_on_constants`) stays clean.
-        assert!(!core::hint::black_box(IRQ_STACK_SWITCH_PERMITTED));
+        assert!(core::hint::black_box(IRQ_STACK_SWITCH_PERMITTED));
         let gate = unsafe { IrqGuard::enter() };
         let mut s = Scheduler::demo_armed_scheduler(&gate);
         assert_eq!(s.current(), 2);
         let next = s.dispatch_gated(&gate).expect("demo table always Ready");
-        assert!(!core::hint::black_box(IRQ_STACK_SWITCH_PERMITTED));
+        assert!(core::hint::black_box(IRQ_STACK_SWITCH_PERMITTED));
         assert_eq!(next, s.current());
         assert_eq!(s.quantum_left(), QUANTUM_TICKS);
     }
 
     #[test]
     fn irq_gate_enforcement_helper_defers_while_closed() {
-        // S07 slice35 (REVIEW #505): the IRQ path references the gate in code
-        // (`debug_assert!(irq_dispatch_must_defer())` in `timer_irq_rust`),
-        // not docs-only. Pin the helper the IRQ site calls: true while the
-        // gate is closed. `black_box` keeps `clippy -D warnings`
-        // (`assertions_on_constants`) clean, same as the slice34 pin.
-        assert!(core::hint::black_box(super::irq_dispatch_must_defer()));
-        assert!(!core::hint::black_box(super::IRQ_STACK_SWITCH_PERMITTED));
+        // S07 slice35 (REVIEW #505); S07 slice66 flip (#21 close): the gate
+        // is OPEN, so the helper reads `false` — IRQ defers by construction
+        // (record one tick, return; no in-IRQ dispatch to guard). Pin the
+        // helper the old IRQ site called plus the open gate, both via
+        // `black_box` so `clippy -D warnings` (`assertions_on_constants`)
+        // stays clean. (Name kept as history: pre-flip it pinned true.)
+        assert!(!core::hint::black_box(super::irq_dispatch_must_defer()));
+        assert!(core::hint::black_box(super::IRQ_STACK_SWITCH_PERMITTED));
     }
 
     #[test]
     fn irq_gate_fail_closed_release_refuses_switch() {
-        // S07 slice36 (REVIEW #510): release-active disconfirm — explicit
-        // `if` branches (enforce in release, unlike `debug_assert!`), so
-        // this test proves the IRQ path refuses a stack switch with the
-        // gate closed in every profile. Mirrors the `if
-        // !irq_dispatch_must_defer() { tick; return; }` fail-closed guard
-        // at the top of guest `timer_irq_rust`. Branches panic instead of
-        // returning bool literals so `clippy -D warnings`
+        // S07 slice36 (REVIEW #510); S07 slice66 flip (#21 close): the
+        // release-active guard shape is retired — the gate is OPEN and the
+        // IRQ path is record-then-defer by construction (tick + return, no
+        // dispatch branch at all), so there is no closed-gate branch left to
+        // refuse. This test pins the open state in every profile instead:
+        // permitted reads true, must-defer reads false. Branches panic
+        // instead of returning bool literals so `clippy -D warnings`
         // (`needless_bool`) stays clean.
-        if core::hint::black_box(super::irq_dispatch_must_defer()) {
-            // Gate closed: IRQ must defer — expected today.
-        } else {
-            panic!("IRQ gate open without record-then-defer");
-        }
         if core::hint::black_box(super::IRQ_STACK_SWITCH_PERMITTED) {
-            panic!("IRQ stack switch permitted while gate must stay closed");
+            // Gate open: IRQ record-then-defer live — expected today.
+        } else {
+            panic!("IRQ gate closed after record-then-defer flip");
+        }
+        if core::hint::black_box(super::irq_dispatch_must_defer()) {
+            panic!("IRQ must-defer helper true while gate open");
         }
     }
 
