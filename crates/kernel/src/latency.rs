@@ -217,4 +217,58 @@ mod tests {
         assert_eq!(r.max, SAMPLE_CAP as u64 - 1);
         assert_eq!(r.dropped, 2);
     }
+
+    #[test]
+    fn reduce_ordering_min_med_p99_max_holds() {
+        // S07 slice60 (#21 R3 relation half): reduce sorts the recorded
+        // prefix, so min <= median <= p99 <= max holds by construction on
+        // every non-empty population (debug and release: pure sort + index,
+        // no profile-dependent path). Floor (empty-pair overhead subtracted
+        // saturating before record) is NOT part of this invariant: a
+        // sub-floor sample records 0, so a floor-limited population has
+        // min=0 below any nonzero floor by design (see slice54 contract).
+        // Pin both the invariant and the documented exception.
+        fn assert_ordered(fill: &[u64]) {
+            let mut s = LatencySamples::new();
+            for &v in fill {
+                assert!(s.record(v));
+            }
+            let r = s.reduce().unwrap();
+            assert!(
+                r.min <= r.median && r.median <= r.p99 && r.p99 <= r.max,
+                "ordering must hold: {r:?}"
+            );
+        }
+        assert_ordered(&[42]);
+        assert_ordered(&[0]);
+        let ramp: Vec<u64> = (0..16).map(|i| 900 + i * 10).collect();
+        assert_ordered(&ramp);
+        let mut outliers = [100u64; 1000];
+        outliers[999] = 10_000;
+        assert_ordered(&outliers);
+        let ascending: Vec<u64> = (1..=1000).collect();
+        assert_ordered(&ascending);
+        // Floor-limited exception: nonzero floor with an all-sub-floor
+        // population reduces to min=0, i.e. min < floor is representable.
+        let floor: u64 = 123;
+        let mut floored = LatencySamples::new();
+        assert!(floored.record(50u64.saturating_sub(floor)));
+        let r = floored.reduce().unwrap();
+        assert_eq!(r.min, 0);
+        assert!(r.min < floor, "0-floored min sits below floor by design");
+        // Non-floor-limited synthetic N=16 ramp: floor <= min <= med and
+        // p99 >= med hold empirically (mirrors slice58 TCG
+        // floor=17568 min=145800 med=146988 p99=227772 shape).
+        let floor: u64 = 100;
+        let mut samples = LatencySamples::new();
+        for i in 0..16u64 {
+            assert!(samples.record((1000 + i * 10).saturating_sub(floor)));
+        }
+        let r = samples.reduce().unwrap();
+        assert!(
+            floor <= r.min && r.min <= r.median,
+            "floor<=min<=med: {r:?}"
+        );
+        assert!(r.p99 >= r.median, "p99>=med: {r:?}");
+    }
 }
