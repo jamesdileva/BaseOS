@@ -311,6 +311,25 @@ pub unsafe fn read_efer() -> u64 {
     (u64::from(hi) << 32) | u64::from(lo)
 }
 
+/// Live `RSP` read (S07 slice68, #21 nit 3 RSP-switch proof).
+///
+/// Unprivileged `mov {}, rsp` — safe on all builds, so host `cargo test`
+/// calls it too (the value is the harness stack there; only the
+/// nonzero/nesting shape is asserted). The guest IRQ body records its inner
+/// `RSP` while switched to the dedicated IRQ stack and the task-context
+/// proof line reports both `RSP`s, so QEMU serial proves the tick ran on
+/// the IRQ stack while dispatch stayed on the task stack.
+#[inline(always)]
+#[must_use]
+pub fn read_rsp() -> u64 {
+    let value: u64;
+    // SAFETY: pure register read, no privilege requirement; never writes.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
 /// TSC warm-up iterations before a latency run (S07 slice52, #21 R3).
 ///
 /// Warms the branch predictor / i-cache on the `lfence; rdtsc` path so the
@@ -624,6 +643,29 @@ mod tests {
         let sti_fn: unsafe fn() = sti;
         let _ = sti_fn;
         unsafe { sti() };
+    }
+
+    #[test]
+    fn read_rsp_is_nonzero_and_nests_down() {
+        // S07 slice68 (#21 nit 3): `read_rsp` is a safe `fn` (bind proves
+        // no `unsafe` block needed at call sites), nonzero on a live
+        // stack, and a nested call observes a LOWER address (x86-64
+        // stacks grow down) — the shape the guest IRQ/task proof relies
+        // on (`irq != task`).
+        let rsp_fn: fn() -> u64 = read_rsp;
+        let _ = rsp_fn;
+        #[inline(never)]
+        fn inner() -> u64 {
+            read_rsp()
+        }
+        let outer = read_rsp();
+        let inner_rsp = inner();
+        assert_ne!(outer, 0);
+        assert_ne!(inner_rsp, 0);
+        assert!(
+            inner_rsp < outer,
+            "nested frame must sit below the caller: inner={inner_rsp:#x} outer={outer:#x}"
+        );
     }
 
     #[test]

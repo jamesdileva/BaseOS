@@ -317,7 +317,9 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 /// later `#PF`/`#DE` park cannot interleave the proof lines.
 /// The `TICK` line shape is unchanged (`ok=<0|1> ticks=<n>`, S07 slice30: `n`
 /// is the gated cumulative total), so the e2e `ticks=[1-9]` hard-require is
-/// untouched.
+/// untouched. S07 slice68 adds the `IRQSTACK ok=1 task=<0x...> irq=<0x...>`
+/// two-stack proof after it (task `RSP` vs IRQ-inner capture on the
+/// dedicated stack; hard-required by e2e).
 ///
 /// # Safety
 /// Must run post-`ExitBootServices` on the boot CPU with interrupts
@@ -390,6 +392,26 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         let (_drained, _dispatched) = timer::poll_timer_dispatch(&gate);
         let total = timer::cumulative_snapshot_gated(&gate);
         write_tick_line(total > 0, total);
+    }
+    // S07 slice68 (nit 3 RSP-switch proof): two-stack line — task-context
+    // `RSP` vs the last IRQ0 inner capture (recorded while running on the
+    // dedicated IRQ stack). `cli` in effect on both arms (the `sti` arm
+    // re-masked before the drain; the fail-closed arm never executed `sti`),
+    // so the snapshot is exact. `ok=1` proves the tick ran on the IRQ stack
+    // while dispatch stayed on the task stack (record-then-defer, #21).
+    {
+        let task_rsp = cpu::read_rsp();
+        // SAFETY: post-EBS guest, `cli` in effect (see above);
+        // single-threaded boot owns both statics.
+        let (base, inner) = unsafe { timer::irq_stack_snapshot() };
+        let top = timer::irq_stack_top_for(base);
+        let ok = inner != 0
+            && timer::irq_stack_contains(base, inner)
+            && inner != task_rsp
+            && !timer::irq_stack_contains(base, task_rsp)
+            && base & 0xF == 0
+            && top & 0xF == 0;
+        uart::write_irqstack_line(ok, task_rsp, inner, base, timer::IRQ_STACK_LEN as u64);
     }
     // Live #PF (#168n6, sole functional open): touch the unmapped guard.
     // If either IDT gate is wrong this triple-faults and e2e fails loudly
@@ -710,9 +732,10 @@ mod tests {
         let exc: fn(bool, u64) = uart::write_exc_line;
         let pf: fn(bool, u64, u64, u64) = uart::write_pf_line;
         let tick: fn(bool, u64) = uart::write_tick_line;
+        let irqstack: fn(bool, u64, u64, u64, u64) = uart::write_irqstack_line;
         let dec: fn(u64) = uart::write_dec_u64;
         let hex: fn(u64) = uart::write_hex_u64;
-        let _ = (init, write_byte, exc, pf, tick, dec, hex);
+        let _ = (init, write_byte, exc, pf, tick, irqstack, dec, hex);
     }
 
     #[test]
@@ -731,6 +754,12 @@ mod tests {
             "write_exc_line",
             "write_pf_line",
             "write_tick_line",
+            "write_irqstack_line",
+            "read_rsp",
+            "tick_on_irq_stack",
+            "irq_stack_snapshot",
+            "IRQ_STACK",
+            "timer_irq_rust",
             "remap_pic",
             "program_pit",
             "pending_snapshot",
@@ -747,8 +776,8 @@ mod tests {
         }
         for row in [
             "| A1 |", "| A2 |", "| A3 |", "| A4 |", "| A5 |", "| A6 |", "| A7 |", "| A8 |",
-            "| A9 |", "| D1 |", "| D2 |", "| D3 |", "| D4 |", "| D5 |", "| D6 |", "| D7 |",
-            "| D8 |", "| D9 |", "| D10 |", "| D11 |",
+            "| A9 |", "| A10 |", "| D1 |", "| D2 |", "| D3 |", "| D4 |", "| D5 |", "| D6 |",
+            "| D7 |", "| D8 |", "| D9 |", "| D10 |", "| D11 |", "| D12 |",
         ] {
             assert!(DOC.contains(row), "inventory must keep row {row}");
         }

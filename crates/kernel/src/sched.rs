@@ -183,9 +183,12 @@ pub const STARVATION_RR_BOUNDED: bool = true;
 /// S07 slice66 flip, #21 close).
 ///
 /// `true` now that IRQ-context dispatch is record-then-defer (no in-IRQ
-/// dispatch at all): `timer_irq_rust` records one tick and returns, and the
+/// dispatch at all): `timer_irq_rust` switches to the dedicated 8 KiB IRQ
+/// stack, records one tick, restores the task stack, and returns, and the
 /// task-context `poll_timer_dispatch` owns the single drain-then-dispatch.
-/// The ignored-`Ok(next)` metadata-only era (gate `false`, dispatch in IRQ)
+/// S07 slice68 proves the switch live (`IRQSTACK ok=1 task=<0x...> irq=<0x...>`
+/// — inner capture inside the IRQ stack, task `RSP` outside it). The
+/// ignored-`Ok(next)` metadata-only era (gate `false`, dispatch in IRQ)
 /// is history — any guest edit that dispatches inside `timer_irq_rust`
 /// violates the gate. Pure `core`-only so host tests pin it.
 pub const IRQ_STACK_SWITCH_PERMITTED: bool = true;

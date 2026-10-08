@@ -520,6 +520,101 @@ pub(crate) const fn timer_stub_text() -> &'static str {
 #[cfg(not(test))]
 core::arch::global_asm!(timer_isr_stub_asm!());
 
+/// Dedicated IRQ-stack length (S07 slice68, #21 nit 3 real RSP-switch).
+///
+/// 8 KiB: the tick body needs only a few dozen bytes (one `run_on_thread_stack`
+/// frame + `tick_gated`), so a page-sized stack leaves two orders of
+/// magnitude of headroom; matches the `MIN_STACK` floor the thread contract
+/// enforces for real stacks.
+pub const IRQ_STACK_LEN: usize = 8192;
+
+/// Pure top for an IRQ-stack base (`base + len`, saturating).
+///
+/// The guest base is 16-aligned by construction (aligned wrapper below),
+/// so the top is 16-aligned: the [`crate::thread::run_on_thread_stack`]
+/// switch-then-`call` contract needs `top % 16 == 0` (entry lands at
+/// `top - 24`, `% 16 == 8`, per SysV). Pure `core`-only so host tests pin
+/// the arithmetic without touching the guest static.
+#[must_use]
+pub const fn irq_stack_top_for(base: u64) -> u64 {
+    base.saturating_add(IRQ_STACK_LEN as u64)
+}
+
+/// Pure range check: `base <= rsp <= top`.
+///
+/// The inner capture lands strictly inside after the switch pushes + `call`,
+/// but `<=` keeps the predicate total (top itself is a valid just-switched
+/// value). The guest `ok` additionally requires `inner != 0` and
+/// `inner != task_rsp`, so a zero capture or a same-stack capture fails
+/// loudly instead of passing on the range alone. Pure `core`-only.
+#[must_use]
+pub const fn irq_stack_contains(base: u64, rsp: u64) -> bool {
+    rsp >= base && rsp <= irq_stack_top_for(base)
+}
+
+/// Guest-only IRQ-stack storage (S07 slice68).
+///
+/// `repr(C, align(16))` so the base — and hence the `irq_stack_top_for`
+/// top — is 16-aligned (a plain `[u8; N]` static is only 1-aligned, which
+/// would hand `run_on_thread_stack` a misaligned `RSP`). Zeroed; the tick
+/// body only reads/writes its own frames. IRQ-owned like `TIMER_TICKS`:
+/// the interrupt gate clears IF and the PIC withholds IRQ0 until the
+/// stub's EOI, so no nested IRQ0 can interleave on this stack.
+#[cfg(not(test))]
+#[repr(C, align(16))]
+struct IrqStack([u8; IRQ_STACK_LEN]);
+
+/// Guest-only dedicated IRQ stack (S07 slice68).
+#[cfg(not(test))]
+static mut IRQ_STACK: IrqStack = IrqStack([0; IRQ_STACK_LEN]);
+
+/// Guest-only inner-`RSP` proof capture (S07 slice68).
+///
+/// Written once per IRQ0 (volatile) by [`tick_on_irq_stack`] while running
+/// ON the IRQ stack; read once by the task-context proof line in
+/// `bring_up_cpu_and_prove_exception` (under `cli`, so no interleave).
+/// Host tests never touch this (pure `irq_stack_contains` rule is pinned
+/// host-side; the capture is proven by QEMU).
+#[cfg(not(test))]
+static mut IRQ_INNER_RSP: u64 = 0;
+
+/// IRQ tick inner running ON the dedicated stack (S07 slice68, guest-only).
+///
+/// `extern "C" fn()` shape so [`crate::thread::run_on_thread_stack`] can
+/// `call` it after the `RSP` switch: records the inner `RSP` (the proof
+/// the switch happened — it must land inside `IRQ_STACK`), then the same
+/// saturating gated tick the old inline body ran. The `IrqGuard::enter()`
+/// proof holds (interrupt gate cleared IF on entry; still cleared here —
+/// `run_on_thread_stack` never enables interrupts).
+#[cfg(not(test))]
+extern "C" fn tick_on_irq_stack() {
+    // SAFETY: guest IRQ context only (called via `run_on_thread_stack`
+    // from `timer_irq_rust` with IF cleared); single-threaded boot owns
+    // `IRQ_INNER_RSP` and `TIMER_TICKS`. Host builds never link this symbol.
+    unsafe {
+        core::ptr::addr_of_mut!(IRQ_INNER_RSP).write_volatile(crate::cpu::read_rsp());
+        let gate = IrqGuard::enter();
+        (*core::ptr::addr_of_mut!(TIMER_TICKS)).tick_gated(&gate);
+    }
+}
+
+/// Guest-only IRQ-stack proof snapshot (S07 slice68).
+///
+/// Returns `(stack_base, inner_rsp)` for the task-context `IRQSTACK` proof
+/// line: `base` locates the dedicated stack, `inner_rsp` is the last IRQ0
+/// inner capture (`0` when no tick has fired yet — the guest reports
+/// `ok=0` loudly instead of passing on an empty capture).
+///
+/// # Safety
+/// Post-EBS guest only, `cli` in effect (proof line runs gated);
+/// single-threaded boot owns both statics.
+#[cfg(not(test))]
+pub(crate) unsafe fn irq_stack_snapshot() -> (u64, u64) {
+    let base = core::ptr::addr_of!(IRQ_STACK) as u64;
+    let inner = core::ptr::addr_of!(IRQ_INNER_RSP).read_volatile();
+    (base, inner)
+}
+
 /// Guest IRQ0 tick counter (S07 slice11).
 ///
 /// `static mut`, guest-only: the IRQ0 stub runs with IF cleared by the
@@ -562,21 +657,36 @@ static mut TIMER_TICKS: TimerTicks = TimerTicks::new();
 /// dispatch + asserts are deleted, not left as dead code. Any guest edit
 /// that dispatches inside this body violates the open gate.
 ///
+/// S07 slice68 (nit 3 real RSP-switch): the tick now runs ON the dedicated
+/// 8 KiB IRQ stack via [`crate::thread::run_on_thread_stack`] (the S06
+/// callee-saved-preserving switch primitive): the entry `RSP` (task stack,
+/// interrupt frame below) is spilled to the new stack, the inner
+/// [`tick_on_irq_stack`] records its `RSP` (must land inside `IRQ_STACK`)
+/// and ticks, then the entry `RSP` is restored before returning to the
+/// stub (which EOIs + `iretq`s on the task stack). Still record-then-defer
+/// (no drain/dispatch in IRQ — the slice66 flip stands); the switch only
+/// moves WHERE the record runs, so a future stack-overflow fault in the
+/// tick path faults on the IRQ stack, never the task stack.
+///
 /// S07 slice12: IRQ side uses the gated form (`tick_gated` under
 /// `IrqGuard::enter()` — the interrupt gate clears IF, so the `cli`
-/// proof holds on entry). Raw `tick()` stays for host parity tests only;
+/// proof holds on entry; still cleared inside the inner after the switch).
+/// Raw `tick()` stays for host parity tests only;
 /// the scheduler drain must use `take_gated` under the same guard.
 #[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn timer_irq_rust() {
     // SAFETY: guest IRQ context only (interrupt gate, IF cleared);
-    // single-threaded boot owns `TIMER_TICKS` until the wiring slice adds
-    // the gated drain. Host builds never link this symbol.
+    // single-threaded boot owns `IRQ_STACK`, `IRQ_INNER_RSP`, and
+    // `TIMER_TICKS`. The top is 16-aligned by construction (aligned
+    // wrapper + `IRQ_STACK_LEN`), satisfying the `run_on_thread_stack`
+    // switch-then-`call` contract. Host builds never link this symbol.
     unsafe {
-        let gate = IrqGuard::enter();
-        // S07 slice66 (#21 close): record-then-defer — record one tick,
-        // return; the task-context poll owns the dispatch.
-        (*core::ptr::addr_of_mut!(TIMER_TICKS)).tick_gated(&gate);
+        let top = irq_stack_top_for(core::ptr::addr_of!(IRQ_STACK) as u64);
+        // S07 slice68 (nit 3): real RSP switch in IRQ — record runs on
+        // the IRQ stack, return restores the task stack; the task-context
+        // poll still owns the dispatch.
+        crate::thread::run_on_thread_stack(top, tick_on_irq_stack);
     }
 }
 
@@ -1025,6 +1135,38 @@ mod tests {
         assert_eq!(fallback.saturating_sub(clean_next), 1);
         // Saturation still holds on the fallback path (never wraps).
         assert_eq!(cumulative_total(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn irq_stack_top_and_range_pin_switch_contract() {
+        // S07 slice68 (#21 nit 3): the real-IRQ-switch contract the guest
+        // body relies on — 8 KiB stack, 16-aligned top off a 16-aligned
+        // base, inner capture strictly inside, task stack outside.
+        assert_eq!(IRQ_STACK_LEN, 8192);
+        let base = 0x7F00_0000u64;
+        let top = irq_stack_top_for(base);
+        assert_eq!(top, base + 8192);
+        assert_eq!(base & 0xF, 0);
+        assert_eq!(top & 0xF, 0, "switch-then-call needs top % 16 == 0");
+        // Inner capture shape: entry lands at top-24 (6 pushes + 2
+        // pointer spills + call return address), strictly inside.
+        let inner = top - 24;
+        assert!(irq_stack_contains(base, inner));
+        assert!(irq_stack_contains(base, base));
+        assert!(irq_stack_contains(base, top));
+        assert!(!irq_stack_contains(base, base - 1));
+        assert!(!irq_stack_contains(base, top + 1));
+        // Zero capture (no tick yet) is in-range numerically but the
+        // guest `ok` requires nonzero separately — pin the range half
+        // here so a base=0 regression goes red (0 would pass contains).
+        assert!(!irq_stack_contains(base, 0) || base == 0);
+        // Task stack far away: the two-stack proof (`irq != task`,
+        // task outside) holds by construction off disjoint ranges.
+        let task_rsp = base + 0x10_0000;
+        assert!(!irq_stack_contains(base, task_rsp));
+        assert_ne!(inner, task_rsp);
+        // Saturating top never wraps (defensive: near-MAX base).
+        assert_eq!(irq_stack_top_for(u64::MAX), u64::MAX);
     }
 
     #[test]

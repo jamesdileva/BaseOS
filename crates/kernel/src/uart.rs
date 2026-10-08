@@ -167,6 +167,43 @@ pub(crate) fn write_tick_line(ok: bool, ticks: u64) {
     com1_write_byte(b'\n');
 }
 
+/// Emit `IRQSTACK ok=<0|1> task=<0x...> irq=<0x...> base=<0x...> size=<n>\n`
+/// directly on COM1 (S07 slice68, #21 nit 3 RSP-switch proof).
+///
+/// `task` is the task-context `RSP` (bring-up, gated), `irq` the last
+/// IRQ0 inner capture (running on the dedicated IRQ stack), `base`/`size`
+/// locate that stack. `ok` is computed by the caller: inner nonzero,
+/// inside `[base, base+size]`, 16-aligned endpoints, and `irq != task`
+/// with `task` outside the range (two-stack proof). Fail-loud by shape:
+/// the e2e gate requires the `ok=1` + both hex fields on one line.
+///
+/// Safe wrapper: only calls [`com1_write_byte`] plus the safe decimal/hex
+/// helpers. Requires COM1 initialized; single-threaded bring-up context
+/// owns the UART exclusively.
+pub(crate) fn write_irqstack_line(ok: bool, task_rsp: u64, irq_rsp: u64, base: u64, size: u64) {
+    for b in b"IRQSTACK ok=" {
+        com1_write_byte(*b);
+    }
+    com1_write_byte(if ok { b'1' } else { b'0' });
+    for b in b" task=" {
+        com1_write_byte(*b);
+    }
+    write_hex_u64(task_rsp);
+    for b in b" irq=" {
+        com1_write_byte(*b);
+    }
+    write_hex_u64(irq_rsp);
+    for b in b" base=" {
+        com1_write_byte(*b);
+    }
+    write_hex_u64(base);
+    for b in b" size=" {
+        com1_write_byte(*b);
+    }
+    write_dec_u64(size);
+    com1_write_byte(b'\n');
+}
+
 /// Emit `PF ok=<0|1> vector=<n> code=<0x...> addr=<0x...>\n` directly on
 /// COM1 (interrupt context cannot use the caller-supplied sink).
 ///
