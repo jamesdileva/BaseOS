@@ -285,5 +285,41 @@ mod tests {
             !r.p99_valid,
             "synthetic N=16 p99 unpublishable (n < MIN_SAMPLES_FOR_P99): {r:?}"
         );
+        // Near-floor scale (REVIEW #560 R1): floor comparable to raw, so
+        // floor<=min does NOT hold (min = raw-floor << floor when raw only
+        // just clears the overhead). Pin the scale-appropriate contract
+        // instead: ordering + saturating-sub endpoints + !p99_valid, with
+        // sub-floor raws flooring to 0 (min < floor by design, slice54).
+        {
+            let floor: u64 = 950;
+            let raws: Vec<u64> = (0..16u64).map(|i| 900 + i * 10).collect();
+            let mut samples = LatencySamples::new();
+            for &raw in &raws {
+                assert!(samples.record(raw.saturating_sub(floor)));
+            }
+            let r = samples.reduce().unwrap();
+            assert_eq!(
+                r.min,
+                raws.iter().min().unwrap().saturating_sub(floor),
+                "near-floor min is min-raw minus floor: {r:?}"
+            );
+            assert_eq!(
+                r.max,
+                raws.iter().max().unwrap().saturating_sub(floor),
+                "near-floor max is max-raw minus floor: {r:?}"
+            );
+            assert!(
+                r.min <= r.median && r.median <= r.p99 && r.p99 <= r.max,
+                "near-floor ordering must hold: {r:?}"
+            );
+            assert!(
+                r.min < floor,
+                "near-floor min sits below floor by design: {r:?}"
+            );
+            assert!(
+                !r.p99_valid,
+                "near-floor N=16 p99 unpublishable (n < MIN_SAMPLES_FOR_P99): {r:?}"
+            );
+        }
     }
 }
