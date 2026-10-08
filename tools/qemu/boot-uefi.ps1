@@ -13,11 +13,13 @@
 #>
 param(
   [int]$TimeoutSec = 20,
-  [string]$LogDir = "target"
+  [string]$LogDir = "target",
+  [ValidateSet("tcg","whpx")][string]$Accel = "tcg"
 )
 $ErrorActionPreference = "Stop"
 
-Write-Output "=== BaseOS UEFI guest boot (S07 slice14: timer IRQ0 first-tick) ==="
+Write-Output "=== BaseOS UEFI guest boot (S07 slice63: C2 emulator compare, accel=$Accel) ==="
+Write-Output "Accelerator: $Accel (SWITCH-LAT cycles are emulator-relative, C2; TCG default, WHPX opt-in)"
 
 # --- 1. Build the guest (debug; .efi artifact, never committed) ---
 cargo build -p baseos-boot-uefi --target x86_64-unknown-uefi
@@ -102,6 +104,7 @@ $varsQemu = $varsFd -replace "\\", "/"
 $serialQemu = $serialLog -replace "\\", "/"
 $qemuArgs = @(
   "-display", "none",
+  "-accel", $Accel,
   "-m", "256",
   "-drive", ("if=pflash,format=raw,unit=0,file=" + $ovmfQemu + ",readonly=on"),
   "-drive", ("if=pflash,format=raw,unit=1,file=" + $varsQemu),
