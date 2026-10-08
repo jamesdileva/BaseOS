@@ -896,16 +896,32 @@ fn storage_disjoint(storage: usize, size: usize, stacks: &[usize; 3], stack_size
     })
 }
 
+/// Slice51 invariant extended by slice56 (REVIEW #550 R1): the
+/// `SWITCH_LATENCIES` population AND the `SWITCH_LAST_FLOOR` / `SWITCH_LAST_RAW`
+/// context statics all live off the three thread stacks. Each static is
+/// checked disjoint from every stack via [`storage_disjoint`].
 fn switch_latency_storage_disjoint() -> bool {
+    let stacks = [
+        core::ptr::addr_of!(THREAD_STACK_A) as usize,
+        core::ptr::addr_of!(THREAD_STACK_B) as usize,
+        core::ptr::addr_of!(THREAD_STACK_C) as usize,
+    ];
+    let stack_size = core::mem::size_of::<AlignedStack>();
     storage_disjoint(
         core::ptr::addr_of!(SWITCH_LATENCIES) as usize,
         core::mem::size_of::<LatencySamples>(),
-        &[
-            core::ptr::addr_of!(THREAD_STACK_A) as usize,
-            core::ptr::addr_of!(THREAD_STACK_B) as usize,
-            core::ptr::addr_of!(THREAD_STACK_C) as usize,
-        ],
-        core::mem::size_of::<AlignedStack>(),
+        &stacks,
+        stack_size,
+    ) && storage_disjoint(
+        core::ptr::addr_of!(SWITCH_LAST_FLOOR) as usize,
+        core::mem::size_of::<u64>(),
+        &stacks,
+        stack_size,
+    ) && storage_disjoint(
+        core::ptr::addr_of!(SWITCH_LAST_RAW) as usize,
+        core::mem::size_of::<u64>(),
+        &stacks,
+        stack_size,
     )
 }
 
@@ -1468,6 +1484,11 @@ unsafe fn probe_sched_switch<E>(emit: &mut impl FnMut(u8) -> Result<(), E>) -> R
     let end = read_tsc_fenced();
     let raw = tsc_delta(start, end);
     let sample = switch_sample_delta(start, end, floor);
+    // S07 slice56 (REVIEW #550 R2 guest half): pin the display relation at
+    // the source — the stashed floor/raw must satisfy raw-floor == sample.
+    // Debug-only so release/TGC timing is untouched; a drift would mean the
+    // SWITCH-LAT suffix no longer explains min.
+    debug_assert_eq!(raw.saturating_sub(floor), sample);
     let _ = (&mut *core::ptr::addr_of_mut!(SWITCH_LATENCIES)).record(sample);
     // S07 slice55 (#21 R3 floor-visibility half): stash same-boot context
     // for the SWITCH-LAT floor=/raw= suffix (best-effort, never flips ok).
@@ -2859,6 +2880,27 @@ mod tests {
     #[test]
     fn switch_latency_buffer_is_separate_from_all_thread_stacks() {
         assert!(switch_latency_storage_disjoint());
+        // S07 slice56 (REVIEW #550 R1): the floor/raw context statics are
+        // covered by the helper above; pin them individually too so a future
+        // helper edit cannot silently drop them.
+        let stacks = [
+            core::ptr::addr_of!(THREAD_STACK_A) as usize,
+            core::ptr::addr_of!(THREAD_STACK_B) as usize,
+            core::ptr::addr_of!(THREAD_STACK_C) as usize,
+        ];
+        let stack_size = core::mem::size_of::<AlignedStack>();
+        assert!(storage_disjoint(
+            core::ptr::addr_of!(SWITCH_LAST_FLOOR) as usize,
+            core::mem::size_of::<u64>(),
+            &stacks,
+            stack_size
+        ));
+        assert!(storage_disjoint(
+            core::ptr::addr_of!(SWITCH_LAST_RAW) as usize,
+            core::mem::size_of::<u64>(),
+            &stacks,
+            stack_size
+        ));
         assert!(storage_disjoint(
             0x3000,
             0x1000,
@@ -3834,6 +3876,34 @@ mod tests {
         );
         assert!(one.is_reduced());
         assert!(!one.record(99), "terminal: no records after reduce");
+        // S07 slice56 (REVIEW #550 R2 host half): floor/raw are not free
+        // display fields — raw saturating-sub floor == recorded sample. QEMU
+        // TCG run pinned raw=371088 floor=27072 min=344016 (371088-27072).
+        let floor: u64 = 27072;
+        let raw: u64 = 371088;
+        let sample = raw.saturating_sub(floor);
+        assert_eq!(sample, 344016);
+        assert_eq!(
+            sample,
+            baseos_kernel::cpu::switch_sample_delta(0, raw, floor)
+        );
+        let mut rel = LatencySamples::new();
+        assert!(rel.record(sample));
+        let mut out: Vec<u8> = Vec::new();
+        assert!(report_switch_latencies::<core::convert::Infallible>(
+            &mut rel,
+            floor,
+            raw,
+            &mut |b| {
+                out.push(b);
+                Ok(())
+            }
+        )
+        .unwrap());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "SWITCH-LAT ok=1 count=1 min=344016 med=344016 p99=344016 max=344016 valid=0 dropped=0 floor=27072 raw=371088\n"
+        );
     }
 
     #[test]
