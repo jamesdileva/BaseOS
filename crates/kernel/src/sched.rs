@@ -190,19 +190,6 @@ pub const STARVATION_RR_BOUNDED: bool = true;
 /// violates the gate. Pure `core`-only so host tests pin it.
 pub const IRQ_STACK_SWITCH_PERMITTED: bool = true;
 
-/// IRQ-gate enforcement helper (S07 slice35, REVIEW #505 enforcement;
-/// S07 slice66: gate open, helper `false`).
-///
-/// `false` now that IRQ-context dispatch defers by construction
-/// (`IRQ_STACK_SWITCH_PERMITTED == true`). The guest `timer_irq_rust` IRQ
-/// path no longer dispatches in IRQ context at all (record one tick, return;
-/// task-context `poll_timer_dispatch` owns the dispatch), so there is no
-/// in-IRQ switch to guard. Pure `core`-only so host tests pin it.
-#[must_use]
-pub const fn irq_dispatch_must_defer() -> bool {
-    !IRQ_STACK_SWITCH_PERMITTED
-}
-
 impl Scheduler {
     /// New empty scheduler with `current` preset (usually the boot thread
     /// id, or `NULL_THREAD` when no thread runs yet). `current` is NOT
@@ -3139,34 +3126,32 @@ mod tests {
     }
 
     #[test]
-    fn irq_gate_enforcement_helper_defers_while_closed() {
-        // S07 slice35 (REVIEW #505); S07 slice66 flip (#21 close): the gate
-        // is OPEN, so the helper reads `false` — IRQ defers by construction
-        // (record one tick, return; no in-IRQ dispatch to guard). Pin the
-        // helper the old IRQ site called plus the open gate, both via
-        // `black_box` so `clippy -D warnings` (`assertions_on_constants`)
-        // stays clean. (Name kept as history: pre-flip it pinned true.)
-        assert!(!core::hint::black_box(super::irq_dispatch_must_defer()));
+    fn irq_gate_open_permits_task_context_dispatch() {
+        // S07 slice35 (REVIEW #505); S07 slice66 flip (#21 close); S07
+        // slice67 (REVIEW #574 nit 1+2): the `irq_dispatch_must_defer`
+        // helper is retired (always-false, dead in guest) — the gate is
+        // OPEN and IRQ defers by construction (record one tick, return; no
+        // in-IRQ dispatch to guard). Pin the open gate via `black_box` so
+        // `clippy -D warnings` (`assertions_on_constants`) stays clean.
+        // (Renamed from `..._defers_while_closed`: pre-flip it pinned true.)
         assert!(core::hint::black_box(super::IRQ_STACK_SWITCH_PERMITTED));
     }
 
     #[test]
-    fn irq_gate_fail_closed_release_refuses_switch() {
-        // S07 slice36 (REVIEW #510); S07 slice66 flip (#21 close): the
-        // release-active guard shape is retired — the gate is OPEN and the
-        // IRQ path is record-then-defer by construction (tick + return, no
-        // dispatch branch at all), so there is no closed-gate branch left to
-        // refuse. This test pins the open state in every profile instead:
-        // permitted reads true, must-defer reads false. Branches panic
-        // instead of returning bool literals so `clippy -D warnings`
-        // (`needless_bool`) stays clean.
+    fn irq_gate_open_has_no_closed_branch() {
+        // S07 slice36 (REVIEW #510); S07 slice66 flip (#21 close); S07
+        // slice67 (REVIEW #574 nit 1+2): the release-active guard shape is
+        // retired — the gate is OPEN and the IRQ path is record-then-defer
+        // by construction (tick + return, no dispatch branch at all), so
+        // there is no closed-gate branch left to refuse. The old
+        // `must-defer` helper is deleted; this test pins the open state in
+        // every profile instead. Branch panics instead of returning a bool
+        // literal so `clippy -D warnings` (`needless_bool`) stays clean.
+        // (Renamed from `irq_gate_fail_closed_release_refuses_switch`.)
         if core::hint::black_box(super::IRQ_STACK_SWITCH_PERMITTED) {
             // Gate open: IRQ record-then-defer live — expected today.
         } else {
             panic!("IRQ gate closed after record-then-defer flip");
-        }
-        if core::hint::black_box(super::irq_dispatch_must_defer()) {
-            panic!("IRQ must-defer helper true while gate open");
         }
     }
 
