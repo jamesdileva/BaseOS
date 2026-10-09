@@ -1220,4 +1220,82 @@ mod tests {
             crate::sched::QUANTUM_TICKS + 1
         ));
     }
+
+    #[test]
+    fn timer_irq_path_needs_no_vector_save_and_no_redzone() {
+        // Pre-S08 audit (TASK #593 / board #25): the IRQ0 path
+        // (`baseos_isr_timer` stub + `timer_irq_rust` + `tick_on_irq_stack`
+        // + `run_on_thread_stack` + gated tick) saves GPRs only (9-reg
+        // frame, pinned by `timer_isr_stub_pins_win64_eoi_iretq`) and relies
+        // on the `x86_64-unknown-uefi` target for the rest. Live code must
+        // stay integer-only (no float / vector intrinsics that would need a
+        // wider save), and the target must keep disabling the red-zone and
+        // hardware float. Both halves are pinned here so either regression
+        // fails host-side before the sti-wiring slice lands.
+        //
+        // (1) Source level: live (non-test) IRQ-path code contains no
+        // float/vector tokens. Only the pre-`#[cfg(test)]` head is checked
+        // so this test's own tokens cannot self-trigger. Tokens are built
+        // via concat so the literals never appear in live code either.
+        let f32_tok: &str = concat!("f", "32");
+        let f64_tok: &str = concat!("f", "64");
+        let xmm_lo: &str = concat!("x", "mm");
+        let xmm_hi: &str = concat!("X", "MM");
+        let mm_tok: &str = concat!("_", "mm");
+        let m128_tok: &str = concat!("__m12", "8");
+        let std_arch: &str = concat!("std::", "arch");
+        let core_x86: &str = concat!("core::arch::", "x86");
+        let feat_tok: &str = concat!("target_", "feature");
+        let cfg_test: &str = concat!("#[cfg(", "test)]");
+        for src in [
+            include_str!("timer.rs"),
+            include_str!("thread.rs"),
+            include_str!("cpu.rs"),
+        ] {
+            let live = src.split(cfg_test).next().unwrap_or(src);
+            for tok in [
+                f32_tok, f64_tok, xmm_lo, xmm_hi, mm_tok, m128_tok, std_arch, core_x86, feat_tok,
+            ] {
+                assert!(
+                    !live.contains(tok),
+                    "IRQ-path live code must stay integer-only (found {tok:?})"
+                );
+            }
+        }
+        // (2) Target level: live query of the pinned toolchain's target
+        // spec. Measured 2026-10-09 (rustc 1.98.0):
+        // `"disable-redzone": true`, `"features": "-mmx,-sse,+soft-float"`,
+        // `"rustc-abi": "softfloat"`. If the toolchain/target changes these,
+        // the sti-wiring slice must extend the stub frame / flags instead.
+        let out = std::process::Command::new("rustc")
+            .env("RUSTC_BOOTSTRAP", "1")
+            .args([
+                "-Z",
+                "unstable-options",
+                "--print",
+                "target-spec-json",
+                "--target",
+                "x86_64-unknown-uefi",
+            ])
+            .output()
+            .expect("rustc target-spec-json query must run");
+        assert!(
+            out.status.success(),
+            "rustc target-spec-json query must succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let spec = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            spec.contains("\"disable-redzone\": true"),
+            "uefi target must disable the red-zone: {spec}"
+        );
+        assert!(
+            spec.contains("-sse"),
+            "uefi target must disable sse: {spec}"
+        );
+        assert!(
+            spec.contains("+soft-float"),
+            "uefi target must use soft-float: {spec}"
+        );
+    }
 }
