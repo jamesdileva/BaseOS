@@ -301,17 +301,22 @@ if ($serialText -and $serialText.Contains($marker)) {
     $budgetDetail = "MEMMAP ok=1 line with map_size=<dec> desc_size=<dec> not found"
   }
   Write-Output "Budget check: $budgetDetail"
-  # S08 slice4 (knob report, REVIEW #605 note 2): extract the STI wait-cost
-  # trace for the before/after report. Presence-only still passes, but
-  # spins>=200 means wake-on-budget (the 200-hlt budget fired, not the
-  # joint gate) - flag it loudly so a budget-hit never reads as healthy.
+  # S08 slice4 (knob report, REVIEW #605 note 2; slice5 REVIEW #607 N2):
+  # extract the STI wait-cost trace for the before/after report.
+  # Presence-only still passes, but spins>=200 rides at the budget boundary
+  # and must never read as healthy. Note the regex above requires ok=1, so
+  # a true budget-miss (ok=0, gate never cleared) never matches here and
+  # already fails the ok=1 hard-require -- this print-only flag marks the
+  # ambiguous spins==200 + ok==1 boundary (gate cleared on the 201st batch
+  # check, spins caps at exactly 200 for both gate-wake and budget-exit).
+  # -ge 200 kept (-gt 200 is unreachable since spins caps at 200).
   $stiDetail = "STI ok=1 line with ticks/work/spins/batch/target not found"
   $stiVals = [regex]::Match($serialText, "STI ok=1 [^\r\n]*ticks=(\d+)[^\r\n]*work=(\d+)[^\r\n]*spins=(\d+)[^\r\n]*batch=(\d+)[^\r\n]*target=(\d+)")
   if ($stiVals.Success) {
     $stiDetail = "ticks=$($stiVals.Groups[1].Value) work=$($stiVals.Groups[2].Value) spins=$($stiVals.Groups[3].Value) batch=$($stiVals.Groups[4].Value) target=$($stiVals.Groups[5].Value)"
     $stiSpins = 0L
     if ([long]::TryParse($stiVals.Groups[3].Value, [ref]$stiSpins) -and ($stiSpins -ge 200)) {
-      $stiDetail = $stiDetail + " [WARNING wake-on-budget: spins>=200, joint gate never cleared]"
+      $stiDetail = $stiDetail + " [WARNING at budget boundary spins>=200 -- inspect gate vs budget]"
     }
   }
   Write-Output "STI trace: $stiDetail"

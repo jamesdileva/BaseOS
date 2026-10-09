@@ -300,11 +300,13 @@ pub const fn work_wait_ready(work_done: u64, work_target: u64) -> bool {
 
 /// Preempted-workload target for the S08 slice-2 guest probe.
 ///
-/// `20_000` busy-loop iterations: the `sti` window does
-/// [`STI_WORK_BATCH`] per `hlt` spin, so the work half clears after ~5
-/// spins while the tick half (`QUANTUM_TICKS + 1` at 100 Hz) needs ~50 ms —
-/// work finishes early, ticks gate the wakeup, and the joint gate proves
-/// both progressed. Pure const so host tests pin it.
+/// `20_000` busy-loop iterations at [`STI_WORK_BATCH`] per `hlt` spin, so
+/// `batches_needed = TARGET / BATCH` sets the work-bound spin count (10 at
+/// batch 2000 -> `spins` ~9; was 5 -> `spins` ~4 at batch 4000 pre-slice4).
+/// At the current batch the work half needs ~100 ms while the tick half
+/// (`QUANTUM_TICKS + 1` at 100 Hz) needs ~50 ms -- work bounds the wakeup
+/// and the joint gate proves both progressed. Pure const so host tests pin
+/// it.
 pub const STI_WORK_TARGET: u64 = 20_000;
 
 /// Busy-work batch per `sti`-window spin (S08 slice 2; slice 4 knob turn
