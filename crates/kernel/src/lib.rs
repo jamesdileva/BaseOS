@@ -601,6 +601,19 @@ mod tests {
         assert_eq!(GDT_USER_CODE >> 45 & 0b11, 3, "user code DPL must be 3");
         assert_eq!(GDT_USER_CODE >> 47 & 1, 1, "user code must be present");
         assert_eq!(GDT_USER_CODE >> 53 & 1, 1, "user code must set L");
+        // REVIEW #632 nits (slice2d): pin S=1 + DB=0 + G=1 so a
+        // system-descriptor (S=0) or DB/L-conflict typo fails host-side.
+        assert_eq!(
+            GDT_USER_CODE >> 44 & 1,
+            1,
+            "user code S must be 1 (code/data)"
+        );
+        assert_eq!(
+            GDT_USER_CODE >> 54 & 1,
+            0,
+            "user code DB must be 0 with L=1"
+        );
+        assert_eq!(GDT_USER_CODE >> 55 & 1, 1, "user code G must be 1");
         assert_eq!(GDT_USER_DATA >> 41 & 1, 1, "user data must be writable");
         assert_eq!(
             GDT_USER_DATA >> 43 & 1,
@@ -609,6 +622,15 @@ mod tests {
         );
         assert_eq!(GDT_USER_DATA >> 45 & 0b11, 3, "user data DPL must be 3");
         assert_eq!(GDT_USER_DATA >> 47 & 1, 1, "user data must be present");
+        // REVIEW #632 nits (slice2d): pin S/G/DB/L shape for the data pair.
+        assert_eq!(
+            GDT_USER_DATA >> 44 & 1,
+            1,
+            "user data S must be 1 (code/data)"
+        );
+        assert_eq!(GDT_USER_DATA >> 55 & 1, 1, "user data G must be 1");
+        assert_eq!(GDT_USER_DATA >> 54 & 1, 1, "user data DB must be 1");
+        assert_eq!(GDT_USER_DATA >> 53 & 1, 0, "user data L must be 0");
         assert_eq!(USER_CODE_SEL, 0x1B);
         assert_eq!(USER_DATA_SEL, 0x23);
         assert_eq!(USER_CODE_SEL >> 3, 3, "user code GDT index 3");
