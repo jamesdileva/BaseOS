@@ -35,8 +35,9 @@ pub(crate) const GDT_TSS_INDEX: usize = 5;
 /// Minimal 64-bit Task State Segment (Intel SDM Vol 3 Fig 7-4, 104 bytes):
 /// only `rsp0` matters for CPL3->0 stack switching; every IST entry stays 0
 /// (single stack, no IST this slice) and `iomap_base == size` marks an empty
-/// I/O bitmap. `rsp0` stays 0 until the user-stack slice provides a ring-0
-/// stack -- `ltr` alone never consults it, so the zero is boot-neutral.
+/// I/O bitmap. `Tss::new()` constructs `rsp0 == 0`; the guest `load_gdt`
+/// overwrites it with the ring-0 stack top before `ltr`, so a live `TR`
+/// never points at a zero `rsp0`.
 ///
 /// `repr(C, packed)`: the hardware layout puts `rsp0` at offset 4
 /// (unaligned `u64`); plain `repr(C)` would insert 4 padding bytes and yield
@@ -97,6 +98,31 @@ static mut GDT: Gdt = Gdt {
         0,
     ],
 };
+
+/// Ring-0 stack for CPL3->0 transitions (S09 slice2h, #30 remainder):
+/// 16 KiB, single stack, no IST. `TSS.rsp0` points at the top (one-past-end)
+/// so a future CPL3->0 entry has somewhere to push SS/RSP/RFLAGS/CS/RIP +
+/// the error code. Wired in `load_gdt` (guest-only); `ltr` alone never
+/// consults it, so the nonzero value is still boot-neutral with no CPL3
+/// entry yet (QEMU serial-identical). Fail-closed note: `iomap_base == 104`
+/// keeps any CPL3 port access `#GP` until an I/O policy slice exists.
+pub(crate) const RING0_STACK_LEN: usize = 16384;
+
+/// Top (one-past-end) of a ring-0 stack blob: `RSP` must start 16-byte
+/// aligned per the SysV/Win64 ABI, and the `align(16)` wrapper below keeps
+/// every real base 16-aligned so the top stays aligned too.
+pub(crate) const fn ring0_stack_top_for(base: u64) -> u64 {
+    base.saturating_add(RING0_STACK_LEN as u64)
+}
+
+/// `repr(C, align(16))` so the base — and hence the `ring0_stack_top_for`
+/// top — is 16-byte aligned. Mirrors the `timer::IrqStack` wrapper shape.
+#[cfg(not(test))]
+#[repr(C, align(16))]
+struct Ring0Stack([u8; RING0_STACK_LEN]);
+
+#[cfg(not(test))]
+static mut RING0_STACK: Ring0Stack = Ring0Stack([0; RING0_STACK_LEN]);
 
 #[cfg(not(test))]
 static mut TSS: Tss = Tss::new();
@@ -505,14 +531,16 @@ extern "C" {
 /// [`super::EXCEPTION_VECTORS`] (32 exception vectors + timer vector 32).
 const IDT_VECTORS: usize = super::EXCEPTION_VECTORS + 1;
 
-/// Load the S02 GDT, wire the TSS descriptor, load `TR`, and reload visible
-/// segment registers + CS.
+/// Load the S02 GDT, wire the TSS descriptor + ring-0 stack top, load `TR`,
+/// and reload visible segment registers + CS.
 ///
 /// # Safety
-/// Guest-only post-`ExitBootServices` path: `GDT`/`TSS` are stable statics,
-/// the far-return reloads CS to [`KERNEL_CODE_SEL`], and data selectors point
-/// at the kernel data selector. `TSS.rsp0` stays 0 until the user-stack slice
-/// (no CPL3 entry yet, so no CPL3->0 transition can consume it). Host builds
+/// Guest-only post-`ExitBootServices` path: `GDT`/`TSS`/`RING0_STACK` are
+/// stable statics, the far-return reloads CS to [`KERNEL_CODE_SEL`], and
+/// data selectors point at the kernel data selector. Wiring `TSS.rsp0` to
+/// the ring-0 stack top here (before `ltr`) guarantees no future `iretq`
+/// to CPL3 can land with `rsp0 == 0` (`#SS(0)`/triple-fault); still no CPL3
+/// entry this slice, so the nonzero `rsp0` is boot-neutral. Host builds
 /// are a no-op (no `lgdt`/`ltr` on the test harness); the OVMF e2e path proves
 /// the descriptors by surviving past load into the intentional `#DE`.
 #[cfg(not(test))]
@@ -522,6 +550,11 @@ pub(crate) unsafe fn load_gdt() {
     let limit = (core::mem::size_of::<Tss>() - 1) as u32;
     (*core::ptr::addr_of_mut!(GDT)).entries[GDT_TSS_INDEX] = tss_desc_low(base, limit);
     (*core::ptr::addr_of_mut!(GDT)).entries[GDT_TSS_INDEX + 1] = tss_desc_high(base);
+    // Ring-0 stack top first: a CPL3->0 transition pushes onto `[rsp0]`,
+    // so `rsp0` must be valid before `ltr` makes the TSS active, not after.
+    // SAFETY: `Tss` is `repr(C, packed)`; `rsp0` is an unaligned `u64`.
+    let top = ring0_stack_top_for(core::ptr::addr_of!(RING0_STACK) as u64);
+    core::ptr::addr_of_mut!((*core::ptr::addr_of_mut!(TSS)).rsp0).write_unaligned(top);
     let ptr = DescriptorTablePointer {
         limit: (core::mem::size_of::<Gdt>() - 1) as u16,
         base: core::ptr::addr_of!(GDT) as u64,
@@ -612,6 +645,32 @@ mod tests {
             tss_desc_high(0x0000_ABCD_1234_5000),
             0x0000_ABCD_1234_5000_u64 >> 32
         );
+    }
+
+    #[test]
+    fn ring0_stack_top_pins_size_align_and_nonzero_rsp0() {
+        // S09 slice2h (#30 remainder): the `ltr` wiring must never leave a
+        // live TR with `rsp0 == 0` (first CPL3->0 entry would #SS(0)/
+        // triple-fault). Host pins the helper the guest `load_gdt` consumes:
+        // 16 KiB, 16-aligned top, nonzero, overflow-saturating.
+        assert_eq!(RING0_STACK_LEN, 16384, "one 16 KiB ring-0 stack");
+        let base = 0xFFFF_8000_0010_0000_u64;
+        assert_eq!(base % 16, 0, "wrapper keeps every real base aligned");
+        let top = ring0_stack_top_for(base);
+        assert_eq!(top, base + 16384);
+        assert_eq!(top % 16, 0, "RSP top stays 16-aligned");
+        assert_ne!(top, 0, "wired rsp0 is never the loaded gun");
+        assert_eq!(ring0_stack_top_for(u64::MAX), u64::MAX, "saturates");
+        // The constructor stays zero; only `load_gdt` wires the top.
+        let mut tss = Tss::new();
+        unsafe {
+            core::ptr::addr_of_mut!(tss.rsp0).write_unaligned(top);
+            assert_ne!(
+                core::ptr::addr_of!(tss.rsp0).read_unaligned(),
+                0,
+                "guest write path yields nonzero rsp0"
+            );
+        }
     }
 
     #[test]

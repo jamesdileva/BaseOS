@@ -116,8 +116,8 @@ const GDT_USER_CODE: u64 = 0x00AF_FA00_0000_FFFF;
 /// contract as [`GDT_USER_CODE`].
 const GDT_USER_DATA: u64 = 0x00CF_F200_0000_FFFF;
 /// TSS selector (GDT entry 5, RPL 0): `5 * 8 = 0x28`. S09 slice2g wires the
-/// 7-slot table and loads `TR` with this selector (RSP0 stays 0 until the
-/// user-stack slice provides a ring-0 stack for CPL3->0 transitions).
+/// 7-slot table and loads `TR` with this selector; slice2h wires `RSP0` to
+/// the 16 KiB ring-0 stack top before `ltr` (no CPL3 entry yet).
 pub(crate) const TSS_SEL: u16 = 0x28;
 /// Available 64-bit TSS descriptor type (Intel SDM Vol 3 §7.2.3: `0x9`).
 /// Busy (`0xB`) is what the CPU writes on first `ltr`/task-switch; the host
