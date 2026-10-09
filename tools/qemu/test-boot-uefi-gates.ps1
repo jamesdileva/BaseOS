@@ -75,9 +75,10 @@ if (($g -notlike '*GUARD ok=1 *') -or (-not $g.Contains('[^\r\n]*passed=7/7')) -
   exit 1
 }
 # S09 slice1 USER gate (REVIEW #620): mirrors the GUARD lock — literal
-# space after `ok=1`, same-line `[^\r\n]*passed=7/7`, `(\s|$)` boundary.
-if (($u -notlike '*USER ok=1 *') -or (-not $u.Contains('[^\r\n]*passed=7/7')) -or ($u -notlike '*passed=7/7(\s|$)*')) {
-  Write-Output "GATE TEST FAIL (USER pattern missing ok=1/passed=7/7 tightening: $u)"
+# space after `ok=1`, same-line `[^\r\n]*passed=9/9`, `(\s|$)` boundary.
+# Slice2a (REVIEW #622 risk 1) grows 7/7 to 9/9 with the NX pair.
+if (($u -notlike '*USER ok=1 *') -or (-not $u.Contains('[^\r\n]*passed=9/9')) -or ($u -notlike '*passed=9/9(\s|$)*')) {
+  Write-Output "GATE TEST FAIL (USER pattern missing ok=1/passed=9/9 tightening: $u)"
   exit 1
 }
 # S04 slice 36 viol-enforcement (fail-closed, #139 note 1 RMBZ gate):
@@ -123,10 +124,11 @@ $cases = @(
   @("G-six", $g, "GUARD ok=1 passed=6/7`n", $false, "6/7 fails"),
   @("G-nopass", $g, "GUARD ok=1`n", $false, "missing passed fails"),
   @("G-split", $g, "GUARD ok=1`n passed=7/7`n", $false, "newline-split fails"),
-  @("U-good", $u, "USER ok=1 passed=7/7`n", $true, "ok=1 7/7 passes"),
-  @("U-ten", $u, "USER ok=10 passed=7/7`n", $false, "ok=10 fails"),
-  @("U-onex", $u, "USER ok=1x passed=7/7`n", $false, "ok=1x fails"),
-  @("U-six", $u, "USER ok=1 passed=6/7`n", $false, "6/7 fails"),
+  @("U-good", $u, "USER ok=1 passed=9/9`n", $true, "ok=1 9/9 passes"),
+  @("U-ten", $u, "USER ok=10 passed=9/9`n", $false, "ok=10 fails"),
+  @("U-onex", $u, "USER ok=1x passed=9/9`n", $false, "ok=1x fails"),
+  @("U-six", $u, "USER ok=1 passed=8/9`n", $false, "8/9 fails"),
+  @("U-seven", $u, "USER ok=1 passed=7/7`n", $false, "old 7/7 fails (NX shrink)"),
   @("U-nopass", $u, "USER ok=1`n", $false, "missing passed fails"),
   @("U-split", $u, "USER ok=1`n passed=7/7`n", $false, "newline-split fails"),
   @("R-good", $r, "RMBZ ok=1 nxen=1 walks=2/2 viol=0`n", $true, "ok=1 viol=0 passes"),
@@ -155,5 +157,5 @@ if ($failed -gt 0) {
   Write-Output "GATE TEST FAIL ($failed cases)"
   exit 1
 }
-Write-Output "GATE TEST PASS (47/47)"
+Write-Output "GATE TEST PASS (48/48)"
 exit 0

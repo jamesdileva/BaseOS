@@ -926,18 +926,25 @@ pub fn guard_selftest() -> (bool, u32, u32) {
 
 /// Synthetic user-isolation self-test for the S09 guest `USER` e2e line.
 ///
-/// Builds a fixed 4-entry [`PageTable`] (kernel RO at `0x1000` with
+/// Builds a fixed 5-entry [`PageTable`] (kernel RO at `0x1000` with
 /// `U/S=0`, kernel RW at `0x2000` with `U/S=0`, user RO at `0x3000` with
-/// `U/S=1`, user RW at `0x4000` with `U/S=1`) and runs 7
-/// [`classify_access`] probes covering the S09 slice-1 verification cut:
-/// user executes/reads/writes its own range, user access to either kernel
-/// page is contained with exactly [`Fault::UserViolation`] (the `#PF`
-/// `U/S=1` case), and invalid ranges are contained (`NotPresent` for
-/// unmapped, `GeneralProtection` for non-canonical). CPL3 entry/return
-/// and user stacks ride with a later slice — this slice pins the `U/S`-bit
-/// policy plus fail-closed containment only. Pure / `no_std`-clean so host
-/// tests and the post-EBS guest share it; the guest maps `ok` to
-/// `USER ok=1` (hard-required by `boot-uefi.ps1`).
+/// `U/S=1`, user RW at `0x4000` with `U/S=1`, user NX at `0x5000` with
+/// `U/S=1` plus `NO_EXEC`) and runs 9 [`classify_access`] probes covering
+/// the S09 slice-1 verification cut plus REVIEW #622 risk 1: user
+/// executes/reads/writes its own range, user NX page stays readable but
+/// refuses fetch with exactly [`Fault::NoExec`] (non-vacuous execute pin),
+/// user access to either kernel page is contained with exactly
+/// [`Fault::UserViolation`] (the `#PF` `U/S=1` case), and invalid ranges
+/// are contained (`NotPresent` for unmapped, `GeneralProtection` for
+/// non-canonical). CPL3 entry/return and user stacks ride with a later
+/// slice — this slice pins the `U/S`-bit policy plus fail-closed
+/// containment only.
+///
+/// Threat model (REVIEW #622 risk 2): supervisor may access user pages by
+/// design — no SMAP/SMEP enforcement in this slice. SMAP/SMEP (CR4 + EFER.NXE
+/// gating) is deferred to S29 Security Baseline, not S09. Pure /
+/// `no_std`-clean so host tests and the post-EBS guest share it; the guest
+/// maps `ok` to `USER ok=1` (hard-required by `boot-uefi.ps1`).
 /// Returns `(ok, passed, total)`.
 #[must_use]
 pub fn user_isolation_selftest() -> (bool, u32, u32) {
@@ -946,19 +953,25 @@ pub fn user_isolation_selftest() -> (bool, u32, u32) {
     let k_rw = PageFlags::PRESENT.union(PageFlags::WRITABLE);
     let u_ro = PageFlags::PRESENT.union(PageFlags::USER);
     let u_rw = u_ro.union(PageFlags::WRITABLE);
+    let u_nx = PageFlags::PRESENT
+        .union(PageFlags::USER)
+        .union(PageFlags::NO_EXEC);
     // Fixed map; `map` cannot fail here (aligned, distinct, PRESENT).
     let _ = pt.map(0x1000, 0xA000, k_ro);
     let _ = pt.map(0x2000, 0xB000, k_rw);
     let _ = pt.map(0x3000, 0xC000, u_ro);
     let _ = pt.map(0x4000, 0xD000, u_rw);
-    let cases: [(u64, AccessKind, bool, bool); 7] = [
+    let _ = pt.map(0x5000, 0xE000, u_nx);
+    let cases: [(u64, AccessKind, bool, bool); 9] = [
         // (virt, kind, is_user, expect_ok)
         (0x3000, AccessKind::Read, true, true), // user reads own range
         (0x4000, AccessKind::Write, true, true), // user writes own range
         (0x4000, AccessKind::Execute, true, true), // user executes (no NO_EXEC)
+        (0x5000, AccessKind::Read, true, true), // NX page stays readable
+        (0x5000, AccessKind::Execute, true, false), // NX fetch refused (NoExec)
         (0x1000, AccessKind::Read, true, false), // user touches kernel RO
         (0x2000, AccessKind::Write, true, false), // user touches kernel RW
-        (0x5000, AccessKind::Read, true, false), // unmapped contained
+        (0x6000, AccessKind::Read, true, false), // unmapped contained
         (0x8000_0000_0000, AccessKind::Read, true, false), // non-canonical contained
     ];
     let mut passed: u32 = 0;
@@ -1673,9 +1686,10 @@ mod tests {
 
     #[test]
     fn user_isolation_selftest_passes_seven_probes() {
-        // S09 slice1: the shared U/S-isolation pin the guest USER line reuses.
+        // S09 slice1 (+slice2a NX pin): the shared U/S-isolation pin the
+        // guest USER line reuses.
         let (ok, passed, total) = user_isolation_selftest();
-        assert_eq!((passed, total), (7, 7));
+        assert_eq!((passed, total), (9, 9));
         assert!(ok);
     }
 
@@ -1683,11 +1697,18 @@ mod tests {
     fn user_isolation_pins_us_bit_and_contained_faults() {
         // Cheapest disconfirm per REVIEW #620: U/S=0 kernel vs U/S=1 user
         // plus exact fault-classifier verdicts, before any QEMU run.
+        // REVIEW #622 risk 1: NX refusal is pinned non-vacuous (NoExec).
+        // REVIEW #622 risk 2: supervisor-may-access-user is by design
+        // (no SMAP/SMEP this slice; deferred to S29).
         let mut pt = PageTable::new();
         let k_rw = PageFlags::PRESENT.union(PageFlags::WRITABLE);
         let u_rw = k_rw.union(PageFlags::USER);
+        let u_nx = PageFlags::PRESENT
+            .union(PageFlags::USER)
+            .union(PageFlags::NO_EXEC);
         pt.map(0x2000, 0xB000, k_rw).unwrap();
         pt.map(0x4000, 0xD000, u_rw).unwrap();
+        pt.map(0x5000, 0xE000, u_nx).unwrap();
         // U/S bit: kernel entry lacks USER, user entry carries it, and the
         // hardware PTE round-trips the bit.
         let (_, k_flags) = pt.translate(0x2000).unwrap();
@@ -1710,12 +1731,21 @@ mod tests {
             Err(CpuFault::PageFault(Fault::UserViolation))
         );
         // Supervisor may still access both (no inverted isolation).
+        // No SMAP/SMEP: supervisor access to user pages is allowed by
+        // design this slice (REVIEW #622 risk 2, S29 defers enforcement).
         assert!(classify_access(&pt, 0x2000, AccessKind::Read, false).is_ok());
         assert!(classify_access(&pt, 0x4000, AccessKind::Read, false).is_ok());
+        // NX enforcement is non-vacuous: the U/S=1 NX page stays readable
+        // but refuses fetch with exactly NoExec (never a silent pass).
+        assert!(classify_access(&pt, 0x5000, AccessKind::Read, true).is_ok());
+        assert_eq!(
+            classify_access(&pt, 0x5000, AccessKind::Execute, true),
+            Err(CpuFault::PageFault(Fault::NoExec))
+        );
         // Invalid-range fail-closed: unmapped is NotPresent, non-canonical
         // is GeneralProtection — both contained, never a panic.
         assert_eq!(
-            classify_access(&pt, 0x5000, AccessKind::Read, true),
+            classify_access(&pt, 0x6000, AccessKind::Read, true),
             Err(CpuFault::PageFault(Fault::NotPresent))
         );
         assert_eq!(

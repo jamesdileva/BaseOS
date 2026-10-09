@@ -671,13 +671,17 @@ fn write_guard_line<E>(
 
 /// Emit the one-line `USER` diagnostic after the `GUARD` line:
 /// `USER ok=<0|1> passed=<n>/<total>` — `ok` is 1 only when the synthetic
-/// [`user_isolation_selftest`] U/S-isolation contract passes all 7 probes
-/// (user executes/reads/writes its own `U/S=1` range, user access to either
-/// `U/S=0` kernel page is contained as `UserViolation`, invalid ranges are
-/// contained as `NotPresent`/`GeneralProtection`). Pure software model, no
-/// live-table mutation and no CPL3 entry yet (entry/return + user stacks
-/// ride with a later S09 slice), so it runs deterministically post-EBS on
-/// any firmware map. Hard-required by `boot-uefi.ps1` (`USER ok=1`).
+/// [`user_isolation_selftest`] U/S-isolation contract passes all 9 probes
+/// (user executes/reads/writes its own `U/S=1` range, NX page readable but
+/// fetch-refused as `NoExec`, user access to either `U/S=0` kernel page is
+/// contained as `UserViolation`, invalid ranges are contained as
+/// `NotPresent`/`GeneralProtection`). Pure software model, no live-table
+/// mutation and no CPL3 entry yet (entry/return + user stacks ride with a
+/// later S09 slice; live-#PF U/S path is slice2b per REVIEW #622 risk 3),
+/// so it runs deterministically post-EBS on any firmware map.
+/// Threat model: supervisor-may-access-user by design (no SMAP/SMEP;
+/// deferred to S29 per REVIEW #622 risk 2). Hard-required by
+/// `boot-uefi.ps1` (`USER ok=1`).
 fn write_user_line<E>(
     ok: bool,
     passed: u32,
@@ -3310,23 +3314,23 @@ mod tests {
     #[test]
     fn write_user_line_embeds_passed_total() {
         let mut text = Vec::new();
-        write_user_line::<core::convert::Infallible>(true, 7, 7, &mut |b| {
+        write_user_line::<core::convert::Infallible>(true, 9, 9, &mut |b| {
             text.push(b);
             Ok(())
         })
         .unwrap();
         let line = core::str::from_utf8(&text).unwrap();
-        assert_eq!(line, "USER ok=1 passed=7/7\n");
+        assert_eq!(line, "USER ok=1 passed=9/9\n");
         assert!(line.contains("USER ok=1"));
 
         let mut text = Vec::new();
-        write_user_line::<core::convert::Infallible>(false, 6, 7, &mut |b| {
+        write_user_line::<core::convert::Infallible>(false, 8, 9, &mut |b| {
             text.push(b);
             Ok(())
         })
         .unwrap();
         let line = core::str::from_utf8(&text).unwrap();
-        assert_eq!(line, "USER ok=0 passed=6/7\n");
+        assert_eq!(line, "USER ok=0 passed=8/9\n");
     }
 
     /// S04 slice 15/18/19: `PERMAUDIT` line shape — live leaf flags;
