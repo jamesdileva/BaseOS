@@ -115,6 +115,43 @@ const GDT_USER_CODE: u64 = 0x00AF_FA00_0000_FFFF;
 /// (`0x92 -> 0xF2` access byte), present + writable. Same deferred-entry
 /// contract as [`GDT_USER_CODE`].
 const GDT_USER_DATA: u64 = 0x00CF_F200_0000_FFFF;
+/// TSS selector (GDT entry 5, RPL 0): `5 * 8 = 0x28`. S09 slice2e pins the
+/// encoding only — the guest GDT stays 5 entries and `TR` is never loaded
+/// this slice, so the wider selector is behavior-preserving (table growth
+/// to 7 slots + `ltr` rides with the TSS-wiring slice).
+#[allow(dead_code)]
+const TSS_SEL: u16 = 0x28;
+/// Available 64-bit TSS descriptor type (Intel SDM Vol 3 §7.2.3: `0x9`).
+/// Busy (`0xB`) is what the CPU writes on first `ltr`/task-switch; the host
+/// pin asserts the initial image is available, never busy.
+#[allow(dead_code)]
+const TSS_TYPE_AVAIL: u64 = 0x9;
+
+/// Low 64 bits of a 64-bit available-TSS system descriptor (Intel SDM
+/// Vol 3 Fig 7-4): limit 15:0, base 23:0 split, type `0x9`, S=0, DPL=0,
+/// P=1, limit 19:16, AVL=0, L=0, DB=0, G=0 (byte-granular), base 31:24.
+/// Pure encoding — the guest table stays 5 entries this slice; the TSS
+/// wiring slice consumes this to grow the GDT to 7 slots.
+/// `limit` is the byte limit (`size - 1`, e.g. 103 for a 104-byte TSS).
+#[allow(dead_code)]
+const fn tss_desc_low(base: u64, limit: u32) -> u64 {
+    let limit = (limit as u64) & 0xF_FFFF;
+    let b = base & 0xFFFF_FFFF;
+    (limit & 0xFFFF)
+        | ((b & 0xFFFF) << 16)
+        | (((b >> 16) & 0xFF) << 32)
+        | (TSS_TYPE_AVAIL << 40)
+        | (1 << 47)
+        | (((limit >> 16) & 0xF) << 48)
+        | (((b >> 24) & 0xFF) << 56)
+}
+
+/// High 64 bits of a 64-bit TSS descriptor: base 63:32, upper reserved 0.
+/// Companion to [`tss_desc_low`]; same deferred-wiring contract.
+#[allow(dead_code)]
+const fn tss_desc_high(base: u64) -> u64 {
+    base >> 32
+}
 
 /// Exception vector for `#DE` (divide error). First IDT slot; no error
 /// code pushed by the CPU.
@@ -637,6 +674,41 @@ mod tests {
         assert_eq!(USER_DATA_SEL >> 3, 4, "user data GDT index 4");
         assert_eq!(USER_CODE_SEL & 0b11, 3, "user code RPL 3");
         assert_eq!(USER_DATA_SEL & 0b11, 3, "user data RPL 3");
+    }
+
+    #[test]
+    fn tss_descriptor_pins_available_system_shape() {
+        // S09 slice2e (#30 remainder, REVIEW #634 risk 1): pin the 16-byte
+        // available-TSS encoding host-side before any GDT growth / `ltr`.
+        // System descriptor (S=0, type 0x9, P=1, DPL=0, L=DB=0, G=0) with
+        // base/limit round-trip; busy (0xB) must never be the initial image.
+        assert_eq!(TSS_TYPE_AVAIL, 0x9);
+        assert_eq!(TSS_SEL, 0x28);
+        assert_eq!(TSS_SEL >> 3, 5, "TSS GDT index 5");
+        assert_eq!(TSS_SEL & 0b11, 0, "TSS RPL 0");
+        let base = 0x0000_ABCD_1234_5000_u64;
+        let limit = 103_u32;
+        let lo = tss_desc_low(base, limit);
+        let hi = tss_desc_high(base);
+        assert_eq!(lo >> 40 & 0xF, 0x9, "type must be available-TSS");
+        assert_eq!(lo >> 44 & 1, 0, "S must be 0 (system)");
+        assert_eq!(lo >> 45 & 0b11, 0, "TSS DPL must be 0");
+        assert_eq!(lo >> 47 & 1, 1, "TSS must be present");
+        assert_eq!(lo >> 53 & 1, 0, "TSS L must be 0");
+        assert_eq!(lo >> 54 & 1, 0, "TSS DB must be 0");
+        assert_eq!(lo >> 55 & 1, 0, "TSS G must be 0 (byte limit)");
+        assert_ne!(lo >> 40 & 0xF, 0xB, "initial image never busy");
+        let limit_lo = lo & 0xFFFF;
+        let limit_hi = (lo >> 48) & 0xF;
+        assert_eq!(limit_lo | (limit_hi << 16), u64::from(limit));
+        let base_lo =
+            ((lo >> 16) & 0xFFFF) | (((lo >> 32) & 0xFF) << 16) | (((lo >> 56) & 0xFF) << 24);
+        assert_eq!(base_lo, base & 0xFFFF_FFFF);
+        assert_eq!(hi, base >> 32);
+        // Zero base/limit edge stays well-formed (null-table probe shape).
+        let lo0 = tss_desc_low(0, 103);
+        assert_eq!(lo0 >> 40 & 0xF, 0x9);
+        assert_eq!(tss_desc_high(0), 0);
     }
 
     #[test]
