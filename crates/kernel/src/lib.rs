@@ -694,6 +694,7 @@ mod tests {
         assert_eq!(lo >> 44 & 1, 0, "S must be 0 (system)");
         assert_eq!(lo >> 45 & 0b11, 0, "TSS DPL must be 0");
         assert_eq!(lo >> 47 & 1, 1, "TSS must be present");
+        assert_eq!(lo >> 52 & 1, 0, "TSS AVL must be 0");
         assert_eq!(lo >> 53 & 1, 0, "TSS L must be 0");
         assert_eq!(lo >> 54 & 1, 0, "TSS DB must be 0");
         assert_eq!(lo >> 55 & 1, 0, "TSS G must be 0 (byte limit)");
