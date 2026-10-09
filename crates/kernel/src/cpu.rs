@@ -554,7 +554,13 @@ pub(crate) unsafe fn load_gdt() {
     // so `rsp0` must be valid before `ltr` makes the TSS active, not after.
     // SAFETY: `Tss` is `repr(C, packed)`; `rsp0` is an unaligned `u64`.
     let top = ring0_stack_top_for(core::ptr::addr_of!(RING0_STACK) as u64);
+    debug_assert_ne!(top, 0, "TSS.rsp0 must be nonzero before ltr");
     core::ptr::addr_of_mut!((*core::ptr::addr_of_mut!(TSS)).rsp0).write_unaligned(top);
+    debug_assert_ne!(
+        core::ptr::addr_of!((*core::ptr::addr_of!(TSS)).rsp0).read_unaligned(),
+        0,
+        "TSS.rsp0 write must land (offset 4) before ltr"
+    );
     let ptr = DescriptorTablePointer {
         limit: (core::mem::size_of::<Gdt>() - 1) as u16,
         base: core::ptr::addr_of!(GDT) as u64,
@@ -653,13 +659,29 @@ mod tests {
         // live TR with `rsp0 == 0` (first CPL3->0 entry would #SS(0)/
         // triple-fault). Host pins the helper the guest `load_gdt` consumes:
         // 16 KiB, 16-aligned top, nonzero, overflow-saturating.
+        // REVIEW #642: guest `load_gdt` now `debug_assert_ne!`s the top and
+        // the written `rsp0` pre-`ltr`; this test is the host side of that
+        // gate (same invariants, plus offset + in-range).
         assert_eq!(RING0_STACK_LEN, 16384, "one 16 KiB ring-0 stack");
+        // Packed hardware layout: `reserved0: u32` then `rsp0: u64`, so the
+        // guest `write_unaligned` must hit byte offset 4 in the 104 B TSS.
+        assert_eq!(core::mem::size_of::<Tss>(), 104);
+        assert_eq!(core::mem::offset_of!(Tss, rsp0), 4);
+        let tss = Tss::new();
+        let base_ptr = core::ptr::addr_of!(tss) as usize;
+        let rsp0_ptr = core::ptr::addr_of!(tss.rsp0) as usize;
+        assert_eq!(rsp0_ptr.wrapping_sub(base_ptr), 4, "rsp0 byte offset");
         let base = 0xFFFF_8000_0010_0000_u64;
         assert_eq!(base % 16, 0, "wrapper keeps every real base aligned");
         let top = ring0_stack_top_for(base);
         assert_eq!(top, base + 16384);
         assert_eq!(top % 16, 0, "RSP top stays 16-aligned");
         assert_ne!(top, 0, "wired rsp0 is never the loaded gun");
+        // In-range: top is one-past-end; the pushed frame lives below it.
+        assert!(top > base, "top above base");
+        assert_eq!(top.wrapping_sub(base), RING0_STACK_LEN as u64);
+        assert!(base <= top.wrapping_sub(1) && top.wrapping_sub(1) < top);
+        assert!(base <= top.wrapping_sub(8) && top.wrapping_sub(8) < top);
         assert_eq!(ring0_stack_top_for(u64::MAX), u64::MAX, "saturates");
         // The constructor stays zero; only `load_gdt` wires the top.
         let mut tss = Tss::new();
