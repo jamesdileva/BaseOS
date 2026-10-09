@@ -286,6 +286,24 @@ pub const fn cumulative_join(drained_before: u64, pending: u64, drained_after: u
 pub const fn cumulative_wait_ready(total: u64, target: u64) -> bool {
     total >= target
 }
+
+/// Pure S08-slice1 sti-window gate (REVIEW #598: no hlt-only assumption).
+///
+/// `true` only when BOTH the cumulative tick total AND the preempted
+/// workload progress meet their targets. A tick-only `hlt` spin (work
+/// stalled) or a workload-only spin (ticks stalled) both report
+/// not-ready — fail-closed, never a partial wakeup. Pure `core`-only so
+/// host tests pin it; the guest `sti` preemption probe routes its
+/// wakeup through this (QEMU `TICK` proof stays the tick half).
+#[must_use]
+pub const fn sti_window_ready(
+    ticks_total: u64,
+    work_done: u64,
+    tick_target: u64,
+    work_target: u64,
+) -> bool {
+    cumulative_wait_ready(ticks_total, tick_target) && work_done >= work_target
+}
 /// Guest-only volatile tick snapshot (S07 slice14).
 ///
 /// Volatile whole-struct read of `TIMER_TICKS` so the `sti` spin-wait
@@ -1219,6 +1237,22 @@ mod tests {
             crate::sched::QUANTUM_TICKS + 1,
             crate::sched::QUANTUM_TICKS + 1
         ));
+    }
+
+    #[test]
+    fn sti_window_ready_needs_ticks_and_work() {
+        // S08 slice1 (REVIEW #598 gate 1+3): the sti-window wakeup is a
+        // preemption proof, not an hlt-only tick wait — both halves must
+        // clear. Tick-only (work stalled) or work-only (ticks stalled)
+        // both refuse; zero/zero refuses.
+        assert!(sti_window_ready(5, 100, 5, 100));
+        assert!(sti_window_ready(6, 200, 5, 100));
+        assert!(!sti_window_ready(5, 0, 5, 1));
+        assert!(!sti_window_ready(5, 99, 5, 100));
+        assert!(!sti_window_ready(0, 100, 1, 100));
+        assert!(!sti_window_ready(4, 100, 5, 100));
+        assert!(!sti_window_ready(0, 0, 1, 1));
+        assert!(sti_window_ready(u64::MAX, u64::MAX, u64::MAX, u64::MAX));
     }
 
     #[test]
