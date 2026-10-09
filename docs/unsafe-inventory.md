@@ -41,6 +41,7 @@ rides with the slice that closes S05. Slice 3 moved D1/D2 (+ tables) from
 | A8 | kernel `timer::outb` (private unsafe body, S07 slice14) + safe `timer::remap_pic` / `timer::program_pit` (consume `pic_remap_writes` / `pic_mask_writes` / `pit_program_writes` const plans, never raw literals; S07 slice15: bring-up early-fails before `sti` when the PIT plan is `None`) | `out` to PIC/PIT program ports | Post-EBS guest, `cli` in effect, single-threaded boot owns PIC/PIT; `TIMER_PROGRAM` `Some` (fail-closed `None` = no program, fail-loud `TICK ok=0` before `sti`) | `TICK ok=1` e2e |
 | A9 | kernel `uart::write_tick_line` (safe wrapper, S07 slice14) | Bring-up-context writer, cannot use caller sink | COM1 initialized; single-threaded bring-up owns UART; host pin extended (`fn(bool,u64)` type) | `TICK ok=1` e2e |
 | A10 | kernel `uart::write_irqstack_line` (safe wrapper, S07 slice68) | Bring-up-context writer for the two-stack proof, cannot use caller sink | COM1 initialized; single-threaded bring-up owns UART; host pin extended (`fn(bool,u64,u64,u64,u64)` type) | `IRQSTACK ok=1` e2e |
+| A11 | kernel `uart::write_sti_line` (safe wrapper, S08 slice2) | Bring-up-context writer for the joint tick+work preemption proof, cannot use caller sink | COM1 initialized; single-threaded bring-up owns UART; host pin (`fn(bool,u64,u64)` type) | `STI ok=1` e2e |
 
 ## B. UEFI table / slot loads — raw offsets + `read_unaligned` + `transmute`
 

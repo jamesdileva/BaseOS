@@ -287,6 +287,33 @@ pub const fn cumulative_wait_ready(total: u64, target: u64) -> bool {
     total >= target
 }
 
+/// Pure work-progress check for the S08 sti-window gate (slice 2).
+///
+/// `work_done >= work_target`: the preempted-workload half of
+/// [`sti_window_ready`]. Split out (instead of a raw `>=` inside the gate)
+/// so both halves route through a named helper — a future `==` regression
+/// on either half fails host-side, not in QEMU. Pure `core`-only.
+#[must_use]
+pub const fn work_wait_ready(work_done: u64, work_target: u64) -> bool {
+    work_done >= work_target
+}
+
+/// Preempted-workload target for the S08 slice-2 guest probe.
+///
+/// `20_000` busy-loop iterations: the `sti` window does
+/// [`STI_WORK_BATCH`] per `hlt` spin, so the work half clears after ~5
+/// spins while the tick half (`QUANTUM_TICKS + 1` at 100 Hz) needs ~50 ms —
+/// work finishes early, ticks gate the wakeup, and the joint gate proves
+/// both progressed. Pure const so host tests pin it.
+pub const STI_WORK_TARGET: u64 = 20_000;
+
+/// Busy-work batch per `sti`-window spin (S08 slice 2).
+///
+/// Integer-only increments (no float/vector — the pre-S08 audit pin
+/// forbids wider state on the IRQ path); at most 200 spins * batch =
+/// 800 k iterations worst case, trivial for QEMU TCG.
+pub const STI_WORK_BATCH: u64 = 4_000;
+
 /// Pure S08-slice1 sti-window gate (REVIEW #598: no hlt-only assumption).
 ///
 /// `true` only when BOTH the cumulative tick total AND the preempted
@@ -302,7 +329,7 @@ pub const fn sti_window_ready(
     tick_target: u64,
     work_target: u64,
 ) -> bool {
-    cumulative_wait_ready(ticks_total, tick_target) && work_done >= work_target
+    cumulative_wait_ready(ticks_total, tick_target) && work_wait_ready(work_done, work_target)
 }
 /// Guest-only volatile tick snapshot (S07 slice14).
 ///
@@ -1253,6 +1280,37 @@ mod tests {
         assert!(!sti_window_ready(4, 100, 5, 100));
         assert!(!sti_window_ready(0, 0, 1, 1));
         assert!(sti_window_ready(u64::MAX, u64::MAX, u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn sti_work_half_routes_through_named_helper() {
+        // S08 slice2 (REVIEW #600 nit 3): both halves route through a named
+        // `>=` helper — the tick half via `cumulative_wait_ready`, the work
+        // half via `work_wait_ready` — so a future `==` regression on either
+        // half fails here, not in QEMU. The gate is exactly the conjunction.
+        assert!(work_wait_ready(100, 100));
+        assert!(work_wait_ready(200, 100));
+        assert!(!work_wait_ready(99, 100));
+        assert!(!work_wait_ready(0, 1));
+        assert!(work_wait_ready(0, 0));
+        assert!(work_wait_ready(u64::MAX, u64::MAX));
+        assert_eq!(STI_WORK_TARGET, 20_000);
+        assert_eq!(STI_WORK_BATCH, 4_000);
+        assert!(STI_WORK_TARGET.is_multiple_of(STI_WORK_BATCH));
+        for (ticks, work, tt, wt) in [
+            (5u64, 100u64, 5u64, 100u64),
+            (6, 200, 5, 100),
+            (5, 0, 5, 1),
+            (0, 100, 1, 100),
+            (0, 0, 1, 1),
+            (u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+        ] {
+            assert_eq!(
+                sti_window_ready(ticks, work, tt, wt),
+                cumulative_wait_ready(ticks, tt) && work_wait_ready(work, wt),
+                "gate must be the conjunction of both helpers"
+            );
+        }
     }
 
     #[test]

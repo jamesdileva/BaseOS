@@ -204,6 +204,31 @@ pub(crate) fn write_irqstack_line(ok: bool, task_rsp: u64, irq_rsp: u64, base: u
     com1_write_byte(b'\n');
 }
 
+/// Emit `STI ok=<0|1> ticks=<n> work=<m>\n` directly on COM1 (S08 slice 2
+/// preemption probe: `ok` is 1 only when the joint
+/// [`crate::timer::sti_window_ready`] gate clears — cumulative ticks AND
+/// preempted-workload progress — so a tick-only `hlt` spin or a work-only
+/// spin reports `ok=0` fail-closed).
+///
+/// Safe wrapper: only calls [`com1_write_byte`] plus the safe decimal
+/// helper. Requires COM1 initialized; single-threaded bring-up context owns
+/// the UART exclusively.
+pub(crate) fn write_sti_line(ok: bool, ticks: u64, work: u64) {
+    for b in b"STI ok=" {
+        com1_write_byte(*b);
+    }
+    com1_write_byte(if ok { b'1' } else { b'0' });
+    for b in b" ticks=" {
+        com1_write_byte(*b);
+    }
+    write_dec_u64(ticks);
+    for b in b" work=" {
+        com1_write_byte(*b);
+    }
+    write_dec_u64(work);
+    com1_write_byte(b'\n');
+}
+
 /// Emit `PF ok=<0|1> vector=<n> code=<0x...> addr=<0x...>\n` directly on
 /// COM1 (interrupt context cannot use the caller-supplied sink).
 ///

@@ -337,29 +337,36 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         // missing `TICK ok=1`, never on a hang). `TIMER_PROGRAM` is `Some`
         // by construction, so this arm is dead-code in practice.
         write_tick_line(false, 0);
+        uart::write_sti_line(false, 0, 0);
     } else {
         timer::program_pit();
         timer::reset_total_drained();
         cpu::sti();
         // Multi-tick wait (S07 slice26; slice28 cumulative; slice33 `>=`
-        // helper): `hlt` until `QUANTUM_TICKS + 1` total ticks are observed
-        // (one full quantum plus one, so the task-context live drain expires
-        // and owes exactly one resched). Cumulative (`pending + drained_total`)
-        // instead of pending-only (S07 slice28; S07 slice66: IRQ records
-        // without draining, so pending carries the window until the task
-        // batch moves it to drained_total — either order sums the same). The
-        // target check routes through `timer::cumulative_wait_ready` (`>=`,
-        // never `==`): the storm fallback is non-monotonic by construction
-        // (REVIEW #501 risk 2), so exact equality could miss its wakeup after
-        // a step-back. Cumulative (not pending-only) since S07 slice28; S07
-        // slice66 keeps it: IRQ records without draining, so pending carries
-        // the window and drained_total carries the task batch — the sum is
-        // the proof either way. Const-driven: a quantum change moves the target; the
+        // helper; S08 slice2 preemption probe): busy-work batch + `hlt`
+        // until the JOINT `sti_window_ready` gate clears — `QUANTUM_TICKS + 1`
+        // total ticks (one full quantum plus one) AND `STI_WORK_TARGET`
+        // workload iterations. The work batch is integer-only (audit pin:
+        // no float/vector on the IRQ path) and `black_box`ed so the
+        // optimizer keeps it; the wakeup routes through
+        // `timer::sti_window_ready` (both halves via named `>=` helpers,
+        // never `==`), so a tick-only `hlt` spin or a work-only spin
+        // refuses. Const-driven: a quantum change moves the tick target; the
         // ps1 `ticks=[1-9]` gate accepts any positive count.
         let wait_target = crate::sched::QUANTUM_TICKS + 1;
+        let work_target = timer::STI_WORK_TARGET;
+        let mut work: u64 = 0;
         let mut spins = 0u32;
         loop {
-            if timer::cumulative_wait_ready(timer::cumulative_snapshot(), wait_target) {
+            let mut i = 0u64;
+            while i < timer::STI_WORK_BATCH {
+                work = work.saturating_add(1);
+                i += 1;
+                core::hint::spin_loop();
+            }
+            work = core::hint::black_box(work);
+            if timer::sti_window_ready(timer::cumulative_snapshot(), work, wait_target, work_target)
+            {
                 break;
             }
             if spins >= 200 {
@@ -392,6 +399,16 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         let (_drained, _dispatched) = timer::poll_timer_dispatch(&gate);
         let total = timer::cumulative_snapshot_gated(&gate);
         write_tick_line(total > 0, total);
+        // S08 slice2 preemption proof: the joint gate over the gated
+        // cumulative total + the busy-work counter. `TICK` stays the
+        // tick-half proof; this line wires `sti_window_ready` into the
+        // guest (closes the slice-1 dead-code gap) and e2e hard-requires
+        // `STI ok=1` with positive ticks AND work.
+        uart::write_sti_line(
+            timer::sti_window_ready(total, work, wait_target, work_target),
+            total,
+            work,
+        );
     }
     // S07 slice68 (nit 3 RSP-switch proof): two-stack line — task-context
     // `RSP` vs the last IRQ0 inner capture (recorded while running on the
@@ -732,10 +749,11 @@ mod tests {
         let exc: fn(bool, u64) = uart::write_exc_line;
         let pf: fn(bool, u64, u64, u64) = uart::write_pf_line;
         let tick: fn(bool, u64) = uart::write_tick_line;
+        let sti: fn(bool, u64, u64) = uart::write_sti_line;
         let irqstack: fn(bool, u64, u64, u64, u64) = uart::write_irqstack_line;
         let dec: fn(u64) = uart::write_dec_u64;
         let hex: fn(u64) = uart::write_hex_u64;
-        let _ = (init, write_byte, exc, pf, tick, irqstack, dec, hex);
+        let _ = (init, write_byte, exc, pf, tick, sti, irqstack, dec, hex);
     }
 
     #[test]
@@ -754,6 +772,7 @@ mod tests {
             "write_exc_line",
             "write_pf_line",
             "write_tick_line",
+            "write_sti_line",
             "write_irqstack_line",
             "read_rsp",
             "tick_on_irq_stack",
@@ -776,8 +795,8 @@ mod tests {
         }
         for row in [
             "| A1 |", "| A2 |", "| A3 |", "| A4 |", "| A5 |", "| A6 |", "| A7 |", "| A8 |",
-            "| A9 |", "| A10 |", "| D1 |", "| D2 |", "| D3 |", "| D4 |", "| D5 |", "| D6 |",
-            "| D7 |", "| D8 |", "| D9 |", "| D10 |", "| D11 |", "| D12 |",
+            "| A9 |", "| A10 |", "| A11 |", "| D1 |", "| D2 |", "| D3 |", "| D4 |", "| D5 |",
+            "| D6 |", "| D7 |", "| D8 |", "| D9 |", "| D10 |", "| D11 |", "| D12 |",
         ] {
             assert!(DOC.contains(row), "inventory must keep row {row}");
         }
