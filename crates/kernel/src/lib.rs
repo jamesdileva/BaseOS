@@ -88,6 +88,15 @@ pub(crate) const LSR_THR_EMPTY: u8 = 0x20;
 const KERNEL_CODE_SEL: u16 = 0x08;
 /// Kernel data selector in the S02 GDT (entry 2).
 const KERNEL_DATA_SEL: u16 = 0x10;
+/// User code selector (GDT entry 3, RPL 3): `3 * 8 | 3 = 0x1B`. S09 slice2c
+/// pins the descriptor/selector only — no CPL3 entry (`iretq`/TSS/user
+/// stacks) yet, so the guest still runs ring 0 on the kernel selectors.
+#[allow(dead_code)]
+const USER_CODE_SEL: u16 = 0x1B;
+/// User data selector (GDT entry 4, RPL 3): `4 * 8 | 3 = 0x23`. Same
+/// deferred-entry contract as [`USER_CODE_SEL`].
+#[allow(dead_code)]
+const USER_DATA_SEL: u16 = 0x23;
 
 /// Null descriptor (required GDT slot 0).
 const GDT_NULL: u64 = 0;
@@ -97,6 +106,15 @@ const GDT_CODE: u64 = 0x00AF_9A00_0000_FFFF;
 /// Kernel data: base 0, 4 KiB granularity, present, writable
 /// (`0x00CF92000000FFFF` — standard long-mode data descriptor).
 const GDT_DATA: u64 = 0x00CF_9200_0000_FFFF;
+/// User 64-bit code (DPL 3): kernel code encoding with the DPL field
+/// (bits 45-46) raised `0 -> 3` (`0x9A -> 0xFA` access byte), so ring-3
+/// callers can execute it once a CPL3 entry path exists. Pinned host-side
+/// this slice; the guest GDT grows to 5 entries but still enters ring 0.
+const GDT_USER_CODE: u64 = 0x00AF_FA00_0000_FFFF;
+/// User data (DPL 3): kernel data encoding with DPL raised `0 -> 3`
+/// (`0x92 -> 0xF2` access byte), present + writable. Same deferred-entry
+/// contract as [`GDT_USER_CODE`].
+const GDT_USER_DATA: u64 = 0x00CF_F200_0000_FFFF;
 
 /// Exception vector for `#DE` (divide error). First IDT slot; no error
 /// code pushed by the CPU.
@@ -576,6 +594,27 @@ mod tests {
         assert_eq!(GDT_DATA >> 47 & 1, 1, "data descriptor must be present");
         assert_eq!(KERNEL_CODE_SEL, 0x08);
         assert_eq!(KERNEL_DATA_SEL, 0x10);
+        // S09 slice2c: user DPL3 descriptors — same shape as the kernel
+        // pair with DPL 0 -> 3 (bits 45-46), present, code L=1 +
+        // executable, data writable; selectors carry RPL 3.
+        assert_eq!(GDT_USER_CODE >> 43 & 1, 1, "user code must be executable");
+        assert_eq!(GDT_USER_CODE >> 45 & 0b11, 3, "user code DPL must be 3");
+        assert_eq!(GDT_USER_CODE >> 47 & 1, 1, "user code must be present");
+        assert_eq!(GDT_USER_CODE >> 53 & 1, 1, "user code must set L");
+        assert_eq!(GDT_USER_DATA >> 41 & 1, 1, "user data must be writable");
+        assert_eq!(
+            GDT_USER_DATA >> 43 & 1,
+            0,
+            "user data must not be executable"
+        );
+        assert_eq!(GDT_USER_DATA >> 45 & 0b11, 3, "user data DPL must be 3");
+        assert_eq!(GDT_USER_DATA >> 47 & 1, 1, "user data must be present");
+        assert_eq!(USER_CODE_SEL, 0x1B);
+        assert_eq!(USER_DATA_SEL, 0x23);
+        assert_eq!(USER_CODE_SEL >> 3, 3, "user code GDT index 3");
+        assert_eq!(USER_DATA_SEL >> 3, 4, "user data GDT index 4");
+        assert_eq!(USER_CODE_SEL & 0b11, 3, "user code RPL 3");
+        assert_eq!(USER_DATA_SEL & 0b11, 3, "user data RPL 3");
     }
 
     #[test]

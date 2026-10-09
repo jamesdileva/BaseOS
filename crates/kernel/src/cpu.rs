@@ -19,23 +19,26 @@
 
 use super::KERNEL_CODE_SEL;
 #[cfg(not(test))]
-use super::{GDT_CODE, GDT_DATA, GDT_NULL, VECTOR_DE, VECTOR_PF};
+use super::{GDT_CODE, GDT_DATA, GDT_NULL, GDT_USER_CODE, GDT_USER_DATA, VECTOR_DE, VECTOR_PF};
 #[cfg(not(test))]
 use crate::timer::VECTOR_TIMER;
 
-/// Minimal long-mode GDT: null, kernel code (`0x08`), kernel data (`0x10`).
+/// Minimal long-mode GDT: null, kernel code (`0x08`), kernel data (`0x10`),
+/// user code DPL3 (`0x1B`), user data DPL3 (`0x23`). S09 slice2c pins the
+/// user descriptors host-side; the guest still enters ring 0 (no `iretq`/
+/// TSS/user stacks yet), so the wider table is behavior-preserving.
 /// Static so `lgdt` keeps a stable base after the function returns.
 /// Guest-only (`cfg(not(test))`) — host tests cover the descriptor constants
 /// without constructing the table.
 #[cfg(not(test))]
 #[repr(C, align(16))]
 struct Gdt {
-    entries: [u64; 3],
+    entries: [u64; 5],
 }
 
 #[cfg(not(test))]
 static mut GDT: Gdt = Gdt {
-    entries: [GDT_NULL, GDT_CODE, GDT_DATA],
+    entries: [GDT_NULL, GDT_CODE, GDT_DATA, GDT_USER_CODE, GDT_USER_DATA],
 };
 
 /// Packed `lgdt` operand: 16-bit limit + 64-bit base (Intel SDM format).
