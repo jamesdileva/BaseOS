@@ -554,9 +554,13 @@ pub(crate) unsafe fn load_gdt() {
     // so `rsp0` must be valid before `ltr` makes the TSS active, not after.
     // SAFETY: `Tss` is `repr(C, packed)`; `rsp0` is an unaligned `u64`.
     let top = ring0_stack_top_for(core::ptr::addr_of!(RING0_STACK) as u64);
-    debug_assert_ne!(top, 0, "TSS.rsp0 must be nonzero before ltr");
+    // REVIEW #644: release-present `assert_ne!` (not `debug_assert!` — the
+    // latter compiles out in the release UEFI profile, silently restoring
+    // the caller-convention gun). One-time boot cost only; a zero `top`
+    // fails loudly via panic instead of a later `#SS(0)`/triple-fault.
+    assert_ne!(top, 0, "TSS.rsp0 must be nonzero before ltr");
     core::ptr::addr_of_mut!((*core::ptr::addr_of_mut!(TSS)).rsp0).write_unaligned(top);
-    debug_assert_ne!(
+    assert_ne!(
         core::ptr::addr_of!((*core::ptr::addr_of!(TSS)).rsp0).read_unaligned(),
         0,
         "TSS.rsp0 write must land (offset 4) before ltr"
@@ -659,7 +663,8 @@ mod tests {
         // live TR with `rsp0 == 0` (first CPL3->0 entry would #SS(0)/
         // triple-fault). Host pins the helper the guest `load_gdt` consumes:
         // 16 KiB, 16-aligned top, nonzero, overflow-saturating.
-        // REVIEW #642: guest `load_gdt` now `debug_assert_ne!`s the top and
+        // REVIEW #642/#644: guest `load_gdt` now `assert_ne!`s the top and
+        // the written `rsp0` pre-`ltr` (release-present per #644; this test
         // the written `rsp0` pre-`ltr`; this test is the host side of that
         // gate (same invariants, plus offset + in-range).
         assert_eq!(RING0_STACK_LEN, 16384, "one 16 KiB ring-0 stack");
@@ -683,6 +688,22 @@ mod tests {
         assert!(base <= top.wrapping_sub(1) && top.wrapping_sub(1) < top);
         assert!(base <= top.wrapping_sub(8) && top.wrapping_sub(8) < top);
         assert_eq!(ring0_stack_top_for(u64::MAX), u64::MAX, "saturates");
+        // REVIEW #644 release-fold theorem: `saturating_add(16384)` can never
+        // yield 0 (true sum is either exact-nonzero or saturates to MAX), so
+        // the release optimizer folds the guest `assert_ne!(top, 0)` by proof
+        // (release EFI keeps generic panic strings but drops ours) while
+        // debug builds still check loudly at runtime. Pin the exact
+        // would-be-zero preimage: base == -16384 overflows, saturates to MAX.
+        assert_eq!(
+            ring0_stack_top_for(u64::MAX - 16383),
+            u64::MAX,
+            "exact-zero preimage saturates, never 0"
+        );
+        assert_ne!(
+            ring0_stack_top_for(0),
+            0,
+            "zero base still yields nonzero top"
+        );
         // The constructor stays zero; only `load_gdt` wires the top.
         let mut tss = Tss::new();
         unsafe {
