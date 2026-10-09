@@ -288,9 +288,72 @@ pub(crate) fn write_pf_line(ok: bool, vector: u64, code: u64, cr2: u64) {
     com1_write_byte(b'\n');
 }
 
+/// Pure PFUS line formatter shared by the guest writer and host tests
+/// (S09 slice2b, REVIEW #622 risk 3: the USER line is classifier-only, so the
+/// live `#PF` U/S path needs its own e2e-pinned shape).
+///
+/// Emits `PFUS ok=<0|1> us=<0|1> w=<0|1> p=<0|1>\n` through a byte callback
+/// (`core`-only, no port I/O), so host tests pin the literal field order,
+/// names, and decimal shape while [`write_pfus_line`] reuses this exact body
+/// for its COM1-direct write. `us`/`w`/`p` are the decoded `#PF` error-code
+/// U/S (bit 2), W/R (bit 1), P (bit 0) bits; `ok` is the caller-computed
+/// [`crate::pf_us_verdict`] fail-closed verdict. `no_std`-clean; the guest
+/// passes a `com1_write_byte` closure (infallible).
+pub(crate) fn emit_pfus_line<E>(
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+    ok: bool,
+    us: bool,
+    w: bool,
+    p: bool,
+) -> Result<(), E> {
+    use baseos_boot_info::{write_str, write_u64_dec};
+    write_str(emit, "PFUS ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " us=")?;
+    write_u64_dec(emit, u64::from(us))?;
+    write_str(emit, " w=")?;
+    write_u64_dec(emit, u64::from(w))?;
+    write_str(emit, " p=")?;
+    write_u64_dec(emit, u64::from(p))?;
+    write_str(emit, "\n")
+}
+
+/// Emit `PFUS ok=<0|1> us=<0|1> w=<0|1> p=<0|1>\n` directly on COM1
+/// (S09 slice2b live-`#PF` U/S path: `ok` is 1 only when the live handler
+/// decoded the supervisor-read-not-present shape `us=0 w=0 p=0` at the
+/// expected probe address — any U/S=1, write, or present fault prints `ok=0`
+/// fail-closed; CPL3 `U=1` entry stays deferred, see [`crate::pf_us_verdict`]).
+///
+/// Safe wrapper: only calls [`com1_write_byte`] via [`emit_pfus_line`].
+/// Requires COM1 initialized; single-threaded exception context owns
+/// the UART exclusively.
+pub(crate) fn write_pfus_line(ok: bool, us: bool, w: bool, p: bool) {
+    let mut out = |b: u8| {
+        com1_write_byte(b);
+        Ok::<(), core::convert::Infallible>(())
+    };
+    let _ = emit_pfus_line(&mut out, ok, us, w, p);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_pfus(ok: bool, us: bool, w: bool, p: bool) -> String {
+        let mut out = Vec::new();
+        emit_pfus_line::<core::convert::Infallible>(
+            &mut |b| {
+                out.push(b);
+                Ok(())
+            },
+            ok,
+            us,
+            w,
+            p,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
 
     fn run_sti(ok: bool, ticks: u64, work: u64, spins: u64, batch: u64, target: u64) -> String {
         let mut out = Vec::new();
@@ -342,6 +405,33 @@ mod tests {
         );
         assert!(ticks_i < work_i && work_i < spins_i && spins_i < batch_i && batch_i < target_i);
         assert!(line.starts_with("STI ok="));
+        assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn pfus_line_pins_exact_field_order_and_fail_closed_shape() {
+        // S09 slice2b: host backstop for the live-#PF U/S e2e shape. The
+        // guest PF handler shares this body, so a format drift fails here.
+        assert_eq!(
+            run_pfus(true, false, false, false),
+            "PFUS ok=1 us=0 w=0 p=0\n"
+        );
+        assert_eq!(
+            run_pfus(false, true, false, false),
+            "PFUS ok=0 us=1 w=0 p=0\n"
+        );
+        assert_eq!(
+            run_pfus(false, false, true, true),
+            "PFUS ok=0 us=0 w=1 p=1\n"
+        );
+        let line = run_pfus(true, false, false, false);
+        let (us_i, w_i, p_i) = (
+            line.find(" us=").unwrap(),
+            line.find(" w=").unwrap(),
+            line.find(" p=").unwrap(),
+        );
+        assert!(us_i < w_i && w_i < p_i);
+        assert!(line.starts_with("PFUS ok="));
         assert!(line.ends_with('\n'));
     }
 }

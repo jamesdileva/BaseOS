@@ -17,7 +17,7 @@
 //! `x86_64-unknown-uefi`, boots OVMF, and asserts the marker plus the
 //! `BOOTINFO valid=1`, `MEMMAP ok=1`, `FB present=1`, `GOP ok=1`,
 //! `EBS ok=1`, `KERNEL ok=1`, `FRAMEALLOC ok=1`, `PAGING ok=1`, `PERM ok=1`,
-//! `PERMAUDIT ok=1`, `PERMAUDIT2 ok=1`, `RMBZ ok=1`, `USER ok=1`,
+//! `PERMAUDIT ok=1`, `PERMAUDIT2 ok=1`, `RMBZ ok=1`, `USER ok=1`, `PFUS ok=1`,
 //! summary lines in the serial capture. The `MEMMAP` line also carries
 //! `map_size`/`desc_size` for the 16 KiB + 4 KiB budget baseline (#59a).
 

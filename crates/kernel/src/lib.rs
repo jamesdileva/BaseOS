@@ -46,7 +46,7 @@ pub mod uart;
 pub(crate) use cpu::IdtEntry;
 #[cfg(not(test))]
 use uart::write_tick_line;
-use uart::{write_exc_line, write_pf_line};
+use uart::{write_exc_line, write_pf_line, write_pfus_line};
 
 /// Enter the kernel with the boot handoff: validate [`BootInfo`] and emit
 /// the one-line entry proof on the caller's byte sink:
@@ -200,6 +200,31 @@ extern "C" fn exception_handler_rust(vector: u64) -> ! {
     }
 }
 
+/// Fail-closed live-`#PF` U/S verdict (S09 slice2b, REVIEW #622 risk 3).
+///
+/// The S09 `USER` line is classifier-only (`classify_access` `Err` returns),
+/// not a live `#PF` with a CPU-pushed U/S bit. This is the smallest live
+/// proof: the supervisor-read-not-present probe at [`PF_PROBE_ADDR`] must
+/// arrive with error code `0x0` (`P=0` not-present, `W/R=0` read, `U/S=0`
+/// supervisor) at the expected fault address. Returns `(ok, us, w, p)` where
+/// `us`/`w`/`p` are the decoded bits and `ok` is true only when
+/// `us == false && w == false && p == false && cr2 == PF_PROBE_ADDR` — any
+/// `U/S=1`, write, present, or off-probe fault prints `ok=0` fail-closed
+/// instead of a silent pass.
+///
+/// Pure / `core`-only so host tests and the guest `#PF` handler share the
+/// exact rule; the guest maps `ok` to `PFUS ok=1` (hard-required by
+/// `boot-uefi.ps1`). CPL3 `U=1` entry (user stacks, DPL3 GDT/TSS, `iretq` to
+/// ring 3) stays deferred: this slice pins the supervisor half of the U/S
+/// path live, the user half stays classifier-only until that slice.
+#[must_use]
+pub fn pf_us_verdict(code: u64, cr2: u64) -> (bool, bool, bool, bool) {
+    let err = PfError::from_bits(code);
+    let (us, w, p) = (err.is_user(), err.is_write(), err.is_present());
+    let ok = !us && !w && !p && cr2 == PF_PROBE_ADDR;
+    (ok, us, w, p)
+}
+
 /// Rust body of the `#PF` stub: prove the fault was *caught* (serial
 /// line) then chain into an intentional `#DE` so the single e2e boot proves
 /// BOTH vectors (`PF ok=1 ...` then `EXC ok=1 vector=0`) before parking.
@@ -217,6 +242,11 @@ pub extern "C" fn exception_handler_pf_rust(vector: u64, code: u64, cr2: u64) ->
     // fault-chain `div` + `hlt` park need `unsafe`. Same COM1-exclusive
     // contract as `exception_handler_rust`.
     write_pf_line(true, vector, code, cr2);
+    // S09 slice2b live-U/S proof: decode the CPU-pushed error code and emit
+    // the fail-closed PFUS line before chaining (a U=1/W=1/P=1/off-probe
+    // fault prints `PFUS ok=0` and fails the e2e hard-require loudly).
+    let (us_ok, us, w, p) = pf_us_verdict(code, cr2);
+    write_pfus_line(us_ok, us, w, p);
     unsafe {
         // Chain: intentional #DE so e2e keeps its EXC hard-require.
         core::arch::asm!("xor eax, eax", "xor edx, edx", "div eax", options(nostack),);
@@ -712,6 +742,42 @@ mod tests {
     }
 
     #[test]
+    fn pf_us_verdict_pins_supervisor_read_not_present_live_shape() {
+        // S09 slice2b (REVIEW #622 risk 3): the live probe is a supervisor
+        // read of unmapped PF_PROBE_ADDR, so the CPU pushes code 0x0 at the
+        // probe address. Any U/S=1, write, present, or off-probe fault must
+        // fail closed (ok=0) while still reporting the decoded bits.
+        assert_eq!(
+            pf_us_verdict(0x0, PF_PROBE_ADDR),
+            (true, false, false, false)
+        );
+        // U/S=1 (CPL3 fault shape): decoded us=1, verdict refuses.
+        assert_eq!(
+            pf_us_verdict(0b100, PF_PROBE_ADDR),
+            (false, true, false, false)
+        );
+        // Write fault: decoded w=1, verdict refuses.
+        assert_eq!(
+            pf_us_verdict(0b010, PF_PROBE_ADDR),
+            (false, false, true, false)
+        );
+        // Present (protection-violation) fault: decoded p=1, refuses.
+        assert_eq!(
+            pf_us_verdict(0b001, PF_PROBE_ADDR),
+            (false, false, false, true)
+        );
+        // Right code, wrong address (stale CR2): refuses.
+        assert_eq!(
+            pf_us_verdict(0x0, PF_PROBE_ADDR + 0x1000),
+            (false, false, false, false)
+        );
+        // Upper CPU bits (PK/SGX/HLAT) never flip the bit 0-2 verdict.
+        assert_eq!(
+            pf_us_verdict(!0x1Fu64, PF_PROBE_ADDR),
+            (true, false, false, false)
+        );
+    }
+    #[test]
     fn pf_probe_addr_is_canonical_unmapped_guard() {
         // #168n6 live-#PF guard: canonical low-half, 4 KiB-aligned, far
         // above firmware RAM/FB (0x80000000) and below the non-canonical
@@ -762,12 +828,15 @@ mod tests {
         let write_byte: fn(u8) = uart::com1_write_byte;
         let exc: fn(bool, u64) = uart::write_exc_line;
         let pf: fn(bool, u64, u64, u64) = uart::write_pf_line;
+        let pfus: fn(bool, bool, bool, bool) = uart::write_pfus_line;
         let tick: fn(bool, u64) = uart::write_tick_line;
         let sti: fn(bool, u64, u64, u64, u64, u64) = uart::write_sti_line;
         let irqstack: fn(bool, u64, u64, u64, u64) = uart::write_irqstack_line;
         let dec: fn(u64) = uart::write_dec_u64;
         let hex: fn(u64) = uart::write_hex_u64;
-        let _ = (init, write_byte, exc, pf, tick, sti, irqstack, dec, hex);
+        let _ = (
+            init, write_byte, exc, pf, pfus, tick, sti, irqstack, dec, hex,
+        );
     }
 
     #[test]
