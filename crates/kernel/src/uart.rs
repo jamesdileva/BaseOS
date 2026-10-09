@@ -204,6 +204,41 @@ pub(crate) fn write_irqstack_line(ok: bool, task_rsp: u64, irq_rsp: u64, base: u
     com1_write_byte(b'\n');
 }
 
+/// Pure STI line formatter shared by the guest writer and host tests
+/// (S08 slice6, REVIEW #610 N3: batch/target line shape was e2e-only — the
+/// only shape check was the ps1 `$stiPat`/`$stiVals` regex, so a guest
+/// format drift was caught only under QEMU).
+///
+/// Emits `STI ok=<0|1> ticks=<n> work=<m> spins=<s> batch=<b> target=<t>\n`
+/// through a byte callback (`core`-only, no port I/O), so host tests pin
+/// the literal field order, names, and decimal shape while
+/// [`write_sti_line`] reuses this exact body for its COM1-direct write.
+/// `no_std`-clean; the guest passes a `com1_write_byte` closure (infallible).
+pub(crate) fn emit_sti_line<E>(
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+    ok: bool,
+    ticks: u64,
+    work: u64,
+    spins: u64,
+    batch: u64,
+    target: u64,
+) -> Result<(), E> {
+    use baseos_boot_info::{write_str, write_u64_dec};
+    write_str(emit, "STI ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " ticks=")?;
+    write_u64_dec(emit, ticks)?;
+    write_str(emit, " work=")?;
+    write_u64_dec(emit, work)?;
+    write_str(emit, " spins=")?;
+    write_u64_dec(emit, spins)?;
+    write_str(emit, " batch=")?;
+    write_u64_dec(emit, batch)?;
+    write_str(emit, " target=")?;
+    write_u64_dec(emit, target)?;
+    write_str(emit, "\n")
+}
+
 /// Emit `STI ok=<0|1> ticks=<n> work=<m> spins=<s> batch=<b> target=<t>\n`
 /// directly on COM1 (S08 slice 2 preemption probe: `ok` is 1 only when the
 /// joint [`crate::timer::sti_window_ready`] gate clears — cumulative ticks
@@ -216,35 +251,15 @@ pub(crate) fn write_irqstack_line(ok: bool, task_rsp: u64, irq_rsp: u64, base: u
 /// (`work = (spins + 1) * BATCH` at a fixed batch) — without them a
 /// tick-bound vs work-bound change misreads).
 ///
-/// Safe wrapper: only calls [`com1_write_byte`] plus the safe decimal
-/// helper. Requires COM1 initialized; single-threaded bring-up context owns
+/// Safe wrapper: only calls [`com1_write_byte`] via [`emit_sti_line`].
+/// Requires COM1 initialized; single-threaded bring-up context owns
 /// the UART exclusively.
 pub(crate) fn write_sti_line(ok: bool, ticks: u64, work: u64, spins: u64, batch: u64, target: u64) {
-    for b in b"STI ok=" {
-        com1_write_byte(*b);
-    }
-    com1_write_byte(if ok { b'1' } else { b'0' });
-    for b in b" ticks=" {
-        com1_write_byte(*b);
-    }
-    write_dec_u64(ticks);
-    for b in b" work=" {
-        com1_write_byte(*b);
-    }
-    write_dec_u64(work);
-    for b in b" spins=" {
-        com1_write_byte(*b);
-    }
-    write_dec_u64(spins);
-    for b in b" batch=" {
-        com1_write_byte(*b);
-    }
-    write_dec_u64(batch);
-    for b in b" target=" {
-        com1_write_byte(*b);
-    }
-    write_dec_u64(target);
-    com1_write_byte(b'\n');
+    let mut out = |b: u8| {
+        com1_write_byte(b);
+        Ok::<(), core::convert::Infallible>(())
+    };
+    let _ = emit_sti_line(&mut out, ok, ticks, work, spins, batch, target);
 }
 
 /// Emit `PF ok=<0|1> vector=<n> code=<0x...> addr=<0x...>\n` directly on
@@ -271,4 +286,62 @@ pub(crate) fn write_pf_line(ok: bool, vector: u64, code: u64, cr2: u64) {
     }
     write_hex_u64(cr2);
     com1_write_byte(b'\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_sti(ok: bool, ticks: u64, work: u64, spins: u64, batch: u64, target: u64) -> String {
+        let mut out = Vec::new();
+        emit_sti_line::<core::convert::Infallible>(
+            &mut |b| {
+                out.push(b);
+                Ok(())
+            },
+            ok,
+            ticks,
+            work,
+            spins,
+            batch,
+            target,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn sti_line_pins_exact_field_order_names_and_decimals() {
+        // REVIEW #610 N3: host backstop for the e2e-only batch/target shape.
+        // The guest writer shares this body, so a format drift fails here.
+        assert_eq!(
+            run_sti(true, 5, 20_000, 9, 2_000, 20_000),
+            "STI ok=1 ticks=5 work=20000 spins=9 batch=2000 target=20000\n"
+        );
+    }
+
+    #[test]
+    fn sti_line_fail_closed_shape_and_zero_values() {
+        assert_eq!(
+            run_sti(false, 0, 0, 0, 2_000, 20_000),
+            "STI ok=0 ticks=0 work=0 spins=0 batch=2000 target=20000\n"
+        );
+        // Decimal, never hex/padded: values above 9 prove base-10 shape.
+        let line = run_sti(true, 12, 34, 56, 78, 90);
+        assert_eq!(
+            line,
+            "STI ok=1 ticks=12 work=34 spins=56 batch=78 target=90\n"
+        );
+        // Field order is load-bearing for the ps1 regex groups.
+        let (ticks_i, work_i, spins_i, batch_i, target_i) = (
+            line.find(" ticks=").unwrap(),
+            line.find(" work=").unwrap(),
+            line.find(" spins=").unwrap(),
+            line.find(" batch=").unwrap(),
+            line.find(" target=").unwrap(),
+        );
+        assert!(ticks_i < work_i && work_i < spins_i && spins_i < batch_i && batch_i < target_i);
+        assert!(line.starts_with("STI ok="));
+        assert!(line.ends_with('\n'));
+    }
 }
