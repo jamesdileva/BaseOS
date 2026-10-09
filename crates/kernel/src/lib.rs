@@ -115,26 +115,22 @@ const GDT_USER_CODE: u64 = 0x00AF_FA00_0000_FFFF;
 /// (`0x92 -> 0xF2` access byte), present + writable. Same deferred-entry
 /// contract as [`GDT_USER_CODE`].
 const GDT_USER_DATA: u64 = 0x00CF_F200_0000_FFFF;
-/// TSS selector (GDT entry 5, RPL 0): `5 * 8 = 0x28`. S09 slice2e pins the
-/// encoding only — the guest GDT stays 5 entries and `TR` is never loaded
-/// this slice, so the wider selector is behavior-preserving (table growth
-/// to 7 slots + `ltr` rides with the TSS-wiring slice).
-#[allow(dead_code)]
-const TSS_SEL: u16 = 0x28;
+/// TSS selector (GDT entry 5, RPL 0): `5 * 8 = 0x28`. S09 slice2g wires the
+/// 7-slot table and loads `TR` with this selector (RSP0 stays 0 until the
+/// user-stack slice provides a ring-0 stack for CPL3->0 transitions).
+pub(crate) const TSS_SEL: u16 = 0x28;
 /// Available 64-bit TSS descriptor type (Intel SDM Vol 3 §7.2.3: `0x9`).
 /// Busy (`0xB`) is what the CPU writes on first `ltr`/task-switch; the host
 /// pin asserts the initial image is available, never busy.
-#[allow(dead_code)]
-const TSS_TYPE_AVAIL: u64 = 0x9;
+pub(crate) const TSS_TYPE_AVAIL: u64 = 0x9;
 
 /// Low 64 bits of a 64-bit available-TSS system descriptor (Intel SDM
 /// Vol 3 Fig 7-4): limit 15:0, base 23:0 split, type `0x9`, S=0, DPL=0,
 /// P=1, limit 19:16, AVL=0, L=0, DB=0, G=0 (byte-granular), base 31:24.
-/// Pure encoding — the guest table stays 5 entries this slice; the TSS
-/// wiring slice consumes this to grow the GDT to 7 slots.
+/// Consumed by the TSS-wiring slice (`cpu::load_gdt` grows the GDT to 7
+/// slots with this encoding).
 /// `limit` is the byte limit (`size - 1`, e.g. 103 for a 104-byte TSS).
-#[allow(dead_code)]
-const fn tss_desc_low(base: u64, limit: u32) -> u64 {
+pub(crate) const fn tss_desc_low(base: u64, limit: u32) -> u64 {
     let limit = (limit as u64) & 0xF_FFFF;
     let b = base & 0xFFFF_FFFF;
     (limit & 0xFFFF)
@@ -147,9 +143,8 @@ const fn tss_desc_low(base: u64, limit: u32) -> u64 {
 }
 
 /// High 64 bits of a 64-bit TSS descriptor: base 63:32, upper reserved 0.
-/// Companion to [`tss_desc_low`]; same deferred-wiring contract.
-#[allow(dead_code)]
-const fn tss_desc_high(base: u64) -> u64 {
+/// Companion to [`tss_desc_low`]; consumed by `cpu::load_gdt`.
+pub(crate) const fn tss_desc_high(base: u64) -> u64 {
     base >> 32
 }
 

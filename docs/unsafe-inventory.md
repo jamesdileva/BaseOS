@@ -64,7 +64,7 @@ rides with the slice that closes S05. Slice 3 moved D1/D2 (+ tables) from
 
 | # | Site | Why unsafe | Invariant / caller contract | Proof |
 |---|---|---|---|---|
-| D1 | kernel `cpu::load_gdt` (slice 3 @this-slice, was lib.rs 494 @bfc4790): `addr_of!(GDT)`, `lgdt`, far-return CS reload | Privileged descriptor load + segment switch | Post-EBS boot CPU; static outlives use; selectors `0x08`/`0x10` | Survival into `#DE` e2e |
+| D1 | kernel `cpu::load_gdt` (slice 3 @this-slice, was lib.rs 494 @bfc4790; S09 slice2g: GDT 5->7 slots + `TSS` static + `ltr TSS_SEL`, `rsp0=0` until the user-stack slice) | Privileged descriptor load + segment switch | Post-EBS boot CPU; static outlives use; selectors `0x08`/`0x10` | Survival into `#DE` e2e |
 | D2 | kernel `cpu::load_idt` (slice 3 @this-slice, was lib.rs 528 @bfc4790): `addr_of_mut!(IDT)` gate writes, `addr_of!(IDT)`, `lidt` — gates built via safe [`gate_for`] (pins `KERNEL_CODE_SEL`; slice 4: `IdtEntry::from_handler` is private to `cpu`, so the pin is compiler-enforced) | Privileged table load; raw static mutation | `cli` in effect; gates target `baseos_isr_div0`/`baseos_isr_pf` with `KERNEL_CODE_SEL` | `PF`+`EXC` lines e2e |
 | D3 | `global_asm!` stubs (481/483) + `extern "C"` fwd decls (544) | Hand-written entry code (Win64 ABI: vector in `RCX`, shadow space, align) | Host ABI-pin tests share the macro source | Stub-ABI tests; live fire e2e |
 | D4 | `exception_handler_rust` body (327) / `exception_handler_pf_rust` body (349): `hlt`, chained `div eax` (352) | `hlt`/fault-chain are CPU instructions | COM1-exclusive exception context; never returns so the pushed `#PF` error code needs no pop (`add rsp,8` owed only if a future handler returns) | `PF ok=1` then `EXC ok=1` chained e2e |

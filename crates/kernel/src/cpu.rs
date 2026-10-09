@@ -18,28 +18,88 @@
 //! statics outlive use.
 
 use super::KERNEL_CODE_SEL;
+use super::{tss_desc_high, tss_desc_low, TSS_SEL};
 #[cfg(not(test))]
 use super::{GDT_CODE, GDT_DATA, GDT_NULL, GDT_USER_CODE, GDT_USER_DATA, VECTOR_DE, VECTOR_PF};
 #[cfg(not(test))]
 use crate::timer::VECTOR_TIMER;
 
+/// Number of GDT slots: null + kernel code/data + user code/data (S09
+/// slice2c) + one 16-byte TSS descriptor occupying slots 5-6 (S09 slice2g).
+/// Single-sources the guest table length so the `TSS_SEL` index pin and the
+/// `lgdt` limit cannot drift apart.
+pub(crate) const GDT_LEN: usize = 7;
+/// GDT index of the TSS descriptor (low half); `TSS_SEL == index * 8`.
+pub(crate) const GDT_TSS_INDEX: usize = 5;
+
+/// Minimal 64-bit Task State Segment (Intel SDM Vol 3 Fig 7-4, 104 bytes):
+/// only `rsp0` matters for CPL3->0 stack switching; every IST entry stays 0
+/// (single stack, no IST this slice) and `iomap_base == size` marks an empty
+/// I/O bitmap. `rsp0` stays 0 until the user-stack slice provides a ring-0
+/// stack -- `ltr` alone never consults it, so the zero is boot-neutral.
+///
+/// `repr(C, packed)`: the hardware layout puts `rsp0` at offset 4
+/// (unaligned `u64`); plain `repr(C)` would insert 4 padding bytes and yield
+/// 112 bytes. Field access must go through `addr_of!` + `read_unaligned`.
+#[repr(C, packed)]
+pub(crate) struct Tss {
+    pub(crate) reserved0: u32,
+    pub(crate) rsp0: u64,
+    pub(crate) rsp1: u64,
+    pub(crate) rsp2: u64,
+    pub(crate) reserved1: u64,
+    pub(crate) ist: [u64; 7],
+    pub(crate) reserved2: u64,
+    pub(crate) reserved3: u16,
+    pub(crate) iomap_base: u16,
+}
+
+impl Tss {
+    /// Zero TSS with an empty I/O bitmap (`iomap_base == size`, no bitmap).
+    pub(crate) const fn new() -> Self {
+        Self {
+            reserved0: 0,
+            rsp0: 0,
+            rsp1: 0,
+            rsp2: 0,
+            reserved1: 0,
+            ist: [0; 7],
+            reserved2: 0,
+            reserved3: 0,
+            iomap_base: 104,
+        }
+    }
+}
+
 /// Minimal long-mode GDT: null, kernel code (`0x08`), kernel data (`0x10`),
-/// user code DPL3 (`0x1B`), user data DPL3 (`0x23`). S09 slice2c pins the
-/// user descriptors host-side; the guest still enters ring 0 (no `iretq`/
-/// TSS/user stacks yet), so the wider table is behavior-preserving.
+/// user code DPL3 (`0x1B`), user data DPL3 (`0x23`), plus the 16-byte TSS
+/// descriptor in slots 5-6 (S09 slice2g wires `TR` via `ltr`; the guest still
+/// enters ring 0 with no `iretq`/user stacks yet, so the wider table is
+/// behavior-preserving).
 /// Static so `lgdt` keeps a stable base after the function returns.
 /// Guest-only (`cfg(not(test))`) — host tests cover the descriptor constants
 /// without constructing the table.
 #[cfg(not(test))]
 #[repr(C, align(16))]
 struct Gdt {
-    entries: [u64; 5],
+    entries: [u64; GDT_LEN],
 }
 
 #[cfg(not(test))]
 static mut GDT: Gdt = Gdt {
-    entries: [GDT_NULL, GDT_CODE, GDT_DATA, GDT_USER_CODE, GDT_USER_DATA],
+    entries: [
+        GDT_NULL,
+        GDT_CODE,
+        GDT_DATA,
+        GDT_USER_CODE,
+        GDT_USER_DATA,
+        0,
+        0,
+    ],
 };
+
+#[cfg(not(test))]
+static mut TSS: Tss = Tss::new();
 
 /// Packed `lgdt` operand: 16-bit limit + 64-bit base (Intel SDM format).
 #[cfg(not(test))]
@@ -445,17 +505,23 @@ extern "C" {
 /// [`super::EXCEPTION_VECTORS`] (32 exception vectors + timer vector 32).
 const IDT_VECTORS: usize = super::EXCEPTION_VECTORS + 1;
 
-/// Load the S02 GDT and reload visible segment registers + CS.
+/// Load the S02 GDT, wire the TSS descriptor, load `TR`, and reload visible
+/// segment registers + CS.
 ///
 /// # Safety
-/// Guest-only post-`ExitBootServices` path: `GDT` is a stable static, the
-/// far-return reloads CS to [`KERNEL_CODE_SEL`], and data selectors point
-/// at the kernel data selector. Host builds are a no-op (no `lgdt` on the
-/// test harness); the OVMF e2e path proves the descriptors by surviving past
-/// load into the intentional `#DE`.
+/// Guest-only post-`ExitBootServices` path: `GDT`/`TSS` are stable statics,
+/// the far-return reloads CS to [`KERNEL_CODE_SEL`], and data selectors point
+/// at the kernel data selector. `TSS.rsp0` stays 0 until the user-stack slice
+/// (no CPL3 entry yet, so no CPL3->0 transition can consume it). Host builds
+/// are a no-op (no `lgdt`/`ltr` on the test harness); the OVMF e2e path proves
+/// the descriptors by surviving past load into the intentional `#DE`.
 #[cfg(not(test))]
 pub(crate) unsafe fn load_gdt() {
     use super::KERNEL_DATA_SEL;
+    let base = core::ptr::addr_of!(TSS) as u64;
+    let limit = (core::mem::size_of::<Tss>() - 1) as u32;
+    (*core::ptr::addr_of_mut!(GDT)).entries[GDT_TSS_INDEX] = tss_desc_low(base, limit);
+    (*core::ptr::addr_of_mut!(GDT)).entries[GDT_TSS_INDEX + 1] = tss_desc_high(base);
     let ptr = DescriptorTablePointer {
         limit: (core::mem::size_of::<Gdt>() - 1) as u16,
         base: core::ptr::addr_of!(GDT) as u64,
@@ -477,6 +543,7 @@ pub(crate) unsafe fn load_gdt() {
         code = in(reg) u64::from(KERNEL_CODE_SEL),
         options(preserves_flags),
     );
+    core::arch::asm!("ltr {sel:x}", sel = in(reg) TSS_SEL, options(nostack, preserves_flags));
 }
 
 /// Populate `#DE` (vector 0) + `#PF` (vector 14) + timer IRQ0 (vector 32)
@@ -514,6 +581,38 @@ pub(crate) unsafe fn load_idt() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tss_wiring_pins_table_shape_and_empty_bitmap() {
+        // S09 slice2g (#30 remainder): the `ltr` wiring slice grows the guest
+        // GDT to 7 slots with the TSS descriptor at index 5; host pins the
+        // shape the guest `load_gdt` consumes (selector/index/limit/size).
+        assert_eq!(GDT_LEN, 7, "null + kcode + kdata + ucode + udata + tss x2");
+        assert_eq!(GDT_TSS_INDEX, 5);
+        assert_eq!(TSS_SEL, 0x28);
+        assert_eq!(TSS_SEL >> 3, GDT_TSS_INDEX as u16);
+        assert_eq!(TSS_SEL & 0b11, 0, "TSS RPL 0");
+        assert_eq!(core::mem::size_of::<Tss>(), 104);
+        let tss = Tss::new();
+        // SAFETY: `Tss` is `repr(C, packed)` (hardware layout); host test only.
+        let rsp0 = unsafe { core::ptr::addr_of!(tss.rsp0).read_unaligned() };
+        let iomap = unsafe { core::ptr::addr_of!(tss.iomap_base).read_unaligned() };
+        assert_eq!(rsp0, 0, "no ring-0 stack until the user-stack slice");
+        assert_eq!(iomap, 104, "empty I/O bitmap");
+        assert_eq!(
+            (core::mem::size_of::<Tss>() - 1) as u32,
+            103,
+            "byte-limit for tss_desc_low"
+        );
+        // Wiring consumes the available-type encoding (busy never initial).
+        assert_eq!(super::super::TSS_TYPE_AVAIL, 0x9);
+        let lo = tss_desc_low(0x0000_ABCD_1234_5000, 103);
+        assert_eq!(lo >> 40 & 0xF, 0x9, "wired descriptor stays available");
+        assert_eq!(
+            tss_desc_high(0x0000_ABCD_1234_5000),
+            0x0000_ABCD_1234_5000_u64 >> 32
+        );
+    }
 
     #[test]
     fn gate_for_pins_kernel_code_selector() {
