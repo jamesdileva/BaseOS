@@ -259,7 +259,10 @@ if ($serialText -and $serialText.Contains($marker)) {
   # the sti_window_ready gate - cumulative ticks AND preempted-workload
   # progress - on one line. Same-line shape mirrors the TICK gate (literal
   # space after ok=1 stops ok=10 false-passing, [1-9] stops ticks=0/work=0).
-  $stiPat = "STI ok=1 [^\r\n]*ticks=[1-9][0-9]*[^\r\n]*work=[1-9][0-9]*(\s|$)"
+  # S08 slice3 (trace capture): the used hlt-spin count rides on the same
+  # line so a parameter change is comparable before/after; spins=[0-9]+
+  # requires the field present while tolerating a 0-spin immediate wakeup.
+  $stiPat = "STI ok=1 [^\r\n]*ticks=[1-9][0-9]*[^\r\n]*work=[1-9][0-9]*[^\r\n]*spins=[0-9]+(\s|$)"
   # S07 slice68 (nit 3 RSP-switch proof): the IRQ body runs on the dedicated
   # IRQ stack while dispatch stays on the task stack. Same-line regex mirrors
   # the PF gate: literal space after ok=1 stops ok=10 false-passing,
@@ -383,7 +386,7 @@ if ($serialText -and $serialText.Contains($marker)) {
        "SCHED-TRACE-X ok=1 present=$hasSchedTraceX, " +
        "SCHED-TICK ok=1 present=$hasSchedTick, " +
        "TICK ok=1 ticks-shape present=$hasTick, " +
-       "STI ok=1 ticks/work-shape present=$hasSti, " +
+       "STI ok=1 ticks/work/spins-shape present=$hasSti, " +
       "IRQSTACK ok=1 task/irq-shape present=$hasIrqstack, " +
       "THREAD-JUMP ok=1 id=2 present=$hasThreadJump, " +
       "THREAD-JUMP-RUN id=2 present=$hasThreadJumpRun, " +

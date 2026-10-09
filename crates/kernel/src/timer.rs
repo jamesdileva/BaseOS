@@ -314,6 +314,15 @@ pub const STI_WORK_TARGET: u64 = 20_000;
 /// 800 k iterations worst case, trivial for QEMU TCG.
 pub const STI_WORK_BATCH: u64 = 4_000;
 
+/// Wait-loop `hlt` budget for the S08 `sti` window (slice 3).
+///
+/// Named (instead of a raw `200` in the bring-up loop) so the host pin and
+/// the guest stay single-sourced: at 100 Hz, 200 spins cover ~2 s, far
+/// beyond the ~50 ms the `QUANTUM_TICKS + 1` tick half needs. The guest
+/// reports its used spins on the `STI` trace line so a parameter change
+/// (quantum, batch, target) produces a comparable before/after spin count.
+pub const STI_MAX_SPINS: u32 = 200;
+
 /// Pure S08-slice1 sti-window gate (REVIEW #598: no hlt-only assumption).
 ///
 /// `true` only when BOTH the cumulative tick total AND the preempted
@@ -1297,6 +1306,12 @@ mod tests {
         assert_eq!(STI_WORK_TARGET, 20_000);
         assert_eq!(STI_WORK_BATCH, 4_000);
         assert!(STI_WORK_TARGET.is_multiple_of(STI_WORK_BATCH));
+        // S08 slice3 (trace capture): the wait-loop budget is a named const
+        // single-sourced with the guest loop bound — a raw `200` edit in the
+        // guest without this pin fails here. 200 spins at 100 Hz cover ~2 s,
+        // far beyond the ~50 ms the QUANTUM_TICKS + 1 tick half needs, so a
+        // healthy boot wakes on the gate, never on the budget.
+        assert_eq!(STI_MAX_SPINS, 200);
         for (ticks, work, tt, wt) in [
             (5u64, 100u64, 5u64, 100u64),
             (6, 200, 5, 100),

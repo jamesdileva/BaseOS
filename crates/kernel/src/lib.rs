@@ -302,8 +302,8 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 /// `PF ok=1 vector=14 code=... addr=...` and chains into an intentional
 /// `#DE` so `EXC ok=1 vector=0` still fires before parking — never returns.
 ///
-/// The tick wait is bounded (200 `hlt` spins ≈ 2 s budget at 100 Hz): a
-/// missing tick emits `TICK ok=0 ticks=0` and the e2e hard-require fails
+/// The tick wait is bounded ([`timer::STI_MAX_SPINS`] `hlt` spins ≈ 2 s budget
+/// at 100 Hz): a missing tick emits `TICK ok=0 ticks=0` and the e2e hard-require fails
 /// loudly instead of hanging. The drain runs gated (`cli` + `IrqGuard` +
 /// `poll_timer_dispatch`), closing the REVIEW #442 R2 static-mut drain in
 /// the guest. The quantum feed arms a two-thread demo scheduler
@@ -337,7 +337,7 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         // missing `TICK ok=1`, never on a hang). `TIMER_PROGRAM` is `Some`
         // by construction, so this arm is dead-code in practice.
         write_tick_line(false, 0);
-        uart::write_sti_line(false, 0, 0);
+        uart::write_sti_line(false, 0, 0, 0);
     } else {
         timer::program_pit();
         timer::reset_total_drained();
@@ -369,7 +369,7 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
             {
                 break;
             }
-            if spins >= 200 {
+            if spins >= timer::STI_MAX_SPINS {
                 break;
             }
             spins += 1;
@@ -403,11 +403,14 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         // cumulative total + the busy-work counter. `TICK` stays the
         // tick-half proof; this line wires `sti_window_ready` into the
         // guest (closes the slice-1 dead-code gap) and e2e hard-requires
-        // `STI ok=1` with positive ticks AND work.
+        // `STI ok=1` with positive ticks AND work. S08 slice3 trace: `spins`
+        // is the used `hlt` count, so a parameter change (quantum, batch,
+        // target) shows up as a comparable before/after wait cost.
         uart::write_sti_line(
             timer::sti_window_ready(total, work, wait_target, work_target),
             total,
             work,
+            u64::from(spins),
         );
     }
     // S07 slice68 (nit 3 RSP-switch proof): two-stack line — task-context
@@ -749,7 +752,7 @@ mod tests {
         let exc: fn(bool, u64) = uart::write_exc_line;
         let pf: fn(bool, u64, u64, u64) = uart::write_pf_line;
         let tick: fn(bool, u64) = uart::write_tick_line;
-        let sti: fn(bool, u64, u64) = uart::write_sti_line;
+        let sti: fn(bool, u64, u64, u64) = uart::write_sti_line;
         let irqstack: fn(bool, u64, u64, u64, u64) = uart::write_irqstack_line;
         let dec: fn(u64) = uart::write_dec_u64;
         let hex: fn(u64) = uart::write_hex_u64;
