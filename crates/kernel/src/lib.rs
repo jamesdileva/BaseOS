@@ -337,7 +337,14 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         // missing `TICK ok=1`, never on a hang). `TIMER_PROGRAM` is `Some`
         // by construction, so this arm is dead-code in practice.
         write_tick_line(false, 0);
-        uart::write_sti_line(false, 0, 0, 0);
+        uart::write_sti_line(
+            false,
+            0,
+            0,
+            0,
+            timer::STI_WORK_BATCH,
+            timer::STI_WORK_TARGET,
+        );
     } else {
         timer::program_pit();
         timer::reset_total_drained();
@@ -405,12 +412,16 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
         // guest (closes the slice-1 dead-code gap) and e2e hard-requires
         // `STI ok=1` with positive ticks AND work. S08 slice3 trace: `spins`
         // is the used `hlt` count, so a parameter change (quantum, batch,
-        // target) shows up as a comparable before/after wait cost.
+        // target) shows up as a comparable before/after wait cost. S08
+        // slice4 knob report (REVIEW #605 note 1): `batch`/`target` ride on
+        // the same line because `spins` couples to work when work-bound.
         uart::write_sti_line(
             timer::sti_window_ready(total, work, wait_target, work_target),
             total,
             work,
             u64::from(spins),
+            timer::STI_WORK_BATCH,
+            work_target,
         );
     }
     // S07 slice68 (nit 3 RSP-switch proof): two-stack line — task-context
@@ -752,7 +763,7 @@ mod tests {
         let exc: fn(bool, u64) = uart::write_exc_line;
         let pf: fn(bool, u64, u64, u64) = uart::write_pf_line;
         let tick: fn(bool, u64) = uart::write_tick_line;
-        let sti: fn(bool, u64, u64, u64) = uart::write_sti_line;
+        let sti: fn(bool, u64, u64, u64, u64, u64) = uart::write_sti_line;
         let irqstack: fn(bool, u64, u64, u64, u64) = uart::write_irqstack_line;
         let dec: fn(u64) = uart::write_dec_u64;
         let hex: fn(u64) = uart::write_hex_u64;

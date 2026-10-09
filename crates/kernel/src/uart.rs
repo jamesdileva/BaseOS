@@ -204,18 +204,22 @@ pub(crate) fn write_irqstack_line(ok: bool, task_rsp: u64, irq_rsp: u64, base: u
     com1_write_byte(b'\n');
 }
 
-/// Emit `STI ok=<0|1> ticks=<n> work=<m> spins=<s>\n` directly on COM1 (S08 slice 2
-/// preemption probe: `ok` is 1 only when the joint
-/// [`crate::timer::sti_window_ready`] gate clears — cumulative ticks AND
-/// preempted-workload progress — so a tick-only `hlt` spin or a work-only
-/// spin reports `ok=0` fail-closed; S08 slice 3 trace capture: `spins` is the
-/// used `hlt` wait-loop count, so a scheduler-parameter change produces a
-/// comparable before/after wait cost on the same line).
+/// Emit `STI ok=<0|1> ticks=<n> work=<m> spins=<s> batch=<b> target=<t>\n`
+/// directly on COM1 (S08 slice 2 preemption probe: `ok` is 1 only when the
+/// joint [`crate::timer::sti_window_ready`] gate clears — cumulative ticks
+/// AND preempted-workload progress — so a tick-only `hlt` spin or a
+/// work-only spin reports `ok=0` fail-closed; S08 slice 3 trace capture:
+/// `spins` is the used `hlt` wait-loop count, so a scheduler-parameter
+/// change produces a comparable before/after wait cost on the same line;
+/// S08 slice 4 knob report (REVIEW #605 note 1): `batch`/`target` ride on
+/// the same line because `spins` is coupled to work when work-bound
+/// (`work = (spins + 1) * BATCH` at a fixed batch) — without them a
+/// tick-bound vs work-bound change misreads).
 ///
 /// Safe wrapper: only calls [`com1_write_byte`] plus the safe decimal
 /// helper. Requires COM1 initialized; single-threaded bring-up context owns
 /// the UART exclusively.
-pub(crate) fn write_sti_line(ok: bool, ticks: u64, work: u64, spins: u64) {
+pub(crate) fn write_sti_line(ok: bool, ticks: u64, work: u64, spins: u64, batch: u64, target: u64) {
     for b in b"STI ok=" {
         com1_write_byte(*b);
     }
@@ -232,6 +236,14 @@ pub(crate) fn write_sti_line(ok: bool, ticks: u64, work: u64, spins: u64) {
         com1_write_byte(*b);
     }
     write_dec_u64(spins);
+    for b in b" batch=" {
+        com1_write_byte(*b);
+    }
+    write_dec_u64(batch);
+    for b in b" target=" {
+        com1_write_byte(*b);
+    }
+    write_dec_u64(target);
     com1_write_byte(b'\n');
 }
 

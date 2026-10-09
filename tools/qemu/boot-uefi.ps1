@@ -262,7 +262,10 @@ if ($serialText -and $serialText.Contains($marker)) {
   # S08 slice3 (trace capture): the used hlt-spin count rides on the same
   # line so a parameter change is comparable before/after; spins=[0-9]+
   # requires the field present while tolerating a 0-spin immediate wakeup.
-  $stiPat = "STI ok=1 [^\r\n]*ticks=[1-9][0-9]*[^\r\n]*work=[1-9][0-9]*[^\r\n]*spins=[0-9]+(\s|$)"
+  # S08 slice4 (knob report, REVIEW #605 note 1): batch/target ride on the
+  # same line because spins couples to work when work-bound - both required
+  # so a tick-bound vs work-bound change stays legible.
+  $stiPat = "STI ok=1 [^\r\n]*ticks=[1-9][0-9]*[^\r\n]*work=[1-9][0-9]*[^\r\n]*spins=[0-9]+[^\r\n]*batch=[0-9]+[^\r\n]*target=[0-9]+(\s|$)"
   # S07 slice68 (nit 3 RSP-switch proof): the IRQ body runs on the dedicated
   # IRQ stack while dispatch stays on the task stack. Same-line regex mirrors
   # the PF gate: literal space after ok=1 stops ok=10 false-passing,
@@ -298,6 +301,20 @@ if ($serialText -and $serialText.Contains($marker)) {
     $budgetDetail = "MEMMAP ok=1 line with map_size=<dec> desc_size=<dec> not found"
   }
   Write-Output "Budget check: $budgetDetail"
+  # S08 slice4 (knob report, REVIEW #605 note 2): extract the STI wait-cost
+  # trace for the before/after report. Presence-only still passes, but
+  # spins>=200 means wake-on-budget (the 200-hlt budget fired, not the
+  # joint gate) - flag it loudly so a budget-hit never reads as healthy.
+  $stiDetail = "STI ok=1 line with ticks/work/spins/batch/target not found"
+  $stiVals = [regex]::Match($serialText, "STI ok=1 [^\r\n]*ticks=(\d+)[^\r\n]*work=(\d+)[^\r\n]*spins=(\d+)[^\r\n]*batch=(\d+)[^\r\n]*target=(\d+)")
+  if ($stiVals.Success) {
+    $stiDetail = "ticks=$($stiVals.Groups[1].Value) work=$($stiVals.Groups[2].Value) spins=$($stiVals.Groups[3].Value) batch=$($stiVals.Groups[4].Value) target=$($stiVals.Groups[5].Value)"
+    $stiSpins = 0L
+    if ([long]::TryParse($stiVals.Groups[3].Value, [ref]$stiSpins) -and ($stiSpins -ge 200)) {
+      $stiDetail = $stiDetail + " [WARNING wake-on-budget: spins>=200, joint gate never cleared]"
+    }
+  }
+  Write-Output "STI trace: $stiDetail"
   $hasBootinfo = $serialText.Contains($bootinfo)
   $hasMemmap = $serialText.Contains($memmap)
   $hasNotrunc = $serialText.Contains($notrunc)
@@ -386,7 +403,7 @@ if ($serialText -and $serialText.Contains($marker)) {
        "SCHED-TRACE-X ok=1 present=$hasSchedTraceX, " +
        "SCHED-TICK ok=1 present=$hasSchedTick, " +
        "TICK ok=1 ticks-shape present=$hasTick, " +
-       "STI ok=1 ticks/work/spins-shape present=$hasSti, " +
+       "STI ok=1 ticks/work/spins/batch/target-shape present=$hasSti, " +
       "IRQSTACK ok=1 task/irq-shape present=$hasIrqstack, " +
       "THREAD-JUMP ok=1 id=2 present=$hasThreadJump, " +
       "THREAD-JUMP-RUN id=2 present=$hasThreadJumpRun, " +

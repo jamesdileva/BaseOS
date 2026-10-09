@@ -307,12 +307,22 @@ pub const fn work_wait_ready(work_done: u64, work_target: u64) -> bool {
 /// both progressed. Pure const so host tests pin it.
 pub const STI_WORK_TARGET: u64 = 20_000;
 
-/// Busy-work batch per `sti`-window spin (S08 slice 2).
+/// Busy-work batch per `sti`-window spin (S08 slice 2; slice 4 knob turn
+/// `4_000` -> `2_000`).
+///
+/// S08 slice4 (parameter knob + before/after report, REVIEW #605 notes):
+/// halving the batch at a fixed [`STI_WORK_TARGET`] doubles the work-bound
+/// spin count (`batches_needed = TARGET / BATCH`: 5 -> 10, so `spins`
+/// 4 -> ~9) while the tick half (`QUANTUM_TICKS + 1` at 100 Hz) stays put —
+/// the before/after `spins` delta is the knob's wait-cost signal. Coupling
+/// warning: when work-bound, `work = (spins + 1) * BATCH`, so `spins` alone
+/// misreads across knob turns — the guest reports `batch=` + `target=` on
+/// the `STI` line next to `spins=` (tick-bound vs work-bound stays legible).
 ///
 /// Integer-only increments (no float/vector — the pre-S08 audit pin
 /// forbids wider state on the IRQ path); at most 200 spins * batch =
-/// 800 k iterations worst case, trivial for QEMU TCG.
-pub const STI_WORK_BATCH: u64 = 4_000;
+/// 400 k iterations worst case, trivial for QEMU TCG.
+pub const STI_WORK_BATCH: u64 = 2_000;
 
 /// Wait-loop `hlt` budget for the S08 `sti` window (slice 3).
 ///
@@ -1304,8 +1314,16 @@ mod tests {
         assert!(work_wait_ready(0, 0));
         assert!(work_wait_ready(u64::MAX, u64::MAX));
         assert_eq!(STI_WORK_TARGET, 20_000);
-        assert_eq!(STI_WORK_BATCH, 4_000);
+        assert_eq!(STI_WORK_BATCH, 2_000);
         assert!(STI_WORK_TARGET.is_multiple_of(STI_WORK_BATCH));
+        // S08 slice4 (knob turn 4000 -> 2000, REVIEW #605 note 1): the batch
+        // halves, so the work-bound spin count doubles (batches_needed =
+        // TARGET / BATCH = 10, spins ~9 vs the slice-3 baseline spins=4 at
+        // batch 4000). `spins` couples to work when work-bound
+        // (work = (spins + 1) * BATCH at a fixed batch), so the guest
+        // reports batch/target next to spins — a tick-bound vs work-bound
+        // change without them misreads.
+        assert_eq!(STI_WORK_TARGET / STI_WORK_BATCH, 10);
         // S08 slice3 (trace capture): the wait-loop budget is a named const
         // single-sourced with the guest loop bound — a raw `200` edit in the
         // guest without this pin fails here. 200 spins at 100 Hz cover ~2 s,
