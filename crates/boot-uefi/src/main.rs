@@ -17,7 +17,7 @@
 //! `x86_64-unknown-uefi`, boots OVMF, and asserts the marker plus the
 //! `BOOTINFO valid=1`, `MEMMAP ok=1`, `FB present=1`, `GOP ok=1`,
 //! `EBS ok=1`, `KERNEL ok=1`, `FRAMEALLOC ok=1`, `PAGING ok=1`, `PERM ok=1`,
-//! `PERMAUDIT ok=1`, `PERMAUDIT2 ok=1`, `RMBZ ok=1`,
+//! `PERMAUDIT ok=1`, `PERMAUDIT2 ok=1`, `RMBZ ok=1`, `USER ok=1`,
 //! summary lines in the serial capture. The `MEMMAP` line also carries
 //! `map_size`/`desc_size` for the 16 KiB + 4 KiB budget baseline (#59a).
 
@@ -44,7 +44,7 @@ use baseos_kernel::kernel_entry;
 use baseos_kernel::latency::{LatencySamples, LatencyStats};
 use baseos_kernel::page_table::{
     guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
-    walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
+    user_isolation_selftest, walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
 };
 use baseos_kernel::sched::{Scheduler, QUANTUM_TICKS};
 use baseos_kernel::thread::check_jump_entry;
@@ -661,6 +661,30 @@ fn write_guard_line<E>(
     emit: &mut impl FnMut(u8) -> Result<(), E>,
 ) -> Result<(), E> {
     write_str(emit, "GUARD ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " passed=")?;
+    write_u64_dec(emit, u64::from(passed))?;
+    write_str(emit, "/")?;
+    write_u64_dec(emit, u64::from(total))?;
+    write_str(emit, "\n")
+}
+
+/// Emit the one-line `USER` diagnostic after the `GUARD` line:
+/// `USER ok=<0|1> passed=<n>/<total>` — `ok` is 1 only when the synthetic
+/// [`user_isolation_selftest`] U/S-isolation contract passes all 7 probes
+/// (user executes/reads/writes its own `U/S=1` range, user access to either
+/// `U/S=0` kernel page is contained as `UserViolation`, invalid ranges are
+/// contained as `NotPresent`/`GeneralProtection`). Pure software model, no
+/// live-table mutation and no CPL3 entry yet (entry/return + user stacks
+/// ride with a later S09 slice), so it runs deterministically post-EBS on
+/// any firmware map. Hard-required by `boot-uefi.ps1` (`USER ok=1`).
+fn write_user_line<E>(
+    ok: bool,
+    passed: u32,
+    total: u32,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "USER ok=")?;
     write_u64_dec(emit, u64::from(ok))?;
     write_str(emit, " passed=")?;
     write_u64_dec(emit, u64::from(passed))?;
@@ -2764,6 +2788,13 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // post-EBS proof with a hard-required GUARD line before bring-up.
             let (guard_ok, guard_passed, guard_total) = guard_selftest();
             write_guard_line::<Infallible>(guard_ok, guard_passed, guard_total, &mut emit).unwrap();
+            // S09 slice1: U/S-isolation pin (kernel U/S=0 vs user U/S=1,
+            // contained UserViolation + invalid-range containment) — synthetic
+            // post-EBS proof with a hard-required USER line before bring-up.
+            // No CPL3 entry yet (deferred per REVIEW #620); kill-vs-return is
+            // fail-closed Err containment, never a kernel panic.
+            let (user_ok, user_passed, user_total) = user_isolation_selftest();
+            write_user_line::<Infallible>(user_ok, user_passed, user_total, &mut emit).unwrap();
             // S04 slice 15: live leaf USER/NX audit of the PAGING probe
             // address — reporting-only baseline before any enforcement.
             // S04 slice 20 (REVIEW #147 risk 1): second probe of low-RAM
@@ -3270,6 +3301,32 @@ mod tests {
         .unwrap();
         let line = core::str::from_utf8(&text).unwrap();
         assert_eq!(line, "GUARD ok=0 passed=6/7\n");
+    }
+
+    /// S09 slice1: `USER` line shape — ok carries passed/total, and the
+    /// e2e hard-require substring (`USER ok=1`) is byte-identical. Same
+    /// function the guest calls, so a format drift fails host-side
+    /// (REVIEW #620 containment-definition note: share the assertion).
+    #[test]
+    fn write_user_line_embeds_passed_total() {
+        let mut text = Vec::new();
+        write_user_line::<core::convert::Infallible>(true, 7, 7, &mut |b| {
+            text.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(line, "USER ok=1 passed=7/7\n");
+        assert!(line.contains("USER ok=1"));
+
+        let mut text = Vec::new();
+        write_user_line::<core::convert::Infallible>(false, 6, 7, &mut |b| {
+            text.push(b);
+            Ok(())
+        })
+        .unwrap();
+        let line = core::str::from_utf8(&text).unwrap();
+        assert_eq!(line, "USER ok=0 passed=6/7\n");
     }
 
     /// S04 slice 15/18/19: `PERMAUDIT` line shape — live leaf flags;

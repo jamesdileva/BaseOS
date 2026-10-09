@@ -160,6 +160,12 @@ if ($serialText -and $serialText.Contains($marker)) {
   # `[^\r\n]*` keeps the pin same-line so a newline-split `ok=1` / passed
   # pair fails. See tools/qemu/test-boot-uefi-gates.ps1 for the control.
   $guardPat = "GUARD ok=1 [^\r\n]*passed=7/7(\s|$)"
+  # S09 slice1 (REVIEW #620 containment definition): USER gate mirrors the
+  # GUARD gate — `USER ok=1 [^\r\n]*passed=7/7(\s|$)` pins the U/S-isolation
+  # pin (user-ok / kernel-refuse / invalid-contained) plus the coverage
+  # count, same-line so a newline-split pair fails. See
+  # tools/qemu/test-boot-uefi-gates.ps1 for the control.
+  $userPat = "USER ok=1 [^\r\n]*passed=7/7(\s|$)"
   $permaudit = "PERMAUDIT ok=1"
   # REVIEW #153 gap (2): `ok` is walk-success, independent of `w`, so a w=0
   # regression still matched the substring above. Hard-require the W bit on
@@ -333,6 +339,7 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasPaging = $serialText.Contains($paging)
   $hasPerm = $serialText.Contains($perm)
   $hasGuard = [regex]::IsMatch($serialText, $guardPat)
+  $hasUser = [regex]::IsMatch($serialText, $userPat)
   $hasPermaudit = $serialText.Contains($permaudit)
   $hasPermauditW = [regex]::IsMatch($serialText, $permauditWPat)
   $hasPermauditUN = [regex]::IsMatch($serialText, $permauditUNPat)
@@ -373,9 +380,9 @@ if ($serialText -and $serialText.Contains($marker)) {
   }
   $hasPf = [regex]::IsMatch($serialText, $pfPat)
   $hasExc = $serialText.Contains($exc)
-   if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSwitchLat -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasTick -and $hasSti -and $hasIrqstack -and $hasThreadJump -and $hasThreadJumpRun -and $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and $hasPf -and $hasExc) {
+   if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasUser -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSwitchLat -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasTick -and $hasSti -and $hasIrqstack -and $hasThreadJump -and $hasThreadJumpRun -and $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and $hasPf -and $hasExc) {
     Write-Output ("Boot summary: FOUND (" + $bootinfo + " + " + $memmap + " + " + $notrunc + " + " + $mapsize + " + " + $descsize + " + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SWITCH-LAT ok=1 count=16 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + STI ok=1 + IRQSTACK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + USER ok=1 passed=7/7 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SWITCH-LAT ok=1 count=16 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + STI ok=1 + IRQSTACK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -389,6 +396,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "PAGING ok=1 present=$hasPaging, " +
       "PERM ok=1 present=$hasPerm, " +
       "GUARD ok=1 passed=7/7 present=$hasGuard, " +
+      "USER ok=1 passed=7/7 present=$hasUser, " +
       "PERMAUDIT ok=1 present=$hasPermaudit, w=1 present=$hasPermauditW, user/nx shape present=$hasPermauditUN, " +
       "PERMAUDIT2 ok=1 present=$hasPermaudit2, w=1 present=$hasPermaudit2W, user/nx shape present=$hasPermaudit2UN, " +
       "RMBZ ok=1 viol-shape present=$hasRmbz, " +
