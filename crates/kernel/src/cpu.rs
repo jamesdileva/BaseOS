@@ -163,11 +163,55 @@ pub(crate) const fn user_stack_top_for(base: u64) -> u64 {
 /// stack wired by `load_gdt`) AND `user_rsp != 0` (user stack mapped, top
 /// from [`user_stack_top_for`]). `user_rip == 0` (null entry) also refuses.
 /// Pure const so host tests and the future guest stub share one rule; no
-/// guest `iretq` yet.
+/// guest `iretq` yet. Weak by design: nonzero-only (accepts kernel-half,
+/// non-canonical, misaligned values) — the stub must ALSO gate on
+/// [`user_entry_valid`] below before pushing a frame.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) const fn iretq_ready(rsp0: u64, user_rip: u64, user_rsp: u64) -> bool {
     rsp0 != 0 && user_rip != 0 && user_rsp != 0
+}
+
+/// Canonical user-half ceiling (S09 slice2o, #30 remainder): every `u64`
+/// below this is canonical low-half; `0x0000_8000_0000_0000` itself is the
+/// non-canonical hole start and anything at/above it (incl. kernel-half
+/// `0xFFFF...`) is rejected by [`user_rip_valid`]/[`user_rsp_valid`].
+/// Single-sources the user-range pin so the two validators cannot drift.
+#[allow(dead_code)]
+pub(crate) const USER_HALF_END: u64 = 0x0000_8000_0000_0000;
+
+/// User-RIP validity (S09 slice2o, REVIEW #654 risk 1): nonzero canonical
+/// low-half. Rejects null, the non-canonical hole, and kernel-half
+/// addresses (e.g. `0xFFFF...`). Caller-owned mapping check (is the page
+/// actually mapped user-accessible?) stays with the future stub — this pins
+/// the encodable shape, not the page-table state.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_rip_valid(user_rip: u64) -> bool {
+    user_rip != 0 && user_rip < USER_HALF_END
+}
+
+/// User-RSP validity (S09 slice2o, REVIEW #654 risk 1): [`user_rip_valid`]
+/// plus 16-byte alignment (SysV/Win64 ABI entry requirement). Rejects null,
+/// kernel-half, non-canonical, and misaligned stacks — notably the
+/// `u64::MAX` saturated top, which passes the weak [`iretq_ready`]
+/// nonzero gate but must never be a live `iretq` RSP.
+#[allow(dead_code)]
+#[allow(clippy::manual_is_multiple_of)]
+#[must_use]
+pub(crate) const fn user_rsp_valid(user_rsp: u64) -> bool {
+    user_rsp != 0 && user_rsp < USER_HALF_END && user_rsp % 16 == 0
+}
+
+/// Combined user-entry validity (S09 slice2o): the future guest stub gates
+/// `iretq_frame_for` on `iretq_ready(rsp0, rip, rsp) && user_entry_valid(rip,
+/// rsp)` — nonzero wiring PLUS canonical user-half RIP plus aligned
+/// canonical user-half RSP. Pure const so host tests and the stub share one
+/// rule; still no guest `iretq` yet.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_entry_valid(user_rip: u64, user_rsp: u64) -> bool {
+    user_rip_valid(user_rip) && user_rsp_valid(user_rsp)
 }
 
 /// Build the CPL3 `iretq` frame for `user_rip` with user stack top
@@ -175,13 +219,15 @@ pub(crate) const fn iretq_ready(rsp0: u64, user_rip: u64, user_rsp: u64) -> bool
 /// Pure so host tests and the future guest entry stub share one rule.
 ///
 /// # Preconditions
-/// Caller owns validation (next slice): `rsp0 != 0` (see [`iretq_ready` —
+/// Caller owns validation (next slice): `rsp0 != 0` (see [`iretq_ready`] —
 /// otherwise the first CPL3->0 entry faults `#SS(0)`/triple-faults),
 /// `user_rsp` is the [`user_stack_top_for`] top of a mapped user stack, and
-/// `user_rip` is a canonical user-half address. This constructor does NOT
+/// `user_rip` is a canonical user-half address (see [`user_entry_valid`] —
+/// the weak [`iretq_ready`] nonzero gate alone accepts kernel-half,
+/// non-canonical, and misaligned values). This constructor does NOT
 /// check them (const, infallible) — the guest entry stub must gate on
-/// [`iretq_ready`] plus user-range mapping validation before pushing this
-/// frame and executing `iretq`.
+/// [`iretq_ready`] PLUS [`user_entry_valid`] plus user-range mapping
+/// validation before pushing this frame and executing `iretq`.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) const fn iretq_frame_for(user_rip: u64, user_rsp: u64) -> IretqFrame {
@@ -881,6 +927,50 @@ mod tests {
         // the gate lives at the call site per the `# Preconditions` doc.
         let frame = iretq_frame_for(0x1_0000, top);
         assert_eq!((frame.rip, frame.rsp), (0x1_0000, top));
+    }
+
+    #[test]
+    fn user_entry_pins_canonical_and_alignment() {
+        // S09 slice2o (#30 remainder, REVIEW #654 risk 1): the weak
+        // `iretq_ready` nonzero gate accepts kernel-half, non-canonical, and
+        // misaligned values, so the future stub must ALSO gate on
+        // `user_entry_valid`. Host-only pin; no guest `iretq` yet.
+        assert_eq!(USER_HALF_END, 0x0000_8000_0000_0000);
+        let base = 0x0000_1000_0020_0000_u64;
+        let top = user_stack_top_for(base);
+        assert_eq!(top % 16, 0);
+        // RIP: nonzero canonical low-half passes; null/hole/kernel fail.
+        assert!(user_rip_valid(0x1_0000));
+        assert!(!user_rip_valid(0), "null rip refuses");
+        assert!(!user_rip_valid(USER_HALF_END), "hole start refuses");
+        assert!(
+            !user_rip_valid(0xFFFF_8000_0010_0000),
+            "kernel-half refuses"
+        );
+        assert!(!user_rip_valid(u64::MAX), "saturated refuses");
+        // RSP: aligned canonical passes; null/misaligned/hole/kernel fail.
+        assert!(user_rsp_valid(top));
+        assert!(!user_rsp_valid(0), "null rsp refuses");
+        assert!(!user_rsp_valid(top - 1), "misaligned refuses");
+        assert!(!user_rsp_valid(top | 0x8), "misaligned refuses");
+        assert!(!user_rsp_valid(USER_HALF_END), "hole refuses");
+        assert!(
+            !user_rsp_valid(0xFFFF_8000_0020_0000),
+            "kernel-half refuses"
+        );
+        // REVIEW #654 load-bearing case: the saturated top passes the weak
+        // nonzero gate yet must fail the canonical gate.
+        assert_eq!(user_stack_top_for(u64::MAX), u64::MAX);
+        assert!(iretq_ready(0x1000, 0x1_0000, u64::MAX));
+        assert!(!user_rsp_valid(u64::MAX));
+        assert!(!user_entry_valid(0x1_0000, u64::MAX));
+        // Combined: valid pair passes; any half-invalid refuses.
+        assert!(user_entry_valid(0x1_0000, top));
+        assert!(!user_entry_valid(0, top));
+        assert!(!user_entry_valid(0x1_0000, 0));
+        assert!(!user_entry_valid(0xFFFF_8000_0010_0000, top));
+        assert!(!user_entry_valid(0x1_0000, top - 1));
+        assert!(!user_entry_valid(0, 0));
     }
 
     #[test]
