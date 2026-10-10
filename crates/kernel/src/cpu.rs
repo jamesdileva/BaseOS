@@ -180,6 +180,18 @@ pub(crate) const fn user_stack_top_for(base: u64) -> u64 {
 #[allow(dead_code)]
 pub(crate) const USER_STACK_PAGES: usize = USER_STACK_LEN / 4096;
 
+/// Required leaf flags for the future CPL3 user-stack mapping (S09 slice2x,
+/// #30 remainder): PRESENT+USER+WRITABLE+NO_EXEC. Single-sources the flag
+/// word the mapping slice must install on all 4 pages so a W+X or
+/// supervisor-only mapping fails host-side before any guest PTE is written.
+/// Must satisfy [`user_stack_perms_valid_for`] with NXE=1 and must NOT
+/// satisfy [`user_code_perms_valid`] (NX set) — code-side reuse refuses.
+#[allow(dead_code)]
+pub(crate) const USER_STACK_MAP_FLAGS: PageFlags = PageFlags::PRESENT
+    .union(PageFlags::USER)
+    .union(PageFlags::WRITABLE)
+    .union(PageFlags::NO_EXEC);
+
 // REVIEW #664 step 2/3 (slice2u): build-time pins so a resized `USER_STACK_LEN`
 // that breaks the 4-page walk fails the build, not just the test run.
 #[allow(dead_code)]
@@ -1860,6 +1872,28 @@ mod tests {
             walk_user_stack_pages(0x1000, u64::MAX - 4096, lookup_top_wrap),
             None
         );
+    }
+
+    #[test]
+    fn user_stack_map_flags_pin_rw_nx_user_no_code_reuse() {
+        // S09 slice2x (#30 remainder): pin the flag word the future mapping
+        // slice must install — RW data, never W+X code. Host-only; no guest
+        // PTE written yet.
+        use super::super::page_table::PageFlags;
+        let f = USER_STACK_MAP_FLAGS;
+        assert!(f.contains(PageFlags::PRESENT));
+        assert!(f.contains(PageFlags::USER));
+        assert!(f.contains(PageFlags::WRITABLE));
+        assert!(f.contains(PageFlags::NO_EXEC));
+        // Stack gate passes with live NXE=1, refuses with NXE=0 (bit 63 MBZ).
+        assert!(user_stack_perms_valid(f));
+        assert!(user_stack_perms_valid_for(f, true));
+        assert!(!user_stack_perms_valid_for(f, false));
+        // Code gate refuses: NX set, so the word cannot be reused code-side.
+        assert!(!user_code_perms_valid(f));
+        // Full 4-page coverage with this word passes the per-page stack gate.
+        assert!(all_stack_pages_valid_for(&[f; USER_STACK_PAGES], true));
+        assert!(!all_stack_pages_valid_for(&[f; USER_STACK_PAGES], false));
     }
 
     #[test]

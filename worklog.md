@@ -4944,5 +4944,29 @@ Format per entry (per `implementation-guide.md` §31):
 - **Expected:** `cargo test --workspace` 278 passed, 1 ignored (277 + 1); fmt + host + UEFI clippy clean; `cargo doc` no new warnings; `boot-uefi.ps1` PASS with no new serial line (stub uncalled).
 - **Measured (2026-10-10, Win11):** `cargo test --workspace` 278 passed (21 boot-info + 39 boot-uefi + 208 kernel incl. 1 new + 4 + 4 serial-marker + 2 version), 1 ignored; `cargo fmt --all -- --check` clean; `cargo clippy -p baseos-kernel --all-targets -- -D warnings` exit 0 (after `redundant_closure` → `&lookup` and file-local `manual_is_multiple_of` fixes); `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings` exit 0; `cargo doc` 18 warnings, none new (no `walk_user_stack`/`probe_user_stack`/`USER_STACK_PAGES` link warnings); `boot-uefi.ps1` UEFI BOOT PASS exit 0, serial 2213 bytes, guest `bootx64.efi` 176640 bytes, full gate chain intact (`TR ok=1 sel=0x28`, `PFUS ok=1`, `PF ok=1 vector=14`, `EXC ok=1 vector=0`, no new lines).
 - **Final:** Walker loop + live-NXE stub landed wrapper-only and proven boot-neutral end-to-end; remainder narrowed to step 3/3 (stack mapping + CPL3 entry + contained-fault proof); pending agent-b review.
+## S09 slice2v -- checked_add overflow fail-closed in walk_user_stack_pages (board #30 remainder, REVIEW #666 risk 2)
+
+- **Decision:** Harden `walk_user_stack_pages` host-side: per-page VA via `checked_add` (`stack_base + i*4096` returns `None` on overflow) instead of `wrapping_add`; extend host test with near-top base (`u64::MAX - 4096`) pinning fail-closed `None`. No guest change (stub uncalled, unmapped).
+- **Why:** REVIEW #666 risk 2: near-`u64::MAX` base wrapped to low VA and walked the wrong pages. Cheapest disconfirm is the overflow-kill unit pin.
+- **Alternatives:** Saturating/wrapping with extra range check (rejected: `checked_add` is the exact fail-closed shape, no second predicate to drift).
+- **Expected:** `cargo test --workspace` 279 passed, 1 ignored (278 + 0 new, extended test); fmt + clippy clean; guest untouched.
+- **Measured (2026-10-10, Win11):** `cargo test --workspace` 279 passed, 1 ignored; `cargo fmt --all -- --check` clean; `cargo clippy -p baseos-kernel --all-targets -- -D warnings` exit 0; `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings` exit 0. Guest untouched.
+- **Final:** Overflow fail-closed pinned; pending agent-b review.
+## S09 slice2w -- discriminating overflow-kill test + off-by-one comment fix (board #30 remainder, REVIEW #668)
+
+- **Decision:** Strengthen the slice2v pin host-side: map the high pair AND the old wrap targets so old `wrapping_add` code would walk all four and return `Some` while `checked_add` refuses with `None` at i=2; fix the off-by-one comment (overflow at i=2, not page 1). No guest change.
+- **Why:** REVIEW #668 weaknesses 1/2: the slice2v top-miss test passed even under the old wrapping code (page 0 already missed), so it could not discriminate the fix.
+- **Alternatives:** Keep the weak shape test (rejected: reviewer-named discriminating test is the load-bearing proof).
+- **Expected:** `cargo test --workspace` 279 passed, 1 ignored (same count, extended test); fmt + clippy clean; guest untouched.
+- **Measured (2026-10-10, Win11):** `cargo test --workspace` 279 passed, 1 ignored; `cargo fmt --all -- --check` clean; `cargo clippy --all-targets -- -D warnings` exit 0. Guest untouched. REVIEW #670 ACCEPT.
+- **Final:** Discriminating overflow-kill verified; remainder: mapping + CPL3 entry.
+## S09 slice2x -- user-stack mapping flags pin, no W+X/code reuse (board #30 remainder)
+
+- **Decision:** Land host-only in `kernel/cpu.rs`: new `USER_STACK_MAP_FLAGS = PRESENT|USER|WRITABLE|NO_EXEC` const (single-sources the flag word the future mapping slice must install on all 4 pages) + host test `user_stack_map_flags_pin_rw_nx_user_no_code_reuse` (contains all four bits; `user_stack_perms_valid` + `..._for(true)` pass, `..._for(false)` refuses (bit 63 MBZ); `user_code_perms_valid` refuses (NX set, no code-side reuse); full 4-page `all_stack_pages_valid_for(..., true)` passes, `false` refuses). No guest change (still BSS-unmapped, no `iretq`).
+- **Why:** Carried REVIEW #670 remainder names mapping + CPL3 entry as next, with no W+X/code-side reuse proof: a future mapping slice could install supervisor-only, read-only, exec, or W+X code-reusable flags and still pass containment. Cheapest disconfirm pins the exact flag word host-side before any PTE is written, same zero-QEMU-risk precedent as slices 2o-2w.
+- **Alternatives:** Map the stack now (rejected: no user-range page-table allocator slice yet -- flag word must be pinned first so the mapping slice has a host test to satisfy); forbid WRITABLE code in the same commit (rejected: code-side W+X policy belongs with the RX-mapping slice, this pins the stack half only); guest serial proof now (rejected: unmapped stack would print `ok=0`, confusing baseline -- proof rides with the mapping slice).
+- **Expected:** `cargo test --workspace` 280 passed, 1 ignored (279 + 1 new); fmt + clippy clean; guest untouched (host-only, no QEMU re-run).
+- **Measured (2026-10-10, Win11):** `cargo test --workspace` 280 passed (21 boot-info + 39 boot-uefi + 210 kernel incl. 1 new + 4 + 4 serial-marker + 2 version), 1 ignored; `cargo fmt --check` clean; `cargo clippy -p baseos-kernel --all-targets -- -D warnings` exit 0. Guest untouched (no QEMU re-run; slice2u byte-identical behavior baseline stands).
+- **Final:** Stack mapping flag word pinned host-side (RW+NX+U, no code reuse); remainder narrowed to installing the 4-page U-map + CPL3 entry + contained-fault proof; pending agent-b review.
 
 
