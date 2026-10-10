@@ -194,6 +194,17 @@ pub(crate) const USER_STACK_MAP_FLAGS: PageFlags = PageFlags::PRESENT
 
 // REVIEW #664 step 2/3 (slice2u): build-time pins so a resized `USER_STACK_LEN`
 // that breaks the 4-page walk fails the build, not just the test run.
+// REVIEW #672 risk 1 (slice2y): the `contains`-style perms gates accept extra
+// bits (in-model: GUARD) — the mapping slice must install EXACTLY
+// `USER_STACK_MAP_FLAGS`, so this exact-equality gate (not `contains`) is the
+// word the mapping stub gates on. `PageFlags` models only
+// PRESENT/WRITABLE/USER/NO_EXEC/GUARD (no HUGE/GLOBAL/ACCESSED bits exist),
+// so exact equality is complete: any extra bit in-model is GUARD.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_stack_map_flags_valid(flags: PageFlags) -> bool {
+    flags.bits() == USER_STACK_MAP_FLAGS.bits()
+}
 #[allow(dead_code)]
 #[allow(clippy::manual_is_multiple_of)]
 const _: () = {
@@ -1894,6 +1905,16 @@ mod tests {
         // Full 4-page coverage with this word passes the per-page stack gate.
         assert!(all_stack_pages_valid_for(&[f; USER_STACK_PAGES], true));
         assert!(!all_stack_pages_valid_for(&[f; USER_STACK_PAGES], false));
+        // Slice2y: exact-equality mapping gate — exact word passes, GUARD
+        // extra refuses (contains-gate would accept), any missing bit refuses.
+        assert!(user_stack_map_flags_valid(f));
+        assert!(!user_stack_map_flags_valid(f.union(PageFlags::GUARD)));
+        assert!(!user_stack_map_flags_valid(
+            PageFlags::PRESENT
+                .union(PageFlags::USER)
+                .union(PageFlags::WRITABLE)
+        ));
+        assert!(!user_stack_map_flags_valid(PageFlags::empty()));
     }
 
     #[test]

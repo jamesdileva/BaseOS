@@ -4968,5 +4968,13 @@ Format per entry (per `implementation-guide.md` §31):
 - **Expected:** `cargo test --workspace` 280 passed, 1 ignored (279 + 1 new); fmt + clippy clean; guest untouched (host-only, no QEMU re-run).
 - **Measured (2026-10-10, Win11):** `cargo test --workspace` 280 passed (21 boot-info + 39 boot-uefi + 210 kernel incl. 1 new + 4 + 4 serial-marker + 2 version), 1 ignored; `cargo fmt --check` clean; `cargo clippy -p baseos-kernel --all-targets -- -D warnings` exit 0. Guest untouched (no QEMU re-run; slice2u byte-identical behavior baseline stands).
 - **Final:** Stack mapping flag word pinned host-side (RW+NX+U, no code reuse); remainder narrowed to installing the 4-page U-map + CPL3 entry + contained-fault proof; pending agent-b review.
+## S09 slice2y -- exact-equality stack mapping gate closes REVIEW #672 risk 1 (board #30 remainder)
+
+- **Decision:** Land host-only in `kernel/cpu.rs`: new `user_stack_map_flags_valid(flags)` const (`bits() == USER_STACK_MAP_FLAGS.bits()`, exact equality, not `contains`) + 4 extended asserts in `user_stack_map_flags_pin_rw_nx_user_no_code_reuse` (exact passes; +GUARD refuses; missing-NX refuses; empty refuses). No guest change (still BSS-unmapped, no `iretq`).
+- **Why:** REVIEW #672 ACCEPT carried risk 1: the `contains`-style perms gates accept extra bits. In-model `PageFlags` has only PRESENT/WRITABLE/USER/NO_EXEC/GUARD (no HUGE/GLOBAL/ACCESSED bits exist), so exact equality is complete: any extra bit in-model is GUARD (a GUARD-flagged stack page faults on every access by construction). The future mapping stub gates on this exact word, never `contains` alone.
+- **Alternatives:** `contains` + explicit `!GUARD` check (rejected: enumerates one bad bit instead of pinning the word -- exact equality refuses every deviation, including a future flag added to the model); map the stack now (rejected: no user-range allocator slice yet -- gate must be pinned first).
+- **Expected:** `cargo test --workspace` 280 passed, 1 ignored (same count, extended test); fmt + clippy clean; guest untouched (host-only, no QEMU re-run).
+- **Measured (2026-10-10, Win11):** `cargo test` default 240/240 (21 boot-info + 209 kernel incl. extended pin + 4 + 4 serial-marker + 2 version), 1 ignored; `cargo fmt --check` clean (after one auto-format); `cargo clippy -p baseos-kernel --all-targets -- -D warnings` exit 0. Guest untouched (no QEMU re-run; slice2x boot-neutral baseline stands).
+- **Final:** Mapping-word exactness pinned host-side; remainder narrowed to installing the 4-page U-map + CPL3 entry + contained-fault proof; pending agent-b review.
 
 
