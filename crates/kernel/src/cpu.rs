@@ -1810,13 +1810,54 @@ mod tests {
         };
         assert_eq!(walk_user_stack_pages(0x1000, stack_base, lookup_miss), None);
         // S09 slice2v (REVIEW #666 risk 2): near-top base refuses instead of
-        // wrapping to low VA — `u64::MAX - 4096` page 1 overflows
-        // (`checked_add`). Page 0 already misses here, so this pins the
-        // fail-closed shape; the wrap-accept kill is the `checked_add`
-        // above (old `wrapping_add` would walk low VA on i=1).
+        // wrapping to low VA — `u64::MAX - 4096` (0xFFFF_FFFF_FFFF_EFFF)
+        // overflows at i=2 (`checked_add` fails on base + 8192), not page 1
+        // (i=1 is exactly `u64::MAX`, no overflow). Page 0 already misses
+        // here, so this pins the fail-closed shape only.
         let lookup_top_miss = |_: u64| -> Option<&[u64; 512]> { None };
         assert_eq!(
             walk_user_stack_pages(0x1000, u64::MAX - 4096, lookup_top_miss),
+            None
+        );
+        // S09 slice2w (REVIEW #668 weakness 1/2): discriminating overflow
+        // kill — map the high pair (i=0 `...EFFF` PT[510], i=1 `...FFFF`
+        // PT[511]) AND the old wrap targets (i=2 `0xFFF` PT_low[0], i=3
+        // `0x1FFF` PT_low[1]), so old `wrapping_add` code would walk all
+        // four and return `Some` while `checked_add` refuses with `None`
+        // at i=2 without touching low VA.
+        let mut pml4t: [u64; 512] = [0; 512];
+        let mut pdpt_lo: [u64; 512] = [0; 512];
+        let mut pdpt_hi: [u64; 512] = [0; 512];
+        let mut pd_lo: [u64; 512] = [0; 512];
+        let mut pd_hi: [u64; 512] = [0; 512];
+        let mut pt_lo: [u64; 512] = [0; 512];
+        let mut pt_hi: [u64; 512] = [0; 512];
+        pml4t[0] = encode_table_entry(0x2000, next).unwrap();
+        pml4t[511] = encode_table_entry(0x3000, next).unwrap();
+        pdpt_lo[0] = encode_table_entry(0x4000, next).unwrap();
+        pdpt_hi[511] = encode_table_entry(0x5000, next).unwrap();
+        pd_lo[0] = encode_table_entry(0x6000, next).unwrap();
+        pd_hi[511] = encode_table_entry(0x7000, next).unwrap();
+        let leaf_nx =
+            PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC;
+        pt_hi[510] = pte_encode(0x70_0000, leaf_nx);
+        pt_hi[511] = pte_encode(0x71_0000, leaf_nx);
+        pt_lo[0] = pte_encode(0x72_0000, leaf_nx);
+        pt_lo[1] = pte_encode(0x73_0000, leaf_nx);
+        let lookup_top_wrap = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4t),
+                0x2000 => Some(&pdpt_lo),
+                0x3000 => Some(&pdpt_hi),
+                0x4000 => Some(&pd_lo),
+                0x5000 => Some(&pd_hi),
+                0x6000 => Some(&pt_lo),
+                0x7000 => Some(&pt_hi),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            walk_user_stack_pages(0x1000, u64::MAX - 4096, lookup_top_wrap),
             None
         );
     }
