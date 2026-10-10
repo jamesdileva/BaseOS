@@ -17,6 +17,7 @@
 //! compiler-enforced): post-`ExitBootServices` boot CPU, `cli` in effect,
 //! statics outlive use.
 
+use super::page_table::PageFlags;
 use super::KERNEL_CODE_SEL;
 use super::{tss_desc_high, tss_desc_low, TSS_SEL, USER_CODE_SEL, USER_DATA_SEL};
 #[cfg(not(test))]
@@ -274,20 +275,78 @@ pub(crate) const fn user_entry_mapped_valid(
         && user_stack_top_valid(stack_base, stack_len, user_rsp)
 }
 
+/// User-code permission validity (S09 slice2q, #30 remainder, REVIEW #658
+/// risk 2): `containment != permission` — slice2p's mapped gate passes a
+/// kernel-only or non-exec range. The future stub must source `flags` from
+/// the page-table walker (`walk_full_leaf_flags` on the live CR3) for the
+/// page containing `user_rip`: `PRESENT` (mapped) AND `USER` (U/S ring-3)
+/// AND NOT `NO_EXEC` (executable). `WRITABLE` is allowed either way this
+/// slice (W+X code hardening deferred — the guest maps its own RX code).
+/// Pure const so host tests and the stub share one rule; still no guest
+/// `iretq` yet.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_code_perms_valid(flags: PageFlags) -> bool {
+    flags.contains(PageFlags::PRESENT)
+        && flags.contains(PageFlags::USER)
+        && !flags.contains(PageFlags::NO_EXEC)
+}
+
+/// User-stack permission validity (S09 slice2q): `flags` from the walker for
+/// the page containing `stack_base` (the mapped user-stack allocation):
+/// `PRESENT` AND `USER` AND `WRITABLE` AND `NO_EXEC` (stack is RW data, never
+/// executed; assumes EFER.NXE=1, which OVMF enables — the guest maps its own
+/// NX stack). Pure const; companion to [`user_code_perms_valid`].
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_stack_perms_valid(flags: PageFlags) -> bool {
+    flags.contains(PageFlags::PRESENT)
+        && flags.contains(PageFlags::USER)
+        && flags.contains(PageFlags::WRITABLE)
+        && flags.contains(PageFlags::NO_EXEC)
+}
+
+/// Fully-gated user-entry validity with permissions (S09 slice2q): the new
+/// single call site the future guest stub must gate `iretq_frame_for` on —
+/// [`user_entry_mapped_valid`] (wiring + shape + containment) PLUS
+/// [`user_code_perms_valid`] PLUS [`user_stack_perms_valid`]. A stub that
+/// forgets permissions (supervisor-only, non-present, non-exec code, exec or
+/// read-only stack) refuses fail-closed. `flags` must come from the walker,
+/// never caller-supplied literals (REVIEW #658 risk 1 remains: this pins the
+/// permission math, not the walker binding).
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub(crate) const fn user_entry_fully_valid(
+    user_rip: u64,
+    user_rsp: u64,
+    rsp0: u64,
+    code_base: u64,
+    code_len: u64,
+    stack_base: u64,
+    stack_len: u64,
+    code_flags: PageFlags,
+    stack_flags: PageFlags,
+) -> bool {
+    user_entry_mapped_valid(
+        user_rip, user_rsp, rsp0, code_base, code_len, stack_base, stack_len,
+    ) && user_code_perms_valid(code_flags)
+        && user_stack_perms_valid(stack_flags)
+}
+
 /// Build the CPL3 `iretq` frame for `user_rip` with user stack top
 /// `user_rsp`: CS/SS pin the DPL3 selectors, RFLAGS pins [`USER_RFLAGS`].
 /// Pure so host tests and the future guest entry stub share one rule.
 ///
 /// # Preconditions
-/// Caller owns validation: gate on [`user_entry_mapped_valid`] (which folds
-/// in [`iretq_ready`] nonzero wiring — otherwise the first CPL3->0 entry
-/// faults `#SS(0)`/triple-faults — PLUS [`user_entry_valid`] canonical +
-/// aligned shape PLUS [`user_range_contains`] code mapping PLUS
-/// [`user_stack_top_valid`] stack-top mapping). The weak [`iretq_ready`]
-/// nonzero gate alone accepts kernel-half, non-canonical, misaligned, and
-/// unmapped values. This constructor does NOT check them (const, infallible)
-/// — the guest entry stub must gate on [`user_entry_mapped_valid`] before
-/// pushing this frame and executing `iretq`.
+/// Caller owns validation: gate on [`user_entry_fully_valid`] (which folds
+/// in [`user_entry_mapped_valid`] wiring/shape/containment PLUS code/stack
+/// page permissions — otherwise a kernel-only or non-exec range passes).
+/// The weak [`iretq_ready`] nonzero gate alone accepts kernel-half,
+/// non-canonical, misaligned, and unmapped values. This constructor does NOT
+/// check them (const, infallible) — the guest entry stub must gate on
+/// [`user_entry_fully_valid`] before pushing this frame and executing
+/// `iretq`.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) const fn iretq_frame_for(user_rip: u64, user_rsp: u64) -> IretqFrame {
@@ -1162,6 +1221,89 @@ mod tests {
         assert!(!user_entry_mapped_valid(
             rip, rsp, 0x1000, code_base, code_len, stack_base, 0
         ));
+    }
+
+    #[test]
+    fn user_entry_fully_pins_code_and_stack_permissions() {
+        // S09 slice2q (#30 remainder, REVIEW #658 risk 2): containment !=
+        // permission — slice2p's mapped gate passes a kernel-only or non-exec
+        // range. This pins the permission math host-side: code needs
+        // PRESENT+USER+exec, stack needs PRESENT+USER+WRITABLE+NX, folded into
+        // the single `user_entry_fully_valid` gate. Flags must come from the
+        // walker in the future stub; this pins the math, not the binding.
+        use super::super::page_table::PageFlags;
+        let code_base = 0x0000_1000_0010_0000_u64;
+        let code_len = 0x2000_u64;
+        let stack_base = 0x0000_1000_0020_0000_u64;
+        let stack_len = USER_STACK_LEN as u64;
+        let rip = code_base + 0x100;
+        let rsp = user_stack_top_for(stack_base);
+        let code_rxu = PageFlags::PRESENT | PageFlags::USER;
+        let stack_rwu_nx =
+            PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC;
+        // Good pair passes both halves and the full gate.
+        assert!(user_code_perms_valid(code_rxu));
+        assert!(user_stack_perms_valid(stack_rwu_nx));
+        assert!(user_entry_fully_valid(
+            rip,
+            rsp,
+            0x1000,
+            code_base,
+            code_len,
+            stack_base,
+            stack_len,
+            code_rxu,
+            stack_rwu_nx
+        ));
+        // Code: supervisor-only (U/S=0), non-present, or non-exec refuses.
+        assert!(!user_code_perms_valid(PageFlags::PRESENT));
+        assert!(!user_code_perms_valid(PageFlags::USER));
+        assert!(!user_code_perms_valid(code_rxu | PageFlags::NO_EXEC));
+        assert!(!user_code_perms_valid(PageFlags::empty()));
+        // Stack: read-only, supervisor-only, non-present, or exec refuses.
+        assert!(!user_stack_perms_valid(
+            PageFlags::PRESENT | PageFlags::USER | PageFlags::NO_EXEC
+        ));
+        assert!(!user_stack_perms_valid(
+            PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
+        ));
+        assert!(!user_stack_perms_valid(
+            PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC
+        ));
+        assert!(!user_stack_perms_valid(PageFlags::empty()));
+        // Full gate: mapped-but-wrong-perms refuses even when containment
+        // passes (the load-bearing slice2p gap).
+        assert!(user_entry_mapped_valid(
+            rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len
+        ));
+        assert!(
+            !user_entry_fully_valid(
+                rip,
+                rsp,
+                0x1000,
+                code_base,
+                code_len,
+                stack_base,
+                stack_len,
+                PageFlags::PRESENT,
+                stack_rwu_nx
+            ),
+            "supervisor-only code refuses"
+        );
+        assert!(
+            !user_entry_fully_valid(
+                rip,
+                rsp,
+                0x1000,
+                code_base,
+                code_len,
+                stack_base,
+                stack_len,
+                code_rxu,
+                PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
+            ),
+            "exec stack refuses"
+        );
     }
 
     #[test]
