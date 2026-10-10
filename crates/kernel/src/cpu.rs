@@ -342,7 +342,8 @@ pub(crate) const fn user_entry_fully_valid(
 /// `nx_enabled=false`), so a NO_EXEC PTE is a reserved violation and must
 /// refuse — the gate demands PRESENT+USER+WRITABLE with NO_EXEC *clear*
 /// (degraded accept: HW cannot enforce NX; the future stub must still
-/// refuse CPL3 entry when NXE=0 — see [`user_entry_fully_valid_nxe`]).
+/// refuse CPL3 entry when NXE=0 — see [`user_entry_fully_valid_pages`]
+/// and the fail-closed [`user_entry_cpl3_allowed`] wrapper).
 /// Pure const so host tests and the stub share one rule; still no guest
 /// `iretq` yet.
 #[allow(dead_code)]
@@ -441,18 +442,57 @@ pub(crate) const fn user_entry_fully_valid_pages(
         && all_stack_pages_valid_for(stack_pages, nxe_enabled)
 }
 
+/// Fail-closed CPL3-entry gate (S09 slice2s, REVIEW #662 nits a+b): the
+/// future guest stub's single call site before `iretq`. `nxe_enabled`
+/// MUST be live `EFER.NXE` — CPL3 entry refuses whenever NXE=0, even
+/// though [`user_entry_fully_valid_pages`] degraded-accepts an
+/// RW-without-NX stack while NX is MBZ. Per-page math alone ACCEPTS
+/// that degraded shape (proven by test); only this `nxe_enabled &&`
+/// wrapper turns it into entry-refused. Pure const; still no guest
+/// `iretq` yet.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub(crate) const fn user_entry_cpl3_allowed(
+    user_rip: u64,
+    user_rsp: u64,
+    rsp0: u64,
+    code_base: u64,
+    code_len: u64,
+    stack_base: u64,
+    stack_len: u64,
+    code_pages: &[PageFlags],
+    stack_pages: &[PageFlags],
+    nxe_enabled: bool,
+) -> bool {
+    nxe_enabled
+        && user_entry_fully_valid_pages(
+            user_rip,
+            user_rsp,
+            rsp0,
+            code_base,
+            code_len,
+            stack_base,
+            stack_len,
+            code_pages,
+            stack_pages,
+            nxe_enabled,
+        )
+}
+
 /// Build the CPL3 `iretq` frame for `user_rip` with user stack top
 /// `user_rsp`: CS/SS pin the DPL3 selectors, RFLAGS pins [`USER_RFLAGS`].
 /// Pure so host tests and the future guest entry stub share one rule.
 ///
 /// # Preconditions
-/// Caller owns validation: gate on [`user_entry_fully_valid`] (which folds
-/// in [`user_entry_mapped_valid`] wiring/shape/containment PLUS code/stack
-/// page permissions — otherwise a kernel-only or non-exec range passes).
+/// Caller owns validation: gate on [`user_entry_cpl3_allowed`] (which folds
+/// in [`user_entry_fully_valid_pages`] wiring/shape/containment PLUS code/stack
+/// page permissions PLUS the fail-closed live-NXE pin — otherwise a kernel-only,
+/// non-exec, or NXE=0-degraded range passes).
 /// The weak [`iretq_ready`] nonzero gate alone accepts kernel-half,
 /// non-canonical, misaligned, and unmapped values. This constructor does NOT
 /// check them (const, infallible) — the guest entry stub must gate on
-/// [`user_entry_fully_valid`] before pushing this frame and executing
+/// [`user_entry_cpl3_allowed`] before pushing this frame and executing
 /// `iretq`.
 #[allow(dead_code)]
 #[must_use]
@@ -1538,6 +1578,25 @@ mod tests {
         assert!(user_entry_fully_valid_pages(
             rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len, &good_code, &degraded4,
             false
+        ));
+        // S09 slice2s (REVIEW #662 nit b): fail-closed CPL3 wrapper — NXE=0
+        // refuses even the degraded-accept shape, NXE=1 delegates to the
+        // per-page gate.
+        assert!(user_entry_cpl3_allowed(
+            rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len, &good_code, &good4, true
+        ));
+        assert!(!user_entry_cpl3_allowed(
+            rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len, &good_code, &bad4, true
+        ));
+        assert!(
+            !user_entry_cpl3_allowed(
+                rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len, &good_code,
+                &degraded4, false
+            ),
+            "degraded accept is never entry-allowed while NXE=0"
+        );
+        assert!(!user_entry_cpl3_allowed(
+            rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len, &good_code, &good4, false
         ));
     }
 
