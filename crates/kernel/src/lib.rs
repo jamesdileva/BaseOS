@@ -91,12 +91,13 @@ const KERNEL_DATA_SEL: u16 = 0x10;
 /// User code selector (GDT entry 3, RPL 3): `3 * 8 | 3 = 0x1B`. S09 slice2c
 /// pins the descriptor/selector only — no CPL3 entry (`iretq`/TSS/user
 /// stacks) yet, so the guest still runs ring 0 on the kernel selectors.
+/// Slice2m consumes these in the host-only `iretq` frame builder.
 #[allow(dead_code)]
-const USER_CODE_SEL: u16 = 0x1B;
+pub(crate) const USER_CODE_SEL: u16 = 0x1B;
 /// User data selector (GDT entry 4, RPL 3): `4 * 8 | 3 = 0x23`. Same
 /// deferred-entry contract as [`USER_CODE_SEL`].
 #[allow(dead_code)]
-const USER_DATA_SEL: u16 = 0x23;
+pub(crate) const USER_DATA_SEL: u16 = 0x23;
 
 /// Null descriptor (required GDT slot 0).
 const GDT_NULL: u64 = 0;

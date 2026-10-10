@@ -18,7 +18,7 @@
 //! statics outlive use.
 
 use super::KERNEL_CODE_SEL;
-use super::{tss_desc_high, tss_desc_low, TSS_SEL};
+use super::{tss_desc_high, tss_desc_low, TSS_SEL, USER_CODE_SEL, USER_DATA_SEL};
 #[cfg(not(test))]
 use super::{GDT_CODE, GDT_DATA, GDT_NULL, GDT_USER_CODE, GDT_USER_DATA, VECTOR_DE, VECTOR_PF};
 #[cfg(not(test))]
@@ -120,6 +120,45 @@ pub(crate) const fn ring0_stack_top_for(base: u64) -> u64 {
 #[cfg(not(test))]
 #[repr(C, align(16))]
 struct Ring0Stack([u8; RING0_STACK_LEN]);
+
+/// RFLAGS image for a future `iretq` to CPL3 (S09 slice2m, #30 remainder):
+/// bit 1 always-1 + IF (bit 9) set, everything else clear (IOPL 0, VM 0,
+/// NT 0, AC/TF/DF 0). No guest `iretq` yet — host-only pin so a wrong
+/// flags word (e.g. IF-clear hang, or IOPL!=0 leak) fails host-side before
+/// any ring-3 entry slice lands.
+#[allow(dead_code)]
+pub(crate) const USER_RFLAGS: u64 = 0x202;
+
+/// `iretq` return frame for CPL3 entry (Intel SDM Vol 3 §6.14: the CPU pops
+/// RIP, CS, RFLAGS, RSP, SS in that order on a privilege-changing `iretq`).
+/// `repr(C)` field order matches pop order so a future guest stub can push
+/// `ss/rsp/rflags/cs/rip` and execute `iretq` with no reordering. Pure const
+/// constructor — no guest `iretq` yet, so boot-neutral by construction.
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IretqFrame {
+    pub(crate) rip: u64,
+    pub(crate) cs: u64,
+    pub(crate) rflags: u64,
+    pub(crate) rsp: u64,
+    pub(crate) ss: u64,
+}
+
+/// Build the CPL3 `iretq` frame for `user_rip` with user stack top
+/// `user_rsp`: CS/SS pin the DPL3 selectors, RFLAGS pins [`USER_RFLAGS`].
+/// Pure so host tests and the future guest entry stub share one rule.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn iretq_frame_for(user_rip: u64, user_rsp: u64) -> IretqFrame {
+    IretqFrame {
+        rip: user_rip,
+        cs: USER_CODE_SEL as u64,
+        rflags: USER_RFLAGS,
+        rsp: user_rsp,
+        ss: USER_DATA_SEL as u64,
+    }
+}
 
 #[cfg(not(test))]
 static mut RING0_STACK: Ring0Stack = Ring0Stack([0; RING0_STACK_LEN]);
@@ -735,6 +774,41 @@ mod tests {
                 "guest write path yields nonzero rsp0"
             );
         }
+    }
+
+    #[test]
+    fn iretq_frame_pins_cpl3_selectors_and_rflags() {
+        // S09 slice2m (#30 remainder): pin the future CPL3 `iretq` frame
+        // host-side before any guest ring-3 entry lands. CS/SS must be the
+        // DPL3 selectors with RPL 3; RFLAGS must be bit1 + IF only (IF-clear
+        // would hang user code with `cli`-equivalent masking; IOPL!=0 would
+        // leak port access). Field order matches the CPU pop order
+        // (RIP/CS/RFLAGS/RSP/SS) so the future stub pushes in reverse with no
+        // reorder; no guest change this slice (still ring 0, no `iretq`).
+        assert_eq!(USER_RFLAGS, 0x202, "bit1 always-1 + IF only");
+        assert_eq!(USER_RFLAGS & (1 << 1), 1 << 1, "bit1 must be 1");
+        assert_eq!(USER_RFLAGS & (1 << 9), 1 << 9, "IF must be set");
+        assert_eq!(USER_RFLAGS >> 12 & 0b11, 0, "IOPL must be 0");
+        assert_eq!(USER_RFLAGS & !0x202, 0, "no other flags");
+        assert_eq!(super::super::USER_CODE_SEL, 0x1B);
+        assert_eq!(super::super::USER_DATA_SEL, 0x23);
+        let frame = iretq_frame_for(0x1_0000, 0x2_0000);
+        assert_eq!(frame.rip, 0x1_0000);
+        assert_eq!(frame.rsp, 0x2_0000);
+        assert_eq!(frame.cs, 0x1B);
+        assert_eq!(frame.rflags, 0x202);
+        assert_eq!(frame.ss, 0x23);
+        assert_eq!(frame.cs & 0b11, 3, "CS RPL 3");
+        assert_eq!(frame.ss & 0b11, 3, "SS RPL 3");
+        assert_eq!(frame.cs >> 3, 3, "CS GDT index 3");
+        assert_eq!(frame.ss >> 3, 4, "SS GDT index 4");
+        // Pop-order layout: RIP(0) CS(8) RFLAGS(16) RSP(24) SS(32).
+        assert_eq!(core::mem::size_of::<IretqFrame>(), 40);
+        assert_eq!(core::mem::offset_of!(IretqFrame, rip), 0);
+        assert_eq!(core::mem::offset_of!(IretqFrame, cs), 8);
+        assert_eq!(core::mem::offset_of!(IretqFrame, rflags), 16);
+        assert_eq!(core::mem::offset_of!(IretqFrame, rsp), 24);
+        assert_eq!(core::mem::offset_of!(IretqFrame, ss), 32);
     }
 
     #[test]
