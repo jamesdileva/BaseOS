@@ -207,11 +207,71 @@ pub(crate) const fn user_rsp_valid(user_rsp: u64) -> bool {
 /// `iretq_frame_for` on `iretq_ready(rsp0, rip, rsp) && user_entry_valid(rip,
 /// rsp)` — nonzero wiring PLUS canonical user-half RIP plus aligned
 /// canonical user-half RSP. Pure const so host tests and the stub share one
-/// rule; still no guest `iretq` yet.
+/// rule; still no guest `iretq` yet. Mapping containment (`rip` inside mapped
+/// code, `rsp` the mapped stack top) lives in [`user_entry_mapped_valid`].
 #[allow(dead_code)]
 #[must_use]
 pub(crate) const fn user_entry_valid(user_rip: u64, user_rsp: u64) -> bool {
     user_rip_valid(user_rip) && user_rsp_valid(user_rsp)
+}
+
+/// Mapped-range containment (S09 slice2p, #30 remainder, REVIEW #654 risk 1
+/// remainder): `addr` in `[map_base, map_base + map_len)` — the page-table
+/// mapping half the slice2o preconditions left caller-owned. Subtraction
+/// form (`addr - map_base < map_len`, guarded by `addr >= map_base`) so a
+/// `map_base + map_len` overflow can never wrap-accept; empty ranges refuse.
+/// Used for the code RIP (`rip` must be INSIDE mapped user code); the stack
+/// top uses [`user_stack_top_valid`] instead (`rsp` is one-past-end, so the
+/// generic half-open check would refuse the valid top). `map_base`/`map_len`
+/// must come from the page-table walker (future slice); this pins the
+/// containment math, not the walker state.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_range_contains(map_base: u64, map_len: u64, addr: u64) -> bool {
+    map_len != 0 && addr >= map_base && addr.wrapping_sub(map_base) < map_len
+}
+
+/// Mapped user-stack-top validity (S09 slice2p): `user_rsp` is the one-past-end
+/// top of the mapped stack `[stack_base, stack_base + stack_len)` — i.e.
+/// `user_rsp - stack_base == stack_len` with `stack_base <= user_rsp` (no
+/// wrap-accept), `stack_len != 0`, and both ends 16-byte aligned (SysV/Win64
+/// ABI entry requirement; matches [`user_rsp_valid`]). An interior pointer
+/// (`base <= rsp < base + len`) refuses: `iretq` RSP must be the empty-stack
+/// top, not mid-stack. `stack_base`/`stack_len` must come from the mapped
+/// user-stack allocation (future guest static + walker slice).
+#[allow(dead_code)]
+#[allow(clippy::manual_is_multiple_of)]
+#[must_use]
+pub(crate) const fn user_stack_top_valid(stack_base: u64, stack_len: u64, user_rsp: u64) -> bool {
+    stack_len != 0
+        && stack_base % 16 == 0
+        && user_rsp % 16 == 0
+        && stack_base <= user_rsp
+        && user_rsp.wrapping_sub(stack_base) == stack_len
+}
+
+/// Fully-gated user-entry validity (S09 slice2p): the single call site the
+/// future guest stub must gate `iretq_frame_for` on — `iretq_ready` (nonzero
+/// wiring) AND `user_entry_valid` (canonical + aligned) AND `rip` inside
+/// mapped user code AND `rsp` the mapped stack top. A stub that forgets any
+/// half (null wiring, kernel-half, misaligned, unmapped rip, interior rsp)
+/// refuses fail-closed. Pure const so host tests and the stub share one rule;
+/// still no guest `iretq` yet.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_entry_mapped_valid(
+    user_rip: u64,
+    user_rsp: u64,
+    rsp0: u64,
+    code_base: u64,
+    code_len: u64,
+    stack_base: u64,
+    stack_len: u64,
+) -> bool {
+    iretq_ready(rsp0, user_rip, user_rsp)
+        && user_entry_valid(user_rip, user_rsp)
+        && user_range_contains(code_base, code_len, user_rip)
+        && user_stack_top_valid(stack_base, stack_len, user_rsp)
 }
 
 /// Build the CPL3 `iretq` frame for `user_rip` with user stack top
@@ -219,15 +279,15 @@ pub(crate) const fn user_entry_valid(user_rip: u64, user_rsp: u64) -> bool {
 /// Pure so host tests and the future guest entry stub share one rule.
 ///
 /// # Preconditions
-/// Caller owns validation (next slice): `rsp0 != 0` (see [`iretq_ready`] —
-/// otherwise the first CPL3->0 entry faults `#SS(0)`/triple-faults),
-/// `user_rsp` is the [`user_stack_top_for`] top of a mapped user stack, and
-/// `user_rip` is a canonical user-half address (see [`user_entry_valid`] —
-/// the weak [`iretq_ready`] nonzero gate alone accepts kernel-half,
-/// non-canonical, and misaligned values). This constructor does NOT
-/// check them (const, infallible) — the guest entry stub must gate on
-/// [`iretq_ready`] PLUS [`user_entry_valid`] plus user-range mapping
-/// validation before pushing this frame and executing `iretq`.
+/// Caller owns validation: gate on [`user_entry_mapped_valid`] (which folds
+/// in [`iretq_ready`] nonzero wiring — otherwise the first CPL3->0 entry
+/// faults `#SS(0)`/triple-faults — PLUS [`user_entry_valid`] canonical +
+/// aligned shape PLUS [`user_range_contains`] code mapping PLUS
+/// [`user_stack_top_valid`] stack-top mapping). The weak [`iretq_ready`]
+/// nonzero gate alone accepts kernel-half, non-canonical, misaligned, and
+/// unmapped values. This constructor does NOT check them (const, infallible)
+/// — the guest entry stub must gate on [`user_entry_mapped_valid`] before
+/// pushing this frame and executing `iretq`.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) const fn iretq_frame_for(user_rip: u64, user_rsp: u64) -> IretqFrame {
@@ -971,6 +1031,137 @@ mod tests {
         assert!(!user_entry_valid(0xFFFF_8000_0010_0000, top));
         assert!(!user_entry_valid(0x1_0000, top - 1));
         assert!(!user_entry_valid(0, 0));
+    }
+
+    #[test]
+    fn user_entry_mapped_pins_range_containment() {
+        // S09 slice2p (#30 remainder, REVIEW #656 carry 1): the slice2o
+        // preconditions left mapping caller-owned with zero enforcement, so
+        // a stub could forget it. This pins the containment math host-side:
+        // `rip` inside mapped code (`user_range_contains`), `rsp` the mapped
+        // stack top (`user_stack_top_valid`), folded into the single
+        // `user_entry_mapped_valid` gate. Host-only; no guest `iretq` yet.
+        let code_base = 0x0000_1000_0010_0000_u64;
+        let code_len = 0x2000_u64;
+        let stack_base = 0x0000_1000_0020_0000_u64;
+        let stack_len = USER_STACK_LEN as u64;
+        let rip = code_base + 0x100;
+        let rsp = user_stack_top_for(stack_base);
+        assert_eq!(rsp, stack_base + stack_len);
+        // REVIEW #656 carry 3: every 16-aligned base yields a 16-aligned
+        // top (not just one base in-test); saturated tops stay refused by
+        // the canonical gate, never silently accepted.
+        for base in [
+            0x0000_1000_0020_0000_u64,
+            0x0000_0000_0010_0000_u64,
+            0x0000_1000_0030_0010_u64,
+            0x0000_7FFF_FFFF_0000_u64,
+        ] {
+            assert_eq!(base % 16, 0);
+            let top = user_stack_top_for(base);
+            assert_eq!(top, base + USER_STACK_LEN as u64);
+            assert_eq!(top % 16, 0, "aligned base => aligned top");
+            assert!(user_rsp_valid(top));
+        }
+        // Range containment: inside passes; base-1 / end / empty refuse;
+        // wrap-around (`base + len` overflow) refuses via subtraction form.
+        assert!(user_range_contains(code_base, code_len, rip));
+        assert!(user_range_contains(code_base, code_len, code_base));
+        assert!(!user_range_contains(code_base, code_len, code_base - 1));
+        assert!(!user_range_contains(
+            code_base,
+            code_len,
+            code_base + code_len
+        ));
+        assert!(!user_range_contains(code_base, 0, code_base));
+        assert!(!user_range_contains(u64::MAX - 15, 32, 0x10));
+        // Stack top: exact top passes; interior / base / top+16 / misaligned
+        // / empty / base-misaligned refuse.
+        assert!(user_stack_top_valid(stack_base, stack_len, rsp));
+        assert!(!user_stack_top_valid(stack_base, stack_len, stack_base));
+        assert!(!user_stack_top_valid(
+            stack_base,
+            stack_len,
+            stack_base + 16
+        ));
+        assert!(!user_stack_top_valid(stack_base, stack_len, rsp + 16));
+        assert!(!user_stack_top_valid(stack_base, stack_len, rsp - 1));
+        assert!(!user_stack_top_valid(stack_base, 0, rsp));
+        assert!(!user_stack_top_valid(stack_base + 1, stack_len, rsp));
+        // Full gate: mapped pair passes; forgetting any half refuses.
+        assert!(user_entry_mapped_valid(
+            rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len
+        ));
+        assert!(
+            !user_entry_mapped_valid(rip, rsp, 0, code_base, code_len, stack_base, stack_len),
+            "rsp0==0 refuses"
+        );
+        assert!(
+            !user_entry_mapped_valid(
+                rip,
+                rsp,
+                0x1000,
+                code_base,
+                code_len,
+                stack_base,
+                stack_len - 16
+            ),
+            "unmapped stack top refuses"
+        );
+        assert!(
+            !user_entry_mapped_valid(
+                code_base + code_len,
+                rsp,
+                0x1000,
+                code_base,
+                code_len,
+                stack_base,
+                stack_len
+            ),
+            "unmapped rip refuses"
+        );
+        assert!(
+            !user_entry_mapped_valid(
+                0xFFFF_8000_0010_0000,
+                rsp,
+                0x1000,
+                0xFFFF_8000_0010_0000,
+                code_len,
+                stack_base,
+                stack_len
+            ),
+            "kernel-half refuses even when mapped"
+        );
+        assert!(
+            !user_entry_mapped_valid(
+                rip,
+                rsp - 1,
+                0x1000,
+                code_base,
+                code_len,
+                stack_base,
+                stack_len
+            ),
+            "misaligned rsp refuses"
+        );
+        assert!(
+            !user_entry_mapped_valid(
+                rip,
+                u64::MAX,
+                0x1000,
+                code_base,
+                code_len,
+                stack_base,
+                stack_len
+            ),
+            "saturated top refuses"
+        );
+        // Load-bearing: shape-valid but mapping-forgotten refuses — the
+        // slice2o gap this closes (`ready && entry_valid` alone passes).
+        assert!(iretq_ready(0x1000, rip, rsp) && user_entry_valid(rip, rsp));
+        assert!(!user_entry_mapped_valid(
+            rip, rsp, 0x1000, code_base, code_len, stack_base, 0
+        ));
     }
 
     #[test]
