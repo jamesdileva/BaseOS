@@ -174,6 +174,21 @@ pub(crate) const fn user_stack_top_for(base: u64) -> u64 {
     base.saturating_add(USER_STACK_LEN as u64)
 }
 
+/// Pages in the future CPL3 user stack (S09 slice2u, #30 remainder):
+/// `USER_STACK_LEN / 4096 == 4` — the stub walks all four via
+/// [`walk_user_stack_pages`], never one flag for the whole range.
+#[allow(dead_code)]
+pub(crate) const USER_STACK_PAGES: usize = USER_STACK_LEN / 4096;
+
+// REVIEW #664 step 2/3 (slice2u): build-time pins so a resized `USER_STACK_LEN`
+// that breaks the 4-page walk fails the build, not just the test run.
+#[allow(dead_code)]
+#[allow(clippy::manual_is_multiple_of)]
+const _: () = {
+    assert!(USER_STACK_LEN % 4096 == 0);
+    assert!(USER_STACK_PAGES == 4);
+};
+
 /// Pre-`iretq` readiness gate (S09 slice2n, #30 remainder): the future guest
 /// entry stub must refuse (`ok=0` fail-closed) unless `rsp0 != 0` (TSS ring-0
 /// stack wired by `load_gdt`) AND `user_rsp != 0` (user stack mapped, top
@@ -416,6 +431,65 @@ pub(crate) const fn all_stack_pages_valid_for(pages: &[PageFlags], nxe_enabled: 
         i += 1;
     }
     true
+}
+
+/// Walk every page of the future CPL3 user stack (S09 slice2u, #30 remainder,
+/// REVIEW #664 step 2/3): `walk_full_leaf_flags` per 4 KiB page over
+/// `[stack_base, stack_base + USER_STACK_LEN)`, collecting one [`PageFlags`]
+/// per page. Returns `None` fail-closed on ANY walk error (unmapped page,
+/// non-canonical base, lookup miss) — a partial walk proves nothing, so the
+/// caller gates on the full [`USER_STACK_PAGES`] array or refuses.
+///
+/// The flags array feeds [`all_stack_pages_valid_for`] with the live
+/// `EFER.NXE` pin (see [`probe_user_stack_pages_valid`]); callers MUST NOT
+/// substitute caller-supplied literals (REVIEW #658 risk 1) — the only
+/// producer of this array is this walk.
+pub(crate) fn walk_user_stack_pages<'a, F>(
+    pml4_base: u64,
+    stack_base: u64,
+    lookup: F,
+) -> Option<[PageFlags; USER_STACK_PAGES]>
+where
+    F: Fn(u64) -> Option<&'a [u64; 512]>,
+{
+    let mut pages = [PageFlags::empty(); USER_STACK_PAGES];
+    let mut i = 0usize;
+    while i < USER_STACK_PAGES {
+        let va = stack_base.wrapping_add((i as u64) * 4096);
+        match super::page_table::walk_full_leaf_flags(pml4_base, va, &lookup) {
+            Ok((_phys, flags)) => pages[i] = flags,
+            Err(_) => return None,
+        }
+        i += 1;
+    }
+    Some(pages)
+}
+
+/// Guest-only stub binding the 4-page walk to the live NXE pin (S09 slice2u,
+/// REVIEW #664 step 2/3): reads live `EFER.NXE` (`efer_nxe_enabled(read_efer())`),
+/// walks the guest `USER_STACK` bytes via [`walk_user_stack_pages`] with the
+/// live `pml4_base` + caller lookup, and gates on [`all_stack_pages_valid_for`]
+/// — wrapper-only (never inline flag checks, never the inner degraded path
+/// alone: NXE=0 refuses here even though the per-page math degraded-accepts).
+/// Uncalled this slice (the stack is BSS-reserved but unmapped, so it would
+/// return false; no `iretq`), so boot-neutral by construction. The CPL3-entry
+/// slice wires the call site with the identity-map lookup + code-side pages.
+///
+/// # Safety
+/// Post-EBS only, on the boot thread: reads `EFER` and firmware page tables
+/// through `lookup` (identity-mapped). Never called on the host.
+#[cfg(not(test))]
+#[allow(dead_code)]
+pub(crate) unsafe fn probe_user_stack_pages_valid<'a, F>(pml4_base: u64, lookup: F) -> bool
+where
+    F: Fn(u64) -> Option<&'a [u64; 512]>,
+{
+    let nxe_enabled = efer_nxe_enabled(read_efer());
+    let base = core::ptr::addr_of!(USER_STACK) as u64;
+    match walk_user_stack_pages(pml4_base, base, lookup) {
+        Some(pages) => all_stack_pages_valid_for(&pages, nxe_enabled),
+        None => false,
+    }
 }
 
 /// Fully-gated user-entry validity over per-page walks (S09 slice2r): the
@@ -1630,6 +1704,107 @@ mod tests {
         assert!(!user_entry_cpl3_allowed(
             rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len, &good_code, &good4, false
         ));
+    }
+
+    #[test]
+    fn user_stack_pages_walk_pins_four_page_wrapper_binding() {
+        // S09 slice2u (#30 remainder, REVIEW #664 step 2/3): the future stub
+        // must walk ALL 4 user-stack pages via `walk_full_leaf_flags` (never
+        // one flag for the range — REVIEW #658 risk 1: no caller-supplied
+        // literals) and gate the array on `all_stack_pages_valid_for` with
+        // the live NXE pin. Host pins the walk core the guest
+        // `probe_user_stack_pages_valid` stub composes; the stub itself is
+        // guest-only (uncalled, unmapped stack → false, no `iretq` yet).
+        use super::super::page_table::{
+            encode_table_entry, pte_decoded_flags, pte_encode, PageFlags,
+        };
+        assert_eq!(USER_STACK_PAGES, 4);
+        assert_eq!(USER_STACK_LEN % 4096, 0);
+        // stack_base 0x0000_1000_0020_0000 (16 KiB-aligned, one PT span):
+        // PML4[32] -> PDPT[0] -> PD[1] -> PT[0..3] (4 consecutive leaves).
+        let stack_base = 0x0000_1000_0020_0000_u64;
+        assert_eq!(stack_base % 16384, 0, "all 4 pages share one PT");
+        // Index pins (recomputed, not trusted): a wrong slot fails the walk
+        // below loudly instead of silently covering the wrong pages.
+        assert_eq!((stack_base >> 39) & 511, 32);
+        assert_eq!((stack_base >> 30) & 511, 0);
+        assert_eq!((stack_base >> 21) & 511, 1);
+        assert_eq!((stack_base >> 12) & 511, 0);
+        let src = |flags: PageFlags| pte_decoded_flags(pte_encode(0x1_0000, flags));
+        let stack_nx =
+            src(PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC);
+        let stack_exec = src(PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE);
+        let next = PageFlags::PRESENT | PageFlags::WRITABLE;
+        let build_tables = |leaf: PageFlags| {
+            let mut pml4: [u64; 512] = [0; 512];
+            let mut pdpt: [u64; 512] = [0; 512];
+            let mut pd: [u64; 512] = [0; 512];
+            let mut ptable: [u64; 512] = [0; 512];
+            pml4[32] = encode_table_entry(0x2000, next).unwrap();
+            pdpt[0] = encode_table_entry(0x3000, next).unwrap();
+            pd[1] = encode_table_entry(0x4000, next).unwrap();
+            let mut i = 0usize;
+            while i < USER_STACK_PAGES {
+                ptable[i] = pte_encode(0x60_0000 + (i as u64) * 4096, leaf);
+                i += 1;
+            }
+            (pml4, pdpt, pd, ptable)
+        };
+        // All-NX pages: walk yields Some(all-NX), wrapper allows while NXE=1.
+        let (pml4, pdpt, pd, ptable) = build_tables(
+            PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC,
+        );
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd),
+                0x4000 => Some(&ptable),
+                _ => None,
+            }
+        };
+        let pages = walk_user_stack_pages(0x1000, stack_base, lookup)
+            .expect("all 4 pages mapped, walk must succeed");
+        assert_eq!(pages, [stack_nx; USER_STACK_PAGES]);
+        assert!(all_stack_pages_valid_for(&pages, true));
+        // NX pages with NXE=0 refuse (bit 63 MBZ while NXE=0).
+        assert!(!all_stack_pages_valid_for(&pages, false));
+        // Page-3 exec: walk still succeeds (present) but the wrapper refuses
+        // — a single good flag for page 0 cannot cover it.
+        let (pml4e, pdpte, pde, mut ptablee) = build_tables(
+            PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC,
+        );
+        ptablee[3] = pte_encode(
+            0x60_0000 + 3 * 4096,
+            PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE,
+        );
+        let lookupe = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4e),
+                0x2000 => Some(&pdpte),
+                0x3000 => Some(&pde),
+                0x4000 => Some(&ptablee),
+                _ => None,
+            }
+        };
+        let bad_pages = walk_user_stack_pages(0x1000, stack_base, lookupe)
+            .expect("present-but-exec page still walks");
+        assert_eq!(bad_pages[3], stack_exec);
+        assert!(
+            !all_stack_pages_valid_for(&bad_pages, true),
+            "page 3 exec refuses"
+        );
+        // Unmapped PT (lookup miss): walk fails closed with None (no partial
+        // array), so the stub refuses instead of gating 3 of 4 pages.
+        let lookup_miss = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd),
+                _ => None,
+            }
+        };
+        assert_eq!(walk_user_stack_pages(0x1000, stack_base, lookup_miss), None);
     }
 
     #[test]
