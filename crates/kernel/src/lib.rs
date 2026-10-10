@@ -44,9 +44,9 @@ pub mod uart;
 /// `cpu::` directly.
 #[cfg(test)]
 pub(crate) use cpu::IdtEntry;
-#[cfg(not(test))]
-use uart::write_tick_line;
 use uart::{write_exc_line, write_pf_line, write_pfus_line};
+#[cfg(not(test))]
+use uart::{write_tick_line, write_tr_line};
 
 /// Enter the kernel with the boot handoff: validate [`BootInfo`] and emit
 /// the one-line entry proof on the caller's byte sink:
@@ -409,6 +409,12 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
     cpu::load_gdt();
     cpu::load_idt();
+    // S09 slice2k (#30 remainder): live TR proof — `str` readback must equal
+    // `TSS_SEL` right after `ltr`; a skipped/faulted `ltr` prints ok=0 loudly.
+    {
+        let tr = cpu::read_tr();
+        write_tr_line(tr == TSS_SEL, tr);
+    }
     timer::remap_pic();
     if timer::pit_program_writes().is_none() {
         // Fail-closed before `sti` (REVIEW #458 residue 1): no PIT program
@@ -958,13 +964,14 @@ mod tests {
         let exc: fn(bool, u64) = uart::write_exc_line;
         let pf: fn(bool, u64, u64, u64) = uart::write_pf_line;
         let pfus: fn(bool, bool, bool, bool) = uart::write_pfus_line;
+        let tr: fn(bool, u16) = uart::write_tr_line;
         let tick: fn(bool, u64) = uart::write_tick_line;
         let sti: fn(bool, u64, u64, u64, u64, u64) = uart::write_sti_line;
         let irqstack: fn(bool, u64, u64, u64, u64) = uart::write_irqstack_line;
         let dec: fn(u64) = uart::write_dec_u64;
         let hex: fn(u64) = uart::write_hex_u64;
         let _ = (
-            init, write_byte, exc, pf, pfus, tick, sti, irqstack, dec, hex,
+            init, write_byte, exc, pf, pfus, tr, tick, sti, irqstack, dec, hex,
         );
     }
 

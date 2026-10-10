@@ -335,9 +335,62 @@ pub(crate) fn write_pfus_line(ok: bool, us: bool, w: bool, p: bool) {
     let _ = emit_pfus_line(&mut out, ok, us, w, p);
 }
 
+/// Pure TR line formatter shared by the guest writer and host tests
+/// (S09 slice2k, #30 remainder: `ltr` survival alone never proved `TR`
+/// holds `TSS_SEL` — boot-identical bytes only).
+///
+/// Emits `TR ok=<0|1> sel=<0x...>\n` through a byte callback
+/// (`core`-only, no port I/O), so host tests pin the literal field order,
+/// names, and hex shape while [`write_tr_line`] reuses this exact body
+/// for its COM1-direct write. `ok` is the caller-computed
+/// `read_tr() == TSS_SEL` verdict. `no_std`-clean; the guest passes a
+/// `com1_write_byte` closure (infallible).
+pub(crate) fn emit_tr_line<E>(
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+    ok: bool,
+    sel: u16,
+) -> Result<(), E> {
+    use baseos_boot_info::{write_str, write_u64_dec, write_u64_hex};
+    write_str(emit, "TR ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " sel=")?;
+    write_u64_hex(emit, u64::from(sel))?;
+    write_str(emit, "\n")
+}
+
+/// Emit `TR ok=<0|1> sel=<0x...>\n` directly on COM1
+/// (S09 slice2k TR-liveness proof: `ok` is 1 only when the live `str`
+/// readback equals `TSS_SEL` right after `ltr` — a skipped/faulted `ltr`
+/// prints `ok=0` fail-closed).
+///
+/// Safe wrapper: only calls [`com1_write_byte`] via [`emit_tr_line`].
+/// Requires COM1 initialized; single-threaded bring-up context owns
+/// the UART exclusively.
+pub(crate) fn write_tr_line(ok: bool, sel: u16) {
+    let mut out = |b: u8| {
+        com1_write_byte(b);
+        Ok::<(), core::convert::Infallible>(())
+    };
+    let _ = emit_tr_line(&mut out, ok, sel);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_tr(ok: bool, sel: u16) -> String {
+        let mut out = Vec::new();
+        emit_tr_line::<core::convert::Infallible>(
+            &mut |b| {
+                out.push(b);
+                Ok(())
+            },
+            ok,
+            sel,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
 
     fn run_pfus(ok: bool, us: bool, w: bool, p: bool) -> String {
         let mut out = Vec::new();
@@ -432,6 +485,18 @@ mod tests {
         );
         assert!(us_i < w_i && w_i < p_i);
         assert!(line.starts_with("PFUS ok="));
+        assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn tr_line_pins_exact_field_order_and_fail_closed_shape() {
+        // S09 slice2k: host backstop for the TR-liveness e2e shape. The
+        // guest bring-up shares this body, so a format drift fails here.
+        assert_eq!(run_tr(true, 0x28), "TR ok=1 sel=0x28\n");
+        assert_eq!(run_tr(false, 0x0), "TR ok=0 sel=0x0\n");
+        let line = run_tr(true, 0x28);
+        assert!(line.starts_with("TR ok="));
+        assert!(line.contains(" sel=0x"));
         assert!(line.ends_with('\n'));
     }
 }

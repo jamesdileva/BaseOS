@@ -419,6 +419,27 @@ pub fn read_rsp() -> u64 {
     value
 }
 
+/// Live `TR` (task register) readback (S09 slice2k, #30 remainder).
+///
+/// `str` (store task register) proves the guest `load_gdt` `ltr TSS_SEL`
+/// actually loaded the task register: the guest emits `TR ok=1 sel=...`
+/// right after `load_gdt`/`load_idt`, so a faulted/skipped `ltr` fails the
+/// e2e hard-require loudly instead of resting on boot-identical bytes.
+/// `str` is unprivileged on x86-64, so this is a safe `fn` with the
+/// `unsafe` confined to the asm body (same shape as [`read_rsp`]); host
+/// `cargo test` may call it (returns the harness TR there — only the
+/// safe-fn shape is asserted, never the value).
+#[inline(always)]
+#[must_use]
+pub fn read_tr() -> u16 {
+    let value: u16;
+    // SAFETY: pure register read, unprivileged `str`; never writes.
+    unsafe {
+        core::arch::asm!("str {0:x}", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
 /// TSC warm-up iterations before a latency run (S07 slice52, #21 R3).
 ///
 /// Warms the branch predictor / i-cache on the `lfence; rdtsc` path so the
@@ -870,6 +891,15 @@ mod tests {
             inner_rsp < outer,
             "nested frame must sit below the caller: inner={inner_rsp:#x} outer={outer:#x}"
         );
+    }
+
+    #[test]
+    fn read_tr_is_safe_fn_shape() {
+        // S09 slice2k: `str` is unprivileged, so `read_tr` is a safe `fn`
+        // (bind proves no `unsafe` block at call sites). Never asserts the
+        // value (host TR is the harness's, not TSS_SEL).
+        let tr_fn: fn() -> u16 = read_tr;
+        let _ = tr_fn;
     }
 
     #[test]
