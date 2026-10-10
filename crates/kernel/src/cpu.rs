@@ -145,9 +145,43 @@ pub(crate) struct IretqFrame {
     pub(crate) ss: u64,
 }
 
+/// User stack length for a future CPL3 thread (S09 slice2n, #30 remainder):
+/// 16 KiB, mirrors [`RING0_STACK_LEN`]. Host-only pin this slice — no guest
+/// user-stack static yet, so boot-neutral by construction.
+#[allow(dead_code)]
+pub(crate) const USER_STACK_LEN: usize = 16384;
+
+/// Top (one-past-end) of a user stack blob: same 16-byte-aligned-top rule as
+/// [`ring0_stack_top_for`].
+#[allow(dead_code)]
+pub(crate) const fn user_stack_top_for(base: u64) -> u64 {
+    base.saturating_add(USER_STACK_LEN as u64)
+}
+
+/// Pre-`iretq` readiness gate (S09 slice2n, #30 remainder): the future guest
+/// entry stub must refuse (`ok=0` fail-closed) unless `rsp0 != 0` (TSS ring-0
+/// stack wired by `load_gdt`) AND `user_rsp != 0` (user stack mapped, top
+/// from [`user_stack_top_for`]). `user_rip == 0` (null entry) also refuses.
+/// Pure const so host tests and the future guest stub share one rule; no
+/// guest `iretq` yet.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn iretq_ready(rsp0: u64, user_rip: u64, user_rsp: u64) -> bool {
+    rsp0 != 0 && user_rip != 0 && user_rsp != 0
+}
+
 /// Build the CPL3 `iretq` frame for `user_rip` with user stack top
 /// `user_rsp`: CS/SS pin the DPL3 selectors, RFLAGS pins [`USER_RFLAGS`].
 /// Pure so host tests and the future guest entry stub share one rule.
+///
+/// # Preconditions
+/// Caller owns validation (next slice): `rsp0 != 0` (see [`iretq_ready` —
+/// otherwise the first CPL3->0 entry faults `#SS(0)`/triple-faults),
+/// `user_rsp` is the [`user_stack_top_for`] top of a mapped user stack, and
+/// `user_rip` is a canonical user-half address. This constructor does NOT
+/// check them (const, infallible) — the guest entry stub must gate on
+/// [`iretq_ready`] plus user-range mapping validation before pushing this
+/// frame and executing `iretq`.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) const fn iretq_frame_for(user_rip: u64, user_rsp: u64) -> IretqFrame {
@@ -159,6 +193,19 @@ pub(crate) const fn iretq_frame_for(user_rip: u64, user_rsp: u64) -> IretqFrame 
         ss: USER_DATA_SEL as u64,
     }
 }
+
+// REVIEW #652 nit 1 (slice2m): build-time pins so a wrong frame layout fails
+// the build, not just the test run (the `#[test]` size/offset asserts remain
+// as the readable host-side pins).
+#[allow(dead_code)]
+const _: () = {
+    assert!(core::mem::size_of::<IretqFrame>() == 40);
+    assert!(core::mem::offset_of!(IretqFrame, rip) == 0);
+    assert!(core::mem::offset_of!(IretqFrame, cs) == 8);
+    assert!(core::mem::offset_of!(IretqFrame, rflags) == 16);
+    assert!(core::mem::offset_of!(IretqFrame, rsp) == 24);
+    assert!(core::mem::offset_of!(IretqFrame, ss) == 32);
+};
 
 #[cfg(not(test))]
 static mut RING0_STACK: Ring0Stack = Ring0Stack([0; RING0_STACK_LEN]);
@@ -809,6 +856,31 @@ mod tests {
         assert_eq!(core::mem::offset_of!(IretqFrame, rflags), 16);
         assert_eq!(core::mem::offset_of!(IretqFrame, rsp), 24);
         assert_eq!(core::mem::offset_of!(IretqFrame, ss), 32);
+    }
+
+    #[test]
+    fn user_stack_top_and_iretq_ready_pin_pre_iretq_gate() {
+        // S09 slice2n (#30 remainder, REVIEW #652 nit 2): the future guest
+        // entry stub must refuse unless rsp0 != 0 (ring-0 stack wired) AND a
+        // nonzero user rip/rsp exist. Host-only pin; no guest `iretq` yet.
+        assert_eq!(USER_STACK_LEN, 16384, "one 16 KiB user stack");
+        let base = 0xFFFF_8000_0020_0000_u64;
+        let top = user_stack_top_for(base);
+        assert_eq!(top, base + 16384);
+        assert_eq!(top % 16, 0, "user RSP top stays 16-aligned");
+        assert_ne!(top, 0);
+        assert_eq!(user_stack_top_for(u64::MAX), u64::MAX, "saturates");
+        assert_ne!(user_stack_top_for(0), 0);
+        // Ready gate: all-nonzero passes; any zero refuses fail-closed.
+        assert!(iretq_ready(0x1000, 0x1_0000, top));
+        assert!(!iretq_ready(0, 0x1_0000, top), "rsp0==0 refuses");
+        assert!(!iretq_ready(0x1000, 0, top), "null rip refuses");
+        assert!(!iretq_ready(0x1000, 0x1_0000, 0), "null rsp refuses");
+        assert!(!iretq_ready(0, 0, 0));
+        // The frame constructor stays pure/infallible (no gate inside) —
+        // the gate lives at the call site per the `# Preconditions` doc.
+        let frame = iretq_frame_for(0x1_0000, top);
+        assert_eq!((frame.rip, frame.rsp), (0x1_0000, top));
     }
 
     #[test]
