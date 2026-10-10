@@ -433,12 +433,16 @@ pub(crate) const fn all_stack_pages_valid_for(pages: &[PageFlags], nxe_enabled: 
     true
 }
 
-/// Walk every page of the future CPL3 user stack (S09 slice2u, #30 remainder,
-/// REVIEW #664 step 2/3): `walk_full_leaf_flags` per 4 KiB page over
+/// Walk every page of the future CPL3 user stack (S09 slice2u+2v, #30 remainder,
+/// REVIEW #664 step 2/3 + REVIEW #666 risk 2): `walk_full_leaf_flags` per 4 KiB page over
 /// `[stack_base, stack_base + USER_STACK_LEN)`, collecting one [`PageFlags`]
 /// per page. Returns `None` fail-closed on ANY walk error (unmapped page,
 /// non-canonical base, lookup miss) — a partial walk proves nothing, so the
 /// caller gates on the full [`USER_STACK_PAGES`] array or refuses.
+///
+/// Slice2v overflow pin: per-page VA uses `checked_add` — a `stack_base` near
+/// `u64::MAX` refuses with `None` instead of `wrapping_add` wrapping to low
+/// VA and walking the wrong pages.
 ///
 /// The flags array feeds [`all_stack_pages_valid_for`] with the live
 /// `EFER.NXE` pin (see [`probe_user_stack_pages_valid`]); callers MUST NOT
@@ -455,7 +459,7 @@ where
     let mut pages = [PageFlags::empty(); USER_STACK_PAGES];
     let mut i = 0usize;
     while i < USER_STACK_PAGES {
-        let va = stack_base.wrapping_add((i as u64) * 4096);
+        let va = stack_base.checked_add((i as u64) * 4096)?;
         match super::page_table::walk_full_leaf_flags(pml4_base, va, &lookup) {
             Ok((_phys, flags)) => pages[i] = flags,
             Err(_) => return None,
@@ -1805,6 +1809,16 @@ mod tests {
             }
         };
         assert_eq!(walk_user_stack_pages(0x1000, stack_base, lookup_miss), None);
+        // S09 slice2v (REVIEW #666 risk 2): near-top base refuses instead of
+        // wrapping to low VA — `u64::MAX - 4096` page 1 overflows
+        // (`checked_add`). Page 0 already misses here, so this pins the
+        // fail-closed shape; the wrap-accept kill is the `checked_add`
+        // above (old `wrapping_add` would walk low VA on i=1).
+        let lookup_top_miss = |_: u64| -> Option<&[u64; 512]> { None };
+        assert_eq!(
+            walk_user_stack_pages(0x1000, u64::MAX - 4096, lookup_top_miss),
+            None
+        );
     }
 
     #[test]
