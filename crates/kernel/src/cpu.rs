@@ -334,6 +334,113 @@ pub(crate) const fn user_entry_fully_valid(
         && user_stack_perms_valid(stack_flags)
 }
 
+/// User-stack permission validity with a live NXE pin (S09 slice2r, #30
+/// remainder, REVIEW #660 risk 3): `nxe_enabled` is the live
+/// `EFER.NXE` bit (`efer_nxe_enabled(read_efer())` in the future stub).
+/// When enabled, same as [`user_stack_perms_valid`] (PRESENT+USER+WRITABLE+
+/// NO_EXEC). When disabled, bit 63 is MBZ (`pte_reserved_violation` with
+/// `nx_enabled=false`), so a NO_EXEC PTE is a reserved violation and must
+/// refuse — the gate demands PRESENT+USER+WRITABLE with NO_EXEC *clear*
+/// (degraded accept: HW cannot enforce NX; the future stub must still
+/// refuse CPL3 entry when NXE=0 — see [`user_entry_fully_valid_nxe`]).
+/// Pure const so host tests and the stub share one rule; still no guest
+/// `iretq` yet.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_stack_perms_valid_for(flags: PageFlags, nxe_enabled: bool) -> bool {
+    if nxe_enabled {
+        user_stack_perms_valid(flags)
+    } else {
+        flags.contains(PageFlags::PRESENT)
+            && flags.contains(PageFlags::USER)
+            && flags.contains(PageFlags::WRITABLE)
+            && !flags.contains(PageFlags::NO_EXEC)
+    }
+}
+
+/// Per-page code permission gate (S09 slice2r, REVIEW #660 risk 2): every
+/// page in `pages` (one [`PageFlags`] per 4 KiB page, sourced from
+/// `walk_full_leaf_flags` per page) must satisfy [`user_code_perms_valid`].
+/// Empty coverage refuses (a zero-length walk proves nothing). This closes
+/// the single-flags-for-multi-page gap: `code_len 0x2000` is 2 pages, so a
+/// caller passing one good flags value for both pages bypasses an exec
+/// check on the second page — the future stub must walk each page.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn all_code_pages_valid(pages: &[PageFlags]) -> bool {
+    if pages.is_empty() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < pages.len() {
+        if !user_code_perms_valid(pages[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Per-page stack permission gate with NXE pin (S09 slice2r, REVIEW #660
+/// risks 2+3): every page in `pages` must satisfy
+/// [`user_stack_perms_valid_for`] with the same live `nxe_enabled`.
+/// Empty coverage refuses. The 16 KiB user stack is 4 pages — one flags
+/// value cannot cover it; the future stub walks all four.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn all_stack_pages_valid_for(pages: &[PageFlags], nxe_enabled: bool) -> bool {
+    if pages.is_empty() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < pages.len() {
+        if !user_stack_perms_valid_for(pages[i], nxe_enabled) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Fully-gated user-entry validity over per-page walks (S09 slice2r): the
+/// future stub's single call site once the walker binding lands —
+/// [`user_entry_mapped_valid`] PLUS per-page code/stack gates PLUS exact
+/// page-count coverage (`code_len`/`stack_len` must be nonzero 4 KiB
+/// multiples and `pages.len()` must equal `len / 4096`, so a one-flag
+/// shortcut for a 4-page stack refuses on count even if the single page
+/// is good) PLUS the live `nxe_enabled` pin. Pure const; still no guest
+/// `iretq` yet.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_is_multiple_of)]
+#[must_use]
+pub(crate) const fn user_entry_fully_valid_pages(
+    user_rip: u64,
+    user_rsp: u64,
+    rsp0: u64,
+    code_base: u64,
+    code_len: u64,
+    stack_base: u64,
+    stack_len: u64,
+    code_pages: &[PageFlags],
+    stack_pages: &[PageFlags],
+    nxe_enabled: bool,
+) -> bool {
+    if code_len == 0 || code_len % 4096 != 0 || stack_len == 0 || stack_len % 4096 != 0 {
+        return false;
+    }
+    if code_pages.len() as u64 != code_len / 4096 {
+        return false;
+    }
+    if stack_pages.len() as u64 != stack_len / 4096 {
+        return false;
+    }
+    user_entry_mapped_valid(
+        user_rip, user_rsp, rsp0, code_base, code_len, stack_base, stack_len,
+    ) && all_code_pages_valid(code_pages)
+        && all_stack_pages_valid_for(stack_pages, nxe_enabled)
+}
+
 /// Build the CPL3 `iretq` frame for `user_rip` with user stack top
 /// `user_rsp`: CS/SS pin the DPL3 selectors, RFLAGS pins [`USER_RFLAGS`].
 /// Pure so host tests and the future guest entry stub share one rule.
@@ -1304,6 +1411,134 @@ mod tests {
             ),
             "exec stack refuses"
         );
+    }
+
+    #[test]
+    fn user_entry_pages_pin_per_page_and_nxe() {
+        // S09 slice2r (#30 remainder, REVIEW #660 risks 2+3): single-flags
+        // gates cannot cover multi-page regions, and the slice2q stack gate
+        // assumed NXE=1. Flags here are walker-shaped: sourced via
+        // `pte_encode` -> `pte_decoded_flags` (the same decode rule
+        // `walk_full_leaf_flags` uses), plus one live `walk_full_leaf_flags`
+        // call proving the walker->gate plumbing. Host-only; no guest iretq.
+        use super::super::page_table::{
+            pte_decoded_flags, pte_encode, walk_full_leaf_flags, PageFlags,
+        };
+        let code_base = 0x0000_1000_0010_0000_u64;
+        let code_len = 0x2000_u64; // 2 pages
+        let stack_base = 0x0000_1000_0020_0000_u64;
+        let stack_len = USER_STACK_LEN as u64; // 16384 = 4 pages
+        let rip = code_base + 0x100;
+        let rsp = user_stack_top_for(stack_base);
+        // Walker-shaped decode: encode then decode (never hand literals).
+        let src = |flags: PageFlags| pte_decoded_flags(pte_encode(0x1_0000, flags));
+        let code_rxu = src(PageFlags::PRESENT | PageFlags::USER);
+        let stack_nx =
+            src(PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC);
+        let stack_exec = src(PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE);
+        // NXE pin agrees with the page-table decode (bit 11).
+        assert!(super::super::page_table::efer_nxe_enabled(
+            super::super::page_table::EFER_NXE_BIT
+        ));
+        assert!(!super::super::page_table::efer_nxe_enabled(0));
+        // NXE-aware stack math: NXE=1 demands NX; NXE=0 demands !NX (bit 63
+        // is MBZ while NXE=0 — a NO_EXEC PTE is a reserved violation).
+        assert!(user_stack_perms_valid_for(stack_nx, true));
+        assert!(!user_stack_perms_valid_for(stack_exec, true));
+        assert!(
+            !user_stack_perms_valid_for(stack_nx, false),
+            "NX is MBZ while NXE=0"
+        );
+        assert!(
+            user_stack_perms_valid_for(stack_exec, false),
+            "degraded accept, HW can't enforce"
+        );
+        assert_eq!(
+            user_stack_perms_valid_for(stack_nx, true),
+            user_stack_perms_valid(stack_nx)
+        );
+        // Live walker plumbing: one real `walk_full_leaf_flags` leaf feeds
+        // the code gate (proves the future stub's source, not just literals).
+        // virt 0x1000: PML4[0] -> PDPT -> PD -> PT[1] = RXU leaf.
+        use super::super::page_table::encode_table_entry;
+        let mut pml4: [u64; 512] = [0; 512];
+        let mut pdpt: [u64; 512] = [0; 512];
+        let mut pd: [u64; 512] = [0; 512];
+        let mut ptable: [u64; 512] = [0; 512];
+        let next = PageFlags::PRESENT | PageFlags::WRITABLE;
+        pml4[0] = encode_table_entry(0x2000, next).unwrap();
+        pdpt[0] = encode_table_entry(0x3000, next).unwrap();
+        pd[0] = encode_table_entry(0x4000, next).unwrap();
+        ptable[1] = pte_encode(0x2_0000, PageFlags::PRESENT | PageFlags::USER);
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd),
+                0x4000 => Some(&ptable),
+                _ => None,
+            }
+        };
+        let (walk_phys, walk_flags) = walk_full_leaf_flags(0x1000, 0x1000, lookup).unwrap();
+        assert_eq!(walk_phys, 0x2_0000);
+        assert_eq!(walk_flags, code_rxu);
+        assert!(user_code_perms_valid(walk_flags));
+        // Per-page: 4-page stack with page 3 exec must refuse even though
+        // the single-page gate with page-0 flags passes (load-bearing risk 2).
+        let good4 = [stack_nx, stack_nx, stack_nx, stack_nx];
+        let bad4 = [stack_nx, stack_nx, stack_nx, stack_exec];
+        assert!(all_stack_pages_valid_for(&good4, true));
+        assert!(
+            !all_stack_pages_valid_for(&bad4, true),
+            "page 3 exec refuses"
+        );
+        assert!(!all_stack_pages_valid_for(&[], true), "empty refuses");
+        assert!(!all_code_pages_valid(&[]), "empty refuses");
+        assert!(all_code_pages_valid(&[code_rxu, code_rxu]));
+        let code_nx = src(PageFlags::PRESENT | PageFlags::USER | PageFlags::NO_EXEC);
+        assert!(!user_code_perms_valid(code_nx), "non-exec code refuses");
+        assert!(!all_code_pages_valid(&[code_rxu, code_nx]));
+        // Full per-page gate: good 2+4 pages pass; bad page-3 refuses even
+        // though `user_entry_fully_valid` with page-0 flags alone passes.
+        let good_code = [code_rxu, code_rxu];
+        assert!(user_entry_fully_valid(
+            rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len, code_rxu, stack_nx
+        ));
+        assert!(user_entry_fully_valid_pages(
+            rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len, &good_code, &good4, true
+        ));
+        assert!(
+            !user_entry_fully_valid_pages(
+                rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len, &good_code, &bad4,
+                true
+            ),
+            "single good flag cannot cover exec page 3"
+        );
+        // Count coverage: one flag for a 4-page stack refuses on count.
+        assert!(
+            !user_entry_fully_valid_pages(
+                rip,
+                rsp,
+                0x1000,
+                code_base,
+                code_len,
+                stack_base,
+                stack_len,
+                &good_code,
+                &[stack_nx],
+                true
+            ),
+            "one flag for 4 pages refuses"
+        );
+        // NXE=0 full gate: NX stack refuses (MBZ), matching per-page rule.
+        assert!(!user_entry_fully_valid_pages(
+            rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len, &good_code, &good4, false
+        ));
+        let degraded4 = [stack_exec, stack_exec, stack_exec, stack_exec];
+        assert!(user_entry_fully_valid_pages(
+            rip, rsp, 0x1000, code_base, code_len, stack_base, stack_len, &good_code, &degraded4,
+            false
+        ));
     }
 
     #[test]
