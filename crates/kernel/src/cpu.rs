@@ -205,6 +205,30 @@ pub(crate) const USER_STACK_MAP_FLAGS: PageFlags = PageFlags::PRESENT
 pub(crate) const fn user_stack_map_flags_valid(flags: PageFlags) -> bool {
     flags.bits() == USER_STACK_MAP_FLAGS.bits()
 }
+
+/// Per-page exact mapping gate (S09 slice2z, #30 remainder, REVIEW #673
+/// follow-up): the future mapping stub's call site — every 4 KiB page must
+/// satisfy [`user_stack_map_flags_valid`] (exact word, not `contains`).
+/// Closes the `contains`-accepts-GUARD gap in [`all_stack_pages_valid_for`]:
+/// a GUARD-tagged page passes the perms gate but refuses here. Empty
+/// coverage refuses. NXE=1 shape only (NXE=0 entry refuses fail-closed via
+/// [`user_entry_cpl3_allowed`]); the stub installs this word only when the
+/// live NXE pin holds.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn all_stack_map_flags_valid(pages: &[PageFlags]) -> bool {
+    if pages.is_empty() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < pages.len() {
+        if !user_stack_map_flags_valid(pages[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 #[allow(dead_code)]
 #[allow(clippy::manual_is_multiple_of)]
 const _: () = {
@@ -1915,6 +1939,16 @@ mod tests {
                 .union(PageFlags::WRITABLE)
         ));
         assert!(!user_stack_map_flags_valid(PageFlags::empty()));
+        // Slice2z: per-page exact gate — the mapping stub's call site.
+        // Exact word on all 4 pages passes; one GUARD-tagged page refuses
+        // even though the contains-gate accepts it (discriminating pin);
+        // empty refuses.
+        assert!(all_stack_map_flags_valid(&[f; USER_STACK_PAGES]));
+        assert!(!all_stack_map_flags_valid(&[]));
+        let mut guard4 = [f; USER_STACK_PAGES];
+        guard4[2] = f.union(PageFlags::GUARD);
+        assert!(!all_stack_map_flags_valid(&guard4));
+        assert!(all_stack_pages_valid_for(&guard4, true));
     }
 
     #[test]
