@@ -46,6 +46,7 @@ $g = Get-Pat "guardPat"
 $u = Get-Pat "userPat"
 $r = Get-Pat "rmbzPat"
 $f = Get-Pat "pfusPat"
+$t = Get-Pat "trPat"
 
 # Finding-1 lock: both patterns must carry the literal `w=1(\s|$)` tightening
 # so w=10 cannot match via the w=1 substring. Match the literal suffix
@@ -101,6 +102,15 @@ if (($r -notlike '*RMBZ ok=1 *') -or (-not $r.Contains('[^\r\n]*viol=0')) -or ($
 # so us=1 / w=1 / p=1 / missing-p / newline-split pairs fail.
 if (($f -notlike '*PFUS ok=1 *') -or (-not $f.Contains('us=0')) -or (-not $f.Contains('w=0')) -or (-not $f.Contains('[^\r\n]*p=0')) -or ($f -notlike '*p=0(\s|$)*')) {
   Write-Output "GATE TEST FAIL (PFUS pattern missing ok=1/us/w/p tightening: $f)"
+  exit 1
+}
+# S09 slice2l TR gate (REVIEW #648 risk 1 load-bearing gap: TR liveness was
+# human-reads-serial, not automated): pattern must carry the literal space
+# after `ok=1` (boundary, mirrors GUARD), same-line `[^\r\n]*sel=0x28`,
+# and a `sel=0x28(\s|$)` value pin so ok=0 / ok=10 / wrong-sel /
+# missing-sel / newline-split pairs fail.
+if (($t -notlike '*TR ok=1 *') -or (-not $t.Contains('[^\r\n]*sel=0x28')) -or ($t -notlike '*sel=0x28(\s|$)*')) {
+  Write-Output "GATE TEST FAIL (TR pattern missing ok=1/sel tightening: $t)"
   exit 1
 }
 
@@ -159,7 +169,13 @@ $cases = @(
   @("F-p1", $f, "PFUS ok=1 us=0 w=0 p=1`n", $false, "p=1 fails fail-closed"),
   @("F-ten", $f, "PFUS ok=10 us=0 w=0 p=0`n", $false, "ok=10 fails"),
   @("F-nop", $f, "PFUS ok=1 us=0 w=0`n", $false, "missing p fails"),
-  @("F-split", $f, "PFUS ok=1 us=0 w=0`n p=0`n", $false, "newline-split fails")
+  @("F-split", $f, "PFUS ok=1 us=0 w=0`n p=0`n", $false, "newline-split fails"),
+  @("T-good", $t, "TR ok=1 sel=0x28`n", $true, "ok=1 sel=0x28 passes"),
+  @("T-ok0", $t, "TR ok=0 sel=0x0`n", $false, "ok=0 fails fail-closed"),
+  @("T-ten", $t, "TR ok=10 sel=0x28`n", $false, "ok=10 fails"),
+  @("T-onex", $t, "TR ok=1x sel=0x28`n", $false, "ok=1x fails"),
+  @("T-badsel", $t, "TR ok=1 sel=0x30`n", $false, "wrong sel fails"),
+  @("T-split", $t, "TR ok=1`n sel=0x28`n", $false, "newline-split fails")
 )
 
 $failed = 0
@@ -178,5 +194,5 @@ if ($failed -gt 0) {
   Write-Output "GATE TEST FAIL ($failed cases)"
   exit 1
 }
-Write-Output "GATE TEST PASS (55/55)"
+Write-Output "GATE TEST PASS (61/61)"
 exit 0

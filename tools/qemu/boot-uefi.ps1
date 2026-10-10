@@ -296,6 +296,18 @@ if ($serialText -and $serialText.Contains($marker)) {
   # `(\s|$)` would match `\n` and false-pass a newline-split pair);
   # line-terminal `p` uses `(\s|$)`. CPL3 U=1 entry stays deferred.
   $pfusPat = "PFUS ok=1 [^\r\n]*us=0[ \t][^\r\n]*w=0[ \t][^\r\n]*p=0(\s|$)"
+  # S09 slice2l (REVIEW #648 risk 1 load-bearing gate gap: TR liveness was
+  # human-reads-serial, not automated): `TR ok=1 [^\r\n]*sel=0x28(\s|$)`
+  # mirrors the PFUS/RMBZ value gates — the literal space after `ok=1`
+  # stops `ok=10`/`ok=1x` false-passing, same-line `[^\r\n]*` stops a
+  # newline-split `ok=1` / sel pair, and `sel=0x28(\s|$)` pins the exact
+  # TSS_SEL so a skipped/faulted `ltr` printing `ok=0` fails e2e.
+  # Value gate (not value-free): TR must equal TSS_SEL == 0x28.
+  # Defense in depth with the guest: write_tr_line forces ok=0 on
+  # tr != TSS_SEL, so a faulted ltr fails both the ok=1 and sel pins.
+  # `TR ok=0` is additionally forbidden outright (refusal-FAIL shape).
+  $trPat = "TR ok=1 [^\r\n]*sel=0x28(\s|$)"
+  $trFail = "TR ok=0"
   # #59a value check (agent-b REVIEW #75 finding 1): presence of the
   # substrings alone would let map_size=999999999 or map_size=abc PASS.
   # Regex-capture the actual values off the MEMMAP ok=1 line and enforce
@@ -391,10 +403,12 @@ if ($serialText -and $serialText.Contains($marker)) {
   }
   $hasPf = [regex]::IsMatch($serialText, $pfPat)
   $hasPfus = [regex]::IsMatch($serialText, $pfusPat)
+  $hasTr = [regex]::IsMatch($serialText, $trPat)
+  $noTrFail = -not $serialText.Contains($trFail)
   $hasExc = $serialText.Contains($exc)
-   if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasUser -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSwitchLat -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasTick -and $hasSti -and $hasIrqstack -and $hasThreadJump -and $hasThreadJumpRun -and $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and $hasPf -and $hasPfus -and $hasExc) {
+   if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasUser -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSwitchLat -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasTick -and $hasSti -and $hasIrqstack -and $hasThreadJump -and $hasThreadJumpRun -and $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and $hasPf -and $hasPfus -and $hasTr -and $noTrFail -and $hasExc) {
     Write-Output ("Boot summary: FOUND (" + $bootinfo + " + " + $memmap + " + " + $notrunc + " + " + $mapsize + " + " + $descsize + " + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + USER ok=1 passed=9/9 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SWITCH-LAT ok=1 count=16 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + STI ok=1 + IRQSTACK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + PFUS ok=1 us=0 w=0 p=0 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + USER ok=1 passed=9/9 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SWITCH-LAT ok=1 count=16 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + STI ok=1 + IRQSTACK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + PFUS ok=1 us=0 w=0 p=0 + TR ok=1 sel=0x28 + no TR ok=0 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -438,6 +452,8 @@ if ($serialText -and $serialText.Contains($marker)) {
       "CHAIN-CURSOR ok=1 legs=3 present=$hasChainCursor, " +
       "PF ok=1 vector=14-shape present=$hasPf, " +
       "PFUS ok=1 us=0 w=0 p=0-shape present=$hasPfus, " +
+      "TR ok=1 sel=0x28-shape present=$hasTr, " +
+      "no TR ok=0 present=$noTrFail, " +
       "EXC ok=1 vector=0 present=$hasExc; " +
       "guest GetMemoryMap/GOP/ExitBootServices/kernel-entry/frame-alloc/#PF/#DE path failed " +
       "-- see serial log)")
