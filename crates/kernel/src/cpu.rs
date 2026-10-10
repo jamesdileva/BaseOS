@@ -122,6 +122,21 @@ pub(crate) const fn ring0_stack_top_for(base: u64) -> u64 {
 #[repr(C, align(16))]
 struct Ring0Stack([u8; RING0_STACK_LEN]);
 
+/// Future CPL3 user-stack blob (S09 slice2t, #30 remainder): 16 KiB
+/// (`USER_STACK_LEN`), same `align(16)` shape as [`Ring0Stack`] so the base
+/// — and hence the [`user_stack_top_for`] top — is 16-byte aligned
+/// (SysV/Win64 ABI entry requirement, shared with [`user_rsp_valid`]).
+/// Guest-only static `USER_STACK` below owns the bytes; unused this slice
+/// (no mapping, no `iretq`), so boot-neutral by construction
+/// (QEMU serial-identical). Future stub must map all 4 pages U+W+NX and
+/// source per-page flags from the walker (`walk_full_leaf_flags` per page)
+/// into [`user_entry_cpl3_allowed`] with live `EFER.NXE` — never the inner
+/// [`user_entry_fully_valid_pages`] degraded path alone.
+#[cfg(not(test))]
+#[allow(dead_code)]
+#[repr(C, align(16))]
+struct UserStack([u8; USER_STACK_LEN]);
+
 /// RFLAGS image for a future `iretq` to CPL3 (S09 slice2m, #30 remainder):
 /// bit 1 always-1 + IF (bit 9) set, everything else clear (IOPL 0, VM 0,
 /// NT 0, AC/TF/DF 0). No guest `iretq` yet — host-only pin so a wrong
@@ -521,6 +536,13 @@ const _: () = {
 
 #[cfg(not(test))]
 static mut RING0_STACK: Ring0Stack = Ring0Stack([0; RING0_STACK_LEN]);
+
+/// Future CPL3 user stack (S09 slice2t, #30 remainder): 16 KiB zero blob.
+/// Not wired anywhere this slice (no page-table mapping, no `iretq` RSP),
+/// so the bytes are pure BSS growth with no guest behavior change.
+#[cfg(not(test))]
+#[allow(dead_code)]
+static mut USER_STACK: UserStack = UserStack([0; USER_STACK_LEN]);
 
 #[cfg(not(test))]
 static mut TSS: Tss = Tss::new();
@@ -1176,6 +1198,16 @@ mod tests {
         // entry stub must refuse unless rsp0 != 0 (ring-0 stack wired) AND a
         // nonzero user rip/rsp exist. Host-only pin; no guest `iretq` yet.
         assert_eq!(USER_STACK_LEN, 16384, "one 16 KiB user stack");
+        assert_eq!(
+            USER_STACK_LEN % 4096,
+            0,
+            "4 KiB-multiple for the per-page walk"
+        );
+        assert_eq!(
+            USER_STACK_LEN / 4096,
+            4,
+            "4 pages: the stub walks all four, never one flag"
+        );
         let base = 0xFFFF_8000_0020_0000_u64;
         let top = user_stack_top_for(base);
         assert_eq!(top, base + 16384);
