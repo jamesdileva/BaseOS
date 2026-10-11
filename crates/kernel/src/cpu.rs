@@ -732,6 +732,54 @@ pub(crate) const fn user_stack_flush_vas(stack_base: u64) -> Option<[u64; USER_S
     user_stack_single_pt_vas(stack_base)
 }
 
+/// Single-page TLB invalidate (S09 slice2ai, #30 remainder): guest `invlpg`
+/// for one VA after the bound install+store writes one PT. Guest-only
+/// contract: post-EBS CPL0 with the edited PT live (same contract as
+/// [`read_cr3`]); host build is a no-op stub so `cargo test` never executes
+/// privileged `invlpg`.
+///
+/// # Safety
+/// Same contract as [`read_cr3`]: boot CPU only, post-`ExitBootServices`.
+/// Caller must own the VA (it must be mapped/unmapped consistently with the
+/// PT edit); the [`user_stack_flush_tlb`] wrapper sources VAs only from
+/// [`user_stack_flush_vas`] so a refused store (nothing written) flushes
+/// nothing.
+#[cfg(not(test))]
+pub unsafe fn invlpg_page(va: u64) {
+    core::arch::asm!("invlpg [{0}]", in(reg) va, options(nostack, preserves_flags));
+}
+
+/// Host-test stub: no-op (never touches hardware).
+///
+/// # Safety
+/// Host `cargo test` only: no-op.
+#[cfg(test)]
+pub unsafe fn invlpg_page(_va: u64) {}
+
+/// Guest TLB flush loop (S09 slice2ai, #30 remainder, REVIEW #688 nit 2
+/// follow-up): `invlpg` every VA in [`user_stack_flush_vas`]. Returns
+/// `false` (flushes nothing) when the VA set refuses (overflow or
+/// cross-PT span — the store wrote nothing, so there is nothing to flush).
+/// Uncalled this slice (no guest PTE written yet), so boot-neutral by
+/// construction. CPL3 entry + QEMU proof ride next.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) unsafe fn user_stack_flush_tlb(stack_base: u64) -> bool {
+    let Some(vas) = user_stack_flush_vas(stack_base) else {
+        return false;
+    };
+    let mut i = 0usize;
+    while i < USER_STACK_PAGES {
+        // SAFETY: caller contract of `invlpg_page` (post-EBS CPL0, VAs
+        // sourced from the just-written store set).
+        unsafe {
+            invlpg_page(vas[i]);
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Walk every page of the future CPL3 user stack (S09 slice2u+2v, #30 remainder,
 /// REVIEW #664 step 2/3 + REVIEW #666 risk 2): `walk_full_leaf_flags` per 4 KiB page over
 /// `[stack_base, stack_base + USER_STACK_LEN)`, collecting one [`PageFlags`]
@@ -2466,6 +2514,33 @@ mod tests {
                 b += 1;
             }
             a += 1;
+        }
+        // S09 slice2ai (REVIEW #688 nit 2): PT-boundary edge — base PT
+        // index 508 (508..511) still fits one PT (`Some`), base index 509
+        // (509..509+3 wraps past slot 511 into the next 2 MiB region)
+        // span-refuses (`None`) in both the helper and the flush set, and
+        // the store leaves `pt` untouched while the flush loop refuses.
+        let base508 = 508u64 * 4096;
+        let base509 = 509u64 * 4096;
+        assert!(user_stack_single_pt_vas(base508).is_some());
+        assert!(user_stack_single_pt_vas(base509).is_none());
+        assert!(user_stack_flush_vas(base508).is_some());
+        assert!(user_stack_flush_vas(base509).is_none());
+        let ptes508 =
+            user_stack_install_ptes(base508, phys, &good, true).expect("508 install must encode");
+        let mut pt508 = [0u64; 512];
+        assert!(user_stack_store_ptes(&mut pt508, base508, ptes508));
+        let mut pt509 = [0u64; 512];
+        let ptes509 = user_stack_install_ptes(base509, phys, &good, true)
+            .expect("509 install encodes (span is store-side)");
+        assert!(!user_stack_store_ptes(&mut pt509, base509, ptes509));
+        assert_eq!(pt509, [0u64; 512]);
+        // SAFETY: host `invlpg_page` stub is a no-op; asserts only the
+        // refuse-nothing-written / accept-flush agreement.
+        unsafe {
+            assert!(user_stack_flush_tlb(base508));
+            assert!(!user_stack_flush_tlb(base509));
+            assert!(!user_stack_flush_tlb(0x1FF000));
         }
     }
 

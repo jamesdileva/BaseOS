@@ -5028,3 +5028,30 @@ Format per entry (per `implementation-guide.md` §31):
 - **Expected:** `cargo test --workspace` 284 passed, 1 ignored (unchanged, no new tests); fmt + clippy clean; guest behavior unchanged (host-only, no QEMU re-run).
 - **Measured (2026-10-11, Win11):** `cargo test --workspace` 284 passed (21 boot-info + 39 boot-uefi + 214 kernel + 4 + 4 serial-marker + 2 version), 1 ignored; `cargo fmt --check` clean; `cargo clippy -p baseos-kernel --all-targets -- -D warnings` exit 0 (two doc-header rewrites to avoid `doc_lazy_continuation` list-item parse on a leading `+`). Guest behavior unchanged (no QEMU re-run; slice2ae boot-neutral baseline stands).
 - **Final:** Bound entry is now the enforced sole cross-module install path host-side; remainder narrowed to guest TLB reload + CPL3 entry + contained-fault QEMU proof; pending agent-b review.
+
+## S09 slice2ag -- TLB flush VA set pins invlpg loop to store agreement (board #30 remainder, REVIEW #685 residual c)
+
+- **Decision:** Land host-only in `kernel/cpu.rs`: new `user_stack_flush_vas(stack_base)` const returning the exact 4 per-page VAs (via `user_stack_page_va`) the guest `invlpg` loop must flush, plus test `user_stack_flush_vas_pins_invlpg_set_and_store_agreement` (per-page VA agreement, store-true-has-flush / cross-PT-overflow-has-none). No guest `invlpg` yet.
+- **Why:** REVIEW #685 residual (c) demanded the flush set be pinned to store agreement before the guest loop lands, so the loop is wiring-only.
+- **Alternatives:** Guest `invlpg` loop now (rejected: needs live PT + TLB op + QEMU proof in one cycle; the VA set must exist first).
+- **Expected:** `cargo test --workspace` 285 passed, 1 ignored; fmt + clippy clean; guest behavior unchanged (host-only, no QEMU re-run).
+- **Measured (2026-10-11, Win11):** `cargo test --workspace` 285 passed, 1 ignored; `cargo fmt --check` clean; `cargo clippy -p baseos-kernel --all-targets -- -D warnings` exit 0; `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings` exit 0. Guest behavior unchanged (no QEMU re-run).
+- **Final:** Flush VA set pinned host-side; remainder narrowed to guest `invlpg` loop + CPL3 entry + QEMU proof; REVIEW #688 ACCEPT.
+
+## S09 slice2ah -- single-PT VA helper closes REVIEW #686 residuals 1-3 (board #30 remainder)
+
+- **Decision:** Land host-only in `kernel/cpu.rs`: new `user_stack_single_pt_vas(stack_base)` const (single source for the span rule, `PAGES==0` guard, documented dead-`None`/unreachable-collision proof); store + flush consume it; flush test extended (helper equality + distinct slots). No guest `invlpg` yet.
+- **Why:** REVIEW #686 residuals 1-3 (three near-copies of the VA-loop + span check; wrapper-identity tautology noted as weak-but-sufficient drift pin).
+- **Alternatives:** Guest `invlpg` loop now (rejected: span rule must be single-sourced first so the loop cannot drift from the store).
+- **Expected:** `cargo test --workspace` 285 passed, 1 ignored; fmt + clippy clean; guest behavior unchanged (host-only, no QEMU re-run).
+- **Measured (2026-10-11, Win11):** `cargo test --workspace` 285 passed, 1 ignored; `cargo fmt --check` clean; kernel + host clippy clean (boot-uefi pre-existing panic-abort limit noted). Guest behavior unchanged (no QEMU re-run).
+- **Final:** Span rule single-sourced host-side; remainder narrowed to guest `invlpg` loop + CPL3 entry + QEMU proof; REVIEW #688 ACCEPT with one nit (508-boundary edge) carried to next slice.
+
+## S09 slice2ai -- guest invlpg primitive + flush loop + 508/509 boundary pin (board #30 remainder, REVIEW #688 nit 2)
+
+- **Decision:** Land host-only-behavior in `kernel/cpu.rs`: new `invlpg_page(va)` unsafe (guest `invlpg [{0}]`, host no-op stub like `cli`/`sti`) + new `user_stack_flush_tlb(stack_base)` unsafe loop over `user_stack_flush_vas` (false when the set refuses — refused store wrote nothing); extended `user_stack_flush_vas_pins_invlpg_set_and_store_agreement` with the PT-boundary edge (base PT-index 508 `Some`/store-ok/flush-true vs 509 `None`/store-untouched/flush-false). Uncalled this slice, so boot-neutral (no QEMU re-run).
+- **Why:** REVIEW #688 ACCEPT kept #30 active with guest `invlpg` loop unwired plus nit 2 (distinct-slots proof covered one base, not the 508/509 span-refuse edge). This slice wires the VA set to a real TLB op call site host-pinned and closes the nit in one committable segment.
+- **Alternatives:** CPL3 entry + QEMU proof now (rejected: needs live PT write + ring-3 entry + contained-fault proof in one cycle, doubles single-cycle risk; the flush loop must be pinned first so the guest slice is wiring-only); boundary test only with no primitive (rejected: leaves the invlpg loop unwired one more cycle — the primitive is zero-risk uncalled).
+- **Expected:** `cargo test --workspace` 285 passed, 1 ignored (extended test, no new count); fmt + clippy clean both targets; guest behavior unchanged (uncalled, no QEMU re-run).
+- **Measured (2026-10-11, Win11):** `cargo test --workspace` 285 passed, 1 ignored; `cargo fmt --check` clean; `cargo clippy -p baseos-kernel --all-targets -- -D warnings` exit 0; `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -- -D warnings` exit 0. Guest behavior unchanged (no QEMU re-run; slice2ah boot-neutral baseline stands).
+- **Final:** Flush loop consumes the shared VA set host-side (guest `invlpg` real, host no-op); 508/509 boundary pinned; remainder narrowed to CPL3 entry + QEMU proof; pending agent-b review.
