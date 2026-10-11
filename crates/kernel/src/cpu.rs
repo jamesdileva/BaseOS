@@ -687,20 +687,22 @@ fn user_stack_store_ptes(
     true
 }
 
-/// Bound install+store entry (S09 slice2ae/slice2af, #30 remainder,
-/// REVIEW #681 residual 1, REVIEW #683 closure (a)): the SOLE cross-module
-/// entry, encodes via the private installer then stores via the private
-/// store in one call so callers cannot inject a
-/// mismatched `ptes` array (the residual-1 silent-install gap: `store`
+/// Bound install+store entry (S09 slice2ae/slice2af/2aj, #30 remainder,
+/// REVIEW #681 residual 1, REVIEW #683 closure (a)): encodes via the private
+/// installer then stores via the private store in one call so callers cannot
+/// inject a mismatched `ptes` array (the residual-1 silent-install gap: `store`
 /// alone trusts caller-supplied words and never re-checks they match
 /// `base`/`phys`/`flags`). Fail-closed `false` on ANY refusal (encode
 /// `None` or store `false`) with `pt` untouched — encode writes only its
 /// local array, and store is two-phase (untouched on refusal), so the
-/// bound path inherits no-partial. Plain `fn`; host-testable. Guest TLB
-/// reload (`invlpg`/CR3) + CPL3 entry + QEMU proof still ride next.
+/// bound path inherits no-partial. Private since slice2aj: only the bound
+/// store+flush entry (same module) and in-module tests may call it, so a
+/// caller cannot store without flushing (REVIEW #690 risk 2). Plain `fn`;
+/// host-testable. Guest TLB reload rides with the bound flush entry;
+/// CPL3 entry + QEMU proof still ride next.
 #[allow(dead_code)]
 #[must_use]
-pub(crate) fn user_stack_install_store_ptes(
+fn user_stack_install_store_ptes(
     pt: &mut [u64; 512],
     stack_base: u64,
     phys_base: u64,
@@ -711,6 +713,38 @@ pub(crate) fn user_stack_install_store_ptes(
         return false;
     };
     user_stack_store_ptes(pt, stack_base, ptes)
+}
+
+/// Bound install+store+flush entry (S09 slice2aj, #30 remainder, REVIEW #690
+/// risk 2): the SOLE cross-module entry — stores via
+/// [`user_stack_install_store_ptes`] (private) then flushes via
+/// [`user_stack_flush_tlb`] (private) in one call, so callers cannot write
+/// PTEs and skip the flush (stale-TLB gap: store+flush agreement was
+/// test-only). Fail-closed `false` with `pt` untouched when the store
+/// refuses (flush never runs — nothing was written, so there is nothing to
+/// flush). A store success implies the VA set holds, so the flush returns
+/// `true` on every reachable accept path. `unsafe` for the `invlpg` loop;
+/// uncalled this slice (no guest PTE written yet), so boot-neutral by
+/// construction. CPL3 entry + QEMU proof ride next.
+///
+/// # Safety
+/// Same contract as [`invlpg_page`]: boot CPU only, post-`ExitBootServices`
+/// with the edited PT live. Host `cargo test` runs the no-op stub.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) unsafe fn user_stack_install_store_flush(
+    pt: &mut [u64; 512],
+    stack_base: u64,
+    phys_base: u64,
+    pages: &[PageFlags],
+    nxe_enabled: bool,
+) -> bool {
+    if !user_stack_install_store_ptes(pt, stack_base, phys_base, pages, nxe_enabled) {
+        return false;
+    }
+    // SAFETY: post-EBS CPL0 contract + VAs sourced from the just-written
+    // store set (store success implies the flush VA set holds).
+    unsafe { user_stack_flush_tlb(stack_base) }
 }
 
 /// TLB flush VA set (S09 slice2ag/2ah, #30 remainder, REVIEW #685 residual c,
@@ -732,11 +766,21 @@ pub(crate) const fn user_stack_flush_vas(stack_base: u64) -> Option<[u64; USER_S
     user_stack_single_pt_vas(stack_base)
 }
 
-/// Single-page TLB invalidate (S09 slice2ai, #30 remainder): guest `invlpg`
+/// Single-page TLB invalidate (S09 slice2ai/2aj, #30 remainder): guest `invlpg`
 /// for one VA after the bound install+store writes one PT. Guest-only
 /// contract: post-EBS CPL0 with the edited PT live (same contract as
 /// [`read_cr3`]); host build is a no-op stub so `cargo test` never executes
 /// privileged `invlpg`.
+///
+/// Ordering (REVIEW #690 nit 3): the asm omits `nomem` on purpose, so the
+/// compiler treats it as an unpredictable memory clobber and will not
+/// reorder the preceding PT `u64` stores across it. No extra fence is
+/// needed at the call site on the single-CPU bring-up path; multicore
+/// broadcast (IPI) is deferred to a later slice.
+///
+/// Crate-scoped since slice2aj (was `pub`): only [`user_stack_flush_tlb`]
+/// (same module) and in-module tests may call it; cross-module callers must
+/// use the bound store+flush entry so a raw `invlpg` cannot bypass the VA set.
 ///
 /// # Safety
 /// Same contract as [`read_cr3`]: boot CPU only, post-`ExitBootServices`.
@@ -745,7 +789,7 @@ pub(crate) const fn user_stack_flush_vas(stack_base: u64) -> Option<[u64; USER_S
 /// [`user_stack_flush_vas`] so a refused store (nothing written) flushes
 /// nothing.
 #[cfg(not(test))]
-pub unsafe fn invlpg_page(va: u64) {
+pub(crate) unsafe fn invlpg_page(va: u64) {
     core::arch::asm!("invlpg [{0}]", in(reg) va, options(nostack, preserves_flags));
 }
 
@@ -754,17 +798,19 @@ pub unsafe fn invlpg_page(va: u64) {
 /// # Safety
 /// Host `cargo test` only: no-op.
 #[cfg(test)]
-pub unsafe fn invlpg_page(_va: u64) {}
+pub(crate) unsafe fn invlpg_page(_va: u64) {}
 
-/// Guest TLB flush loop (S09 slice2ai, #30 remainder, REVIEW #688 nit 2
-/// follow-up): `invlpg` every VA in [`user_stack_flush_vas`]. Returns
-/// `false` (flushes nothing) when the VA set refuses (overflow or
+/// Guest TLB flush loop (S09 slice2ai/2aj, #30 remainder, REVIEW #688 nit 2
+/// follow-up, REVIEW #690 risk 2): `invlpg` every VA in [`user_stack_flush_vas`].
+/// Returns `false` (flushes nothing) when the VA set refuses (overflow or
 /// cross-PT span — the store wrote nothing, so there is nothing to flush).
-/// Uncalled this slice (no guest PTE written yet), so boot-neutral by
-/// construction. CPL3 entry + QEMU proof ride next.
+/// Private since slice2aj: only the bound store+flush entry (same module)
+/// and in-module tests may call it, so a caller cannot write PTEs and skip
+/// the flush (stale-TLB gap). Uncalled this slice (no guest PTE written yet),
+/// so boot-neutral by construction. CPL3 entry + QEMU proof ride next.
 #[allow(dead_code)]
 #[must_use]
-pub(crate) unsafe fn user_stack_flush_tlb(stack_base: u64) -> bool {
+unsafe fn user_stack_flush_tlb(stack_base: u64) -> bool {
     let Some(vas) = user_stack_flush_vas(stack_base) else {
         return false;
     };
@@ -2541,6 +2587,31 @@ mod tests {
             assert!(user_stack_flush_tlb(base508));
             assert!(!user_stack_flush_tlb(base509));
             assert!(!user_stack_flush_tlb(0x1FF000));
+        }
+        // S09 slice2aj (REVIEW #690 risk 2): the bound store+flush entry is
+        // the sole cross-module path — accept stores+flushes, refusals leave
+        // `pt` untouched and run no flush. Host stub is a no-op; asserts the
+        // wiring, not hardware.
+        // SAFETY: host stub no-op (see above).
+        unsafe {
+            let mut pt_bound = [0u64; 512];
+            assert!(user_stack_install_store_flush(
+                &mut pt_bound,
+                base508,
+                phys,
+                &good,
+                true
+            ));
+            assert_eq!(pt_bound, pt508);
+            let mut pt_refused = [0u64; 512];
+            assert!(!user_stack_install_store_flush(
+                &mut pt_refused,
+                base509,
+                phys,
+                &good,
+                true
+            ));
+            assert_eq!(pt_refused, [0u64; 512]);
         }
     }
 
