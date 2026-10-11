@@ -583,10 +583,63 @@ const fn user_stack_install_ptes(
     Some(ptes)
 }
 
-/// Guest PT store loop (S09 slice2ad/slice2af, #30 remainder,
-/// REVIEW #679 risk 1, REVIEW #683 closure (a)): PRIVATE helper, writes
-/// the four bound-entry words into the caller's
+/// Single-PT VA set (S09 slice2ah, #30 remainder, REVIEW #686 residuals
+/// 1-3): the exact per-page VAs of `[stack_base, stack_base +
+/// USER_STACK_LEN)` that fit in ONE 4 KiB PT. Pure const over
+/// [`user_stack_page_va`]; the single source for the span rule so
+/// [`user_stack_store_ptes`] and [`user_stack_flush_vas`] cannot drift
+/// apart (previously two near-copies of the VA-loop + `(va >> 21)` check,
+/// plus a third near-copy in [`user_stack_map_install_ready`]'s VA loop —
+/// that one stays separate by design: install checks encodability only, so
+/// a cross-PT base encodes then store-refuses with `pt` untouched).
+/// Fail-closed `None` on ANY refusal: `USER_STACK_PAGES == 0` (empty stack
+/// would index `vas[0]` — guarded here so a future `PAGES == 0` const panics
+/// nowhere), any per-page VA `None` (overflow), or pages spanning two PTs
+/// (`va >> 21` differs — the store owns one PT).
+///
+/// Explicit non-mirrors (REVIEW #686 residual 1 — documented, not drift):
+/// `page_table_index(va, 0)`-is-`None` needs no mirror — dead today: level 0
+/// always returns `Some` (`page_table.rs:425` matches level 0 to shift 12,
+/// only `level > 3` returns `None`). Slot-collision needs no mirror —
+/// unreachable for the `Some` shape: 4 consecutive 4 KiB VAs inside one
+/// 2 MiB region (`va >> 21` equal) have consecutive PT indices
+/// `((va >> 12) & 0x1FF)` that cannot wrap (wrap would cross the region
+/// boundary, refused above), so with `base_idx <= 508` the set is
+/// `base_idx..base_idx+4`, pairwise distinct. The store still pins the
+/// collision check defense-in-depth; the flush set agrees with the store on
+/// every reachable shape (`Some` iff the store's VA+span preconditions hold).
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_stack_single_pt_vas(stack_base: u64) -> Option<[u64; USER_STACK_PAGES]> {
+    if USER_STACK_PAGES == 0 {
+        return None;
+    }
+    let mut vas = [0u64; USER_STACK_PAGES];
+    let mut i = 0usize;
+    while i < USER_STACK_PAGES {
+        let Some(va) = user_stack_page_va(stack_base, i) else {
+            return None;
+        };
+        vas[i] = va;
+        i += 1;
+    }
+    let pt_base = vas[0] >> 21;
+    let mut j = 1usize;
+    while j < USER_STACK_PAGES {
+        if (vas[j] >> 21) != pt_base {
+            return None;
+        }
+        j += 1;
+    }
+    Some(vas)
+}
+
+/// Guest PT store loop (S09 slice2ad/slice2af/slice2ah, #30 remainder,
+/// REVIEW #679 risk 1, REVIEW #683 closure (a), REVIEW #686 residual 2):
+/// PRIVATE helper, writes the four bound-entry words into the caller's
 /// single 4 KiB PT at `page_table_index(va, 0)` per [`user_stack_page_va`].
+/// VA+span preconditions come from [`user_stack_single_pt_vas`] (shared with
+/// the flush set, so the span rule has one source).
 /// Two-phase (validate all VAs/indices first, then write) so refusal leaves
 /// `pt` untouched — no partial install. Fail-closed `false` on ANY refusal:
 /// any per-page VA `None` (overflow), pages spanning two PTs (`va >> 21`
@@ -603,25 +656,11 @@ fn user_stack_store_ptes(
     stack_base: u64,
     ptes: [u64; USER_STACK_PAGES],
 ) -> bool {
-    let mut vas = [0u64; USER_STACK_PAGES];
-    let mut i = 0usize;
-    while i < USER_STACK_PAGES {
-        let Some(va) = user_stack_page_va(stack_base, i) else {
-            return false;
-        };
-        vas[i] = va;
-        i += 1;
-    }
-    let pt_base = vas[0] >> 21;
-    i = 1;
-    while i < USER_STACK_PAGES {
-        if (vas[i] >> 21) != pt_base {
-            return false;
-        }
-        i += 1;
-    }
+    let Some(vas) = user_stack_single_pt_vas(stack_base) else {
+        return false;
+    };
     let mut idx = [0usize; USER_STACK_PAGES];
-    i = 0;
+    let mut i = 0usize;
     while i < USER_STACK_PAGES {
         let Some(slot) = super::page_table::page_table_index(vas[i], 0) else {
             return false;
@@ -640,7 +679,7 @@ fn user_stack_store_ptes(
         }
         a += 1;
     }
-    i = 0;
+    let mut i = 0usize;
     while i < USER_STACK_PAGES {
         pt[idx[i]] = ptes[i];
         i += 1;
@@ -674,37 +713,23 @@ pub(crate) fn user_stack_install_store_ptes(
     user_stack_store_ptes(pt, stack_base, ptes)
 }
 
-/// TLB flush VA set (S09 slice2ag, #30 remainder, REVIEW #685 residual c):
-/// the exact per-page VAs the guest `invlpg` loop must flush after the
-/// bound install+store writes one PT. Pure const over [`user_stack_page_va`]
-/// so the flush set and the store/walk cannot drift apart (single-source
-/// VA rule). Fail-closed `None` on ANY store-refusal shape the flush must
-/// agree with: any per-page VA `None` (overflow) or pages spanning two PTs
-/// (`va >> 21` differs — the store owns one PT, a split store refuses with
-/// `pt` untouched so there is nothing to flush). Slot-collision needs no
-/// mirror (unreachable via consecutive VAs; store pins it defense-in-depth).
+/// TLB flush VA set (S09 slice2ag/2ah, #30 remainder, REVIEW #685 residual c,
+/// REVIEW #686 residuals 1-3): the exact per-page VAs the guest `invlpg`
+/// loop must flush after the bound install+store writes one PT. Thin wrapper
+/// over [`user_stack_single_pt_vas`] so the flush set and the store share one
+/// span rule and cannot drift apart (single-source VA rule extended to the
+/// span rule). Agreement is exact on every reachable shape: `Some` iff the
+/// store's VA+span preconditions hold (overflow/`None` and cross-PT span
+/// refuse in both, so a refused store wrote nothing and there is nothing to
+/// flush). The two remaining store refusals need no mirror — see
+/// [`user_stack_single_pt_vas`]: `page_table_index` `None` is dead (level 0
+/// always `Some`) and slot-collision is unreachable for 4 consecutive VAs
+/// inside one PT (proven there; the store keeps the check defense-in-depth).
 /// Host-testable; the guest `invlpg` loop + CPL3 entry + QEMU proof ride next.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) const fn user_stack_flush_vas(stack_base: u64) -> Option<[u64; USER_STACK_PAGES]> {
-    let mut vas = [0u64; USER_STACK_PAGES];
-    let mut i = 0usize;
-    while i < USER_STACK_PAGES {
-        let Some(va) = user_stack_page_va(stack_base, i) else {
-            return None;
-        };
-        vas[i] = va;
-        i += 1;
-    }
-    let pt_base = vas[0] >> 21;
-    let mut j = 1usize;
-    while j < USER_STACK_PAGES {
-        if (vas[j] >> 21) != pt_base {
-            return None;
-        }
-        j += 1;
-    }
-    Some(vas)
+    user_stack_single_pt_vas(stack_base)
 }
 
 /// Walk every page of the future CPL3 user stack (S09 slice2u+2v, #30 remainder,
@@ -2421,6 +2446,27 @@ mod tests {
         assert!(user_stack_flush_vas(base).is_some());
         assert!(user_stack_flush_vas(0x1FF000).is_none());
         assert!(user_stack_flush_vas(0xFFFF_FFFF_FFFF_F000).is_none());
+        // S09 slice2ah (REVIEW #686 residuals 1-2): the flush set IS the
+        // shared single-PT helper (no drift), level-0 index is always Some
+        // (dead refusal shape), and the 4 consecutive VAs in one PT map to
+        // pairwise-distinct slots (slot-collision unreachable).
+        use super::super::page_table::page_table_index;
+        assert_eq!(user_stack_flush_vas(base), user_stack_single_pt_vas(base));
+        let mut slots = [0usize; USER_STACK_PAGES];
+        let mut k = 0usize;
+        while k < USER_STACK_PAGES {
+            slots[k] = page_table_index(vas[k], 0).expect("level 0 always Some") as usize;
+            k += 1;
+        }
+        let mut a = 0usize;
+        while a < USER_STACK_PAGES {
+            let mut b = a + 1;
+            while b < USER_STACK_PAGES {
+                assert_ne!(slots[a], slots[b], "consecutive VAs must not collide");
+                b += 1;
+            }
+            a += 1;
+        }
     }
 
     #[test]
