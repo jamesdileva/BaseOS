@@ -497,6 +497,47 @@ pub(crate) const fn user_stack_page_va(stack_base: u64, index: usize) -> Option<
     stack_base.checked_add((index as u64) * 4096)
 }
 
+/// Install-readiness gate (S09 slice2ab, #30 remainder): the future 4-page
+/// U-map install stub's single call site before writing any guest PTE.
+/// Binds the two stub helpers so they cannot drift unwired: gates on
+/// [`all_stack_map_flags_valid`] (exact word on every page, GUARD refuses)
+/// AND [`user_stack_page_va`] (every per-page VA encodable — OOB/overflow
+/// `None` refuses). Also pins `nxe_enabled` (live `EFER.NXE`; NX stack needs
+/// it), `pages.len() == USER_STACK_PAGES` (no short/long coverage), and
+/// 4 KiB base alignment. Canonical/containment stays with the entry gates
+/// ([`user_entry_valid`]/[`user_entry_mapped_valid`]) — this pins the
+/// install wiring, not the entry shape. Pure const; still no guest PTE
+/// written yet.
+#[allow(dead_code)]
+#[allow(clippy::manual_is_multiple_of)]
+#[must_use]
+pub(crate) const fn user_stack_map_install_ready(
+    stack_base: u64,
+    pages: &[PageFlags],
+    nxe_enabled: bool,
+) -> bool {
+    if !nxe_enabled {
+        return false;
+    }
+    if stack_base % 4096 != 0 {
+        return false;
+    }
+    if pages.len() != USER_STACK_PAGES {
+        return false;
+    }
+    if !all_stack_map_flags_valid(pages) {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < USER_STACK_PAGES {
+        if user_stack_page_va(stack_base, i).is_none() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Walk every page of the future CPL3 user stack (S09 slice2u+2v, #30 remainder,
 /// REVIEW #664 step 2/3 + REVIEW #666 risk 2): `walk_full_leaf_flags` per 4 KiB page over
 /// `[stack_base, stack_base + USER_STACK_LEN)`, collecting one [`PageFlags`]
@@ -1991,6 +2032,31 @@ mod tests {
         assert_eq!(user_stack_page_va(u64::MAX, 1), None);
         // Walk still succeeds through the helper (non-interference).
         assert_eq!(USER_STACK_PAGES, 4);
+    }
+
+    #[test]
+    fn user_stack_map_install_ready_binds_both_helpers() {
+        // S09 slice2ab (#30 remainder): the install stub must gate the 4-page
+        // U-map on BOTH helpers — exact-word flags AND encodable per-page VAs
+        // — plus live NXE, 4-page coverage, and base alignment. Host-only;
+        // no guest PTE written yet.
+        let base = 0x0000_1000_0020_0000_u64;
+        let good = [USER_STACK_MAP_FLAGS; USER_STACK_PAGES];
+        assert!(user_stack_map_install_ready(base, &good, true));
+        assert!(!user_stack_map_install_ready(base, &good, false));
+        assert!(!user_stack_map_install_ready(base + 1, &good, true));
+        assert!(!user_stack_map_install_ready(base, &[], true));
+        assert!(!user_stack_map_install_ready(base, &good[..3], true));
+        let mut guard4 = good;
+        guard4[2] = USER_STACK_MAP_FLAGS.union(PageFlags::GUARD);
+        assert!(!user_stack_map_install_ready(base, &guard4, true));
+        // Aligned near-`u64::MAX` base: per-page `checked_add` overflows, so
+        // the VA arm refuses instead of wrapping to low VA.
+        assert!(!user_stack_map_install_ready(
+            0xFFFF_FFFF_FFFF_F000,
+            &good,
+            true
+        ));
     }
 
     #[test]
