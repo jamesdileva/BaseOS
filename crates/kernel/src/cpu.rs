@@ -2519,6 +2519,35 @@ mod tests {
             true
         ));
         assert_eq!(refused, [0u64; 512]);
+        // S09 slice2al (REVIEW #694 risk 3): encode-refuse shapes leave a
+        // pre-dirtied PT bit-identical too (not just zeroed) — no partial
+        // install on any refuse shape (slice2ak covered only the 509 span).
+        let mut dirty = [0xA5A5_A5A5_A5A5_A5A5u64; 512];
+        let dirty_snap = dirty;
+        assert!(!user_stack_install_store_ptes(
+            &mut dirty, base, phys, &guard4, true
+        ));
+        assert_eq!(dirty, dirty_snap);
+        assert!(!user_stack_install_store_ptes(
+            &mut dirty, base, phys, &good, false
+        ));
+        assert_eq!(dirty, dirty_snap);
+        assert!(!user_stack_install_store_ptes(
+            &mut dirty,
+            base,
+            phys + 1,
+            &good,
+            true
+        ));
+        assert_eq!(dirty, dirty_snap);
+        assert!(!user_stack_install_store_ptes(
+            &mut dirty,
+            0xFFFF_FFFF_FFFF_F000,
+            phys,
+            &good,
+            true
+        ));
+        assert_eq!(dirty, dirty_snap);
     }
 
     #[test]
