@@ -480,6 +480,23 @@ pub(crate) const fn all_stack_pages_valid_for(pages: &[PageFlags], nxe_enabled: 
     true
 }
 
+/// Per-page VA for the future CPL3 user-stack mapping stub (S09 slice2aa,
+/// #30 remainder): page `index` of `[stack_base, stack_base +
+/// USER_STACK_LEN)` — the exact VA the stub maps/walks per 4 KiB page.
+/// `None` fail-closed on OOB index (`>= USER_STACK_PAGES`) or
+/// `checked_add` overflow (near-`u64::MAX` base). Single-sources the VA
+/// math so the mapping install and [`walk_user_stack_pages`] cannot drift
+/// apart (one inline `checked_add` copy remains: none — the walk calls
+/// this). Pure const so host tests and the stub share one rule.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_stack_page_va(stack_base: u64, index: usize) -> Option<u64> {
+    if index >= USER_STACK_PAGES {
+        return None;
+    }
+    stack_base.checked_add((index as u64) * 4096)
+}
+
 /// Walk every page of the future CPL3 user stack (S09 slice2u+2v, #30 remainder,
 /// REVIEW #664 step 2/3 + REVIEW #666 risk 2): `walk_full_leaf_flags` per 4 KiB page over
 /// `[stack_base, stack_base + USER_STACK_LEN)`, collecting one [`PageFlags`]
@@ -506,7 +523,7 @@ where
     let mut pages = [PageFlags::empty(); USER_STACK_PAGES];
     let mut i = 0usize;
     while i < USER_STACK_PAGES {
-        let va = stack_base.checked_add((i as u64) * 4096)?;
+        let va = user_stack_page_va(stack_base, i)?;
         match super::page_table::walk_full_leaf_flags(pml4_base, va, &lookup) {
             Ok((_phys, flags)) => pages[i] = flags,
             Err(_) => return None,
@@ -1949,6 +1966,31 @@ mod tests {
         guard4[2] = f.union(PageFlags::GUARD);
         assert!(!all_stack_map_flags_valid(&guard4));
         assert!(all_stack_pages_valid_for(&guard4, true));
+    }
+
+    #[test]
+    fn user_stack_page_va_pins_per_page_addrs_and_fail_closed() {
+        // S09 slice2aa (#30 remainder): the mapping stub maps all 4 pages
+        // one VA at a time — pin the VA math host-side: consecutive 4 KiB
+        // VAs for an aligned base, OOB index refuses, near-top overflow
+        // refuses instead of wrapping to low VA. Host-only; no guest PTE
+        // written yet.
+        let base = 0x0000_1000_0020_0000_u64;
+        assert_eq!(user_stack_page_va(base, 0), Some(base));
+        assert_eq!(user_stack_page_va(base, 1), Some(base + 4096));
+        assert_eq!(user_stack_page_va(base, 2), Some(base + 8192));
+        assert_eq!(user_stack_page_va(base, 3), Some(base + 12288));
+        assert_eq!(user_stack_page_va(base, USER_STACK_PAGES), None);
+        assert_eq!(user_stack_page_va(base, 100), None);
+        // Near-top: index 0/1 still encodable, index 2 overflows.
+        let top = u64::MAX - 4096;
+        assert_eq!(user_stack_page_va(top, 0), Some(top));
+        assert_eq!(user_stack_page_va(top, 1), Some(u64::MAX));
+        assert_eq!(user_stack_page_va(top, 2), None);
+        assert_eq!(user_stack_page_va(u64::MAX, 0), Some(u64::MAX));
+        assert_eq!(user_stack_page_va(u64::MAX, 1), None);
+        // Walk still succeeds through the helper (non-interference).
+        assert_eq!(USER_STACK_PAGES, 4);
     }
 
     #[test]
