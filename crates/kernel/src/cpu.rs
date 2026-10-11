@@ -2540,6 +2540,12 @@ mod tests {
             true
         ));
         assert_eq!(dirty, dirty_snap);
+        // S09 slice2am (REVIEW #696 nit 1): cross-PT base 0x1FF000 dirty
+        // counterpart — zeroed asserts cover 5 shapes, dirty covered 4.
+        assert!(!user_stack_install_store_ptes(
+            &mut dirty, 0x1FF000, phys, &good, true
+        ));
+        assert_eq!(dirty, dirty_snap);
         assert!(!user_stack_install_store_ptes(
             &mut dirty,
             0xFFFF_FFFF_FFFF_F000,
