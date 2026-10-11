@@ -641,6 +641,31 @@ pub(crate) fn user_stack_store_ptes(
     true
 }
 
+/// Bound install+store entry (S09 slice2ae, #30 remainder, REVIEW #681
+/// residual 1): encodes via [`user_stack_install_ptes`] then stores via
+/// [`user_stack_store_ptes`] in one call so callers cannot inject a
+/// mismatched `ptes` array (the residual-1 silent-install gap: `store`
+/// alone trusts caller-supplied words and never re-checks they match
+/// `base`/`phys`/`flags`). Fail-closed `false` on ANY refusal (encode
+/// `None` or store `false`) with `pt` untouched — encode writes only its
+/// local array, and store is two-phase (untouched on refusal), so the
+/// bound path inherits no-partial. Plain `fn`; host-testable. Guest TLB
+/// reload (`invlpg`/CR3) + CPL3 entry + QEMU proof still ride next.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn user_stack_install_store_ptes(
+    pt: &mut [u64; 512],
+    stack_base: u64,
+    phys_base: u64,
+    pages: &[PageFlags],
+    nxe_enabled: bool,
+) -> bool {
+    let Some(ptes) = user_stack_install_ptes(stack_base, phys_base, pages, nxe_enabled) else {
+        return false;
+    };
+    user_stack_store_ptes(pt, stack_base, ptes)
+}
+
 /// Walk every page of the future CPL3 user stack (S09 slice2u+2v, #30 remainder,
 /// REVIEW #664 step 2/3 + REVIEW #666 risk 2): `walk_full_leaf_flags` per 4 KiB page over
 /// `[stack_base, stack_base + USER_STACK_LEN)`, collecting one [`PageFlags`]
@@ -2244,6 +2269,87 @@ mod tests {
             ptes
         ));
         assert_eq!(over, [0u64; 512]);
+    }
+
+    #[test]
+    fn user_stack_install_store_binds_encode_no_mismatched_words() {
+        // S09 slice2ae (#30 remainder, REVIEW #681 residual 1): the bound
+        // entry re-encodes from (base, phys, flags) so a mismatched caller
+        // `ptes` array can never install silently — there is no caller
+        // array to mismatch. Host-only; guest TLB/CPL3/QEMU remain.
+        use super::super::page_table::{page_table_index, pte_decoded_phys};
+        let base = 0x0000_1000_0020_0000_u64;
+        let phys = 0x0000_0000_0060_0000_u64;
+        let good = [USER_STACK_MAP_FLAGS; USER_STACK_PAGES];
+        // Good: true, words land at per-page slots with expected phys.
+        let mut pt = [0u64; 512];
+        assert!(user_stack_install_store_ptes(
+            &mut pt, base, phys, &good, true
+        ));
+        let mut i = 0usize;
+        while i < USER_STACK_PAGES {
+            let va = user_stack_page_va(base, i).expect("good VA encodable");
+            let slot = page_table_index(va, 0).expect("level 0 always Some") as usize;
+            assert_eq!(pte_decoded_phys(pt[slot]), phys + (i as u64) * 4096);
+            i += 1;
+        }
+        // Residual-1 proof: a tampered word installs via the raw store but
+        // can never flow through the bound entry (it re-encodes internally).
+        let ptes =
+            user_stack_install_ptes(base, phys, &good, true).expect("good install must encode");
+        let mut tampered = ptes;
+        tampered[0] ^= 0x0000_0000_0010_0000;
+        let mut raw = [0u64; 512];
+        assert!(user_stack_store_ptes(&mut raw, base, tampered));
+        assert_ne!(
+            raw, pt,
+            "raw store trusts caller words; bound path must not"
+        );
+        // Bound refusals leave PT untouched: bad flags, NXE=0, misaligned
+        // phys, cross-PT base, VA-overflow base.
+        let mut guard4 = good;
+        guard4[2] = USER_STACK_MAP_FLAGS.union(PageFlags::GUARD);
+        let mut refused = [0u64; 512];
+        assert!(!user_stack_install_store_ptes(
+            &mut refused,
+            base,
+            phys,
+            &guard4,
+            true
+        ));
+        assert_eq!(refused, [0u64; 512]);
+        assert!(!user_stack_install_store_ptes(
+            &mut refused,
+            base,
+            phys,
+            &good,
+            false
+        ));
+        assert_eq!(refused, [0u64; 512]);
+        assert!(!user_stack_install_store_ptes(
+            &mut refused,
+            base,
+            phys + 1,
+            &good,
+            true
+        ));
+        assert_eq!(refused, [0u64; 512]);
+        assert!(!user_stack_install_store_ptes(
+            &mut refused,
+            0x1FF000,
+            phys,
+            &good,
+            true
+        ));
+        assert_eq!(refused, [0u64; 512]);
+        assert!(!user_stack_install_store_ptes(
+            &mut refused,
+            0xFFFF_FFFF_FFFF_F000,
+            phys,
+            &good,
+            true
+        ));
+        assert_eq!(refused, [0u64; 512]);
     }
 
     #[test]
