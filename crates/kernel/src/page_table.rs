@@ -381,13 +381,19 @@ pub const fn pte_decoded_phys(pte: u64) -> u64 {
     pte & PTE_ADDR_MASK
 }
 
-/// Fail-closed PTE encode (REVIEW #122 finding 2): `None` when `phys_base`
-/// is not 4 KiB aligned, mirroring [`cr3_encode`]; `Some(pte)` otherwise.
+/// Fail-closed PTE encode (REVIEW #122 finding 2, REVIEW #679 risk 2):
+/// `None` when `phys_base` is not 4 KiB aligned (mirroring [`cr3_encode`])
+/// OR when it carries address bits above the PTE field (bits 52+, i.e.
+/// `phys_base & !PTE_ADDR_MASK != 0` — aligned-but-unrepresentable would
+/// otherwise truncate silently in [`pte_encode`]); `Some(pte)` otherwise.
 /// Use this from the guest walker; [`pte_encode`] keeps its masking form
 /// for load-compat and its test pins the truncation.
 #[must_use]
 pub const fn pte_encode_checked(phys_base: u64, flags: PageFlags) -> Option<u64> {
     if phys_base & PAGE_OFFSET_MASK != 0 {
+        return None;
+    }
+    if phys_base & !PTE_ADDR_MASK != 0 {
         return None;
     }
     Some(pte_encode(phys_base, flags))
@@ -517,11 +523,13 @@ pub fn classify_access(
 
 /// Hardware-walker failure modes (fail-closed: no table mutated, no
 /// TLB touched). `MisalignedPhys` is the [`pte_encode_checked`] `None`
-/// case surfaced as a `Result`; the walker path must use
+/// case surfaced as a `Result` (misaligned OR above-`PTE_ADDR_MASK` range);
+/// the walker path must use
 /// [`encode_table_entry`] (checked), never unchecked [`pte_encode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkerError {
-    /// `phys_base` not 4 KiB aligned (checked-encode rejection).
+    /// `phys_base` not 4 KiB aligned or above the PTE address field
+    /// (checked-encode rejection).
     MisalignedPhys,
     /// `virt` is non-canonical (hardware raises `#GP`, not `#PF`).
     NonCanonical,
@@ -1197,6 +1205,14 @@ mod tests {
         assert_eq!(
             pte_encode_checked(0xA000, K_RW),
             Some(pte_encode(0xA000, K_RW))
+        );
+        // REVIEW #679 risk 2: aligned-but-above-PTE_ADDR_MASK refuses
+        // instead of truncating (unchecked form still truncates, pinned).
+        assert_eq!(pte_encode_checked(1 << 52, K_RW), None);
+        assert_eq!(pte_encode_checked(0xFFFF_FFFF_FFFF_F000, K_RW), None);
+        assert_eq!(
+            pte_encode_checked(PTE_ADDR_MASK, K_RW),
+            Some(pte_encode(PTE_ADDR_MASK, K_RW))
         );
         // Unchecked form keeps its pinned truncation (load-compat).
         assert_eq!(pte_decoded_phys(pte_encode(0x1234_5ABC, K_RW)), 0x1234_5000);

@@ -579,6 +579,68 @@ pub(crate) const fn user_stack_install_ptes(
     Some(ptes)
 }
 
+/// Guest PT store loop (S09 slice2ad, #30 remainder, REVIEW #679 risk 1):
+/// writes the four [`user_stack_install_ptes`] words into the caller's
+/// single 4 KiB PT at `page_table_index(va, 0)` per [`user_stack_page_va`].
+/// Two-phase (validate all VAs/indices first, then write) so refusal leaves
+/// `pt` untouched — no partial install. Fail-closed `false` on ANY refusal:
+/// any per-page VA `None` (overflow), pages spanning two PTs (`va >> 21`
+/// differs — the store owns one PT), or two pages sharing one PT slot
+/// (overwrite; unreachable via consecutive VAs but pinned defense-in-depth).
+/// Plain `fn` (`&mut` store cannot be `const` on stable); host-testable.
+/// The guest TLB reload (`invlpg`/CR3) + CPL3 entry + QEMU proof ride next.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn user_stack_store_ptes(
+    pt: &mut [u64; 512],
+    stack_base: u64,
+    ptes: [u64; USER_STACK_PAGES],
+) -> bool {
+    let mut vas = [0u64; USER_STACK_PAGES];
+    let mut i = 0usize;
+    while i < USER_STACK_PAGES {
+        let Some(va) = user_stack_page_va(stack_base, i) else {
+            return false;
+        };
+        vas[i] = va;
+        i += 1;
+    }
+    let pt_base = vas[0] >> 21;
+    i = 1;
+    while i < USER_STACK_PAGES {
+        if (vas[i] >> 21) != pt_base {
+            return false;
+        }
+        i += 1;
+    }
+    let mut idx = [0usize; USER_STACK_PAGES];
+    i = 0;
+    while i < USER_STACK_PAGES {
+        let Some(slot) = super::page_table::page_table_index(vas[i], 0) else {
+            return false;
+        };
+        idx[i] = slot as usize;
+        i += 1;
+    }
+    let mut a = 0usize;
+    while a < USER_STACK_PAGES {
+        let mut b = a + 1;
+        while b < USER_STACK_PAGES {
+            if idx[a] == idx[b] {
+                return false;
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+    i = 0;
+    while i < USER_STACK_PAGES {
+        pt[idx[i]] = ptes[i];
+        i += 1;
+    }
+    true
+}
+
 /// Walk every page of the future CPL3 user stack (S09 slice2u+2v, #30 remainder,
 /// REVIEW #664 step 2/3 + REVIEW #666 risk 2): `walk_full_leaf_flags` per 4 KiB page over
 /// `[stack_base, stack_base + USER_STACK_LEN)`, collecting one [`PageFlags`]
@@ -2148,6 +2210,40 @@ mod tests {
             user_stack_install_ptes(base, 0xFFFF_FFFF_FFFF_F000, &good, true),
             None
         );
+    }
+
+    #[test]
+    fn user_stack_store_ptes_writes_single_pt_no_partial() {
+        // S09 slice2ad (#30 remainder, REVIEW #679 risk 1): the store loop
+        // consumes install_ptes words into one PT at page_table_index(va,0).
+        use super::super::page_table::page_table_index;
+        let base = 0x0000_1000_0020_0000_u64;
+        let phys = 0x0000_0000_0060_0000_u64;
+        let good = [USER_STACK_MAP_FLAGS; USER_STACK_PAGES];
+        let ptes = user_stack_install_ptes(base, phys, &good, true)
+            .expect("good install must encode 4 PTE words");
+        // Good: true, each word lands at its per-page PT slot.
+        let mut pt = [0u64; 512];
+        assert!(user_stack_store_ptes(&mut pt, base, ptes));
+        let mut i = 0usize;
+        while i < USER_STACK_PAGES {
+            let va = user_stack_page_va(base, i).expect("good VA encodable");
+            let slot = page_table_index(va, 0).expect("level 0 always Some") as usize;
+            assert_eq!(pt[slot], ptes[i]);
+            i += 1;
+        }
+        // Cross-PT base (last page of a 2 MiB PT range): false, PT untouched.
+        let mut cross = [0u64; 512];
+        assert!(!user_stack_store_ptes(&mut cross, 0x1FF000, ptes));
+        assert_eq!(cross, [0u64; 512]);
+        // VA-overflow base: false, PT untouched (no partial of page 0).
+        let mut over = [0u64; 512];
+        assert!(!user_stack_store_ptes(
+            &mut over,
+            0xFFFF_FFFF_FFFF_F000,
+            ptes
+        ));
+        assert_eq!(over, [0u64; 512]);
     }
 
     #[test]
