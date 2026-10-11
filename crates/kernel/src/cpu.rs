@@ -538,6 +538,47 @@ pub(crate) const fn user_stack_map_install_ready(
     true
 }
 
+/// Install PTE-word encoder (S09 slice2ac, #30 remainder, REVIEW #677 risk 1):
+/// the first REAL PTE-write call site — consumes [`user_stack_map_install_ready`]
+/// (exact-word flags + encodable VAs + live NXE + 4-page coverage + base align)
+/// and produces the four `u64` leaf words the guest PT store writes. Fail-closed
+/// `None` on ANY refusal (readiness gate, `phys_base` misalign, per-page phys
+/// `checked_add` overflow, or [`pte_encode_checked`](super::page_table::pte_encode_checked)
+/// reject) so a partial install never reaches the store. `GUARD` naturally
+/// masks to 0 at encode (HW ignores bit 9) — but GUARD never reaches encode:
+/// the readiness gate refuses it first. Pure const; the guest store loop
+/// (PT index per [`user_stack_page_va`], `invlpg`/CR3 reload, QEMU proof)
+/// rides with the next slice — this pins the word the store writes.
+#[allow(dead_code)]
+#[allow(clippy::manual_is_multiple_of)]
+#[must_use]
+pub(crate) const fn user_stack_install_ptes(
+    stack_base: u64,
+    phys_base: u64,
+    pages: &[PageFlags],
+    nxe_enabled: bool,
+) -> Option<[u64; USER_STACK_PAGES]> {
+    if !user_stack_map_install_ready(stack_base, pages, nxe_enabled) {
+        return None;
+    }
+    if phys_base % 4096 != 0 {
+        return None;
+    }
+    let mut ptes = [0u64; USER_STACK_PAGES];
+    let mut i = 0usize;
+    while i < USER_STACK_PAGES {
+        let Some(phys) = phys_base.checked_add((i as u64) * 4096) else {
+            return None;
+        };
+        let Some(pte) = super::page_table::pte_encode_checked(phys, pages[i]) else {
+            return None;
+        };
+        ptes[i] = pte;
+        i += 1;
+    }
+    Some(ptes)
+}
+
 /// Walk every page of the future CPL3 user stack (S09 slice2u+2v, #30 remainder,
 /// REVIEW #664 step 2/3 + REVIEW #666 risk 2): `walk_full_leaf_flags` per 4 KiB page over
 /// `[stack_base, stack_base + USER_STACK_LEN)`, collecting one [`PageFlags`]
@@ -2057,6 +2098,56 @@ mod tests {
             &good,
             true
         ));
+    }
+
+    #[test]
+    fn user_stack_install_ptes_writes_real_pte_words() {
+        // S09 slice2ac (#30 remainder, REVIEW #677 risk 1): the install gate
+        // must CONSUME into a real PTE-write call site — this encoder calls
+        // `user_stack_map_install_ready` then `pte_encode_checked` per page.
+        // Host-only; the guest PT store + CPL3 entry + QEMU proof remain.
+        use super::super::page_table::{pte_decoded_flags, pte_decoded_phys};
+        let base = 0x0000_1000_0020_0000_u64;
+        let phys = 0x0000_0000_0060_0000_u64;
+        let good = [USER_STACK_MAP_FLAGS; USER_STACK_PAGES];
+        // Good: Some with exact per-page words (phys + flags round-trip,
+        // GUARD bit masked to 0 at encode).
+        let ptes = user_stack_install_ptes(base, phys, &good, true)
+            .expect("good install must encode 4 PTE words");
+        let mut i = 0usize;
+        while i < USER_STACK_PAGES {
+            let expect = phys + (i as u64) * 4096;
+            assert_eq!(pte_decoded_phys(ptes[i]), expect);
+            assert_eq!(pte_decoded_flags(ptes[i]), USER_STACK_MAP_FLAGS);
+            assert_eq!(ptes[i] & (1 << 9), 0, "GUARD never reaches HW");
+            i += 1;
+        }
+        // GUARD-tagged page: readiness refuses before encode (no partial).
+        let mut guard4 = good;
+        guard4[2] = USER_STACK_MAP_FLAGS.union(PageFlags::GUARD);
+        assert_eq!(user_stack_install_ptes(base, phys, &guard4, true), None);
+        // Wrong-word flags (missing USER — REVIEW #677 note 2 gap): refuses.
+        let mut nouser4 = good;
+        nouser4[1] = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXEC;
+        assert_eq!(user_stack_install_ptes(base, phys, &nouser4, true), None);
+        // Live NXE=0 refuses (NX stack needs NXE).
+        assert_eq!(user_stack_install_ptes(base, phys, &good, false), None);
+        // Misaligned stack base refuses via the readiness gate.
+        assert_eq!(user_stack_install_ptes(base + 1, phys, &good, true), None);
+        // Misaligned phys base refuses at encode (no readiness cover).
+        assert_eq!(user_stack_install_ptes(base, phys + 1, &good, true), None);
+        // Short coverage refuses (no partial install).
+        assert_eq!(user_stack_install_ptes(base, phys, &good[..3], true), None);
+        // Aligned near-MAX VA base: per-page VA overflow refuses.
+        assert_eq!(
+            user_stack_install_ptes(0xFFFF_FFFF_FFFF_F000, phys, &good, true),
+            None
+        );
+        // Aligned near-MAX phys base: per-page phys overflow refuses.
+        assert_eq!(
+            user_stack_install_ptes(base, 0xFFFF_FFFF_FFFF_F000, &good, true),
+            None
+        );
     }
 
     #[test]
