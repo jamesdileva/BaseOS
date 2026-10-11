@@ -2669,6 +2669,56 @@ mod tests {
                 true
             ));
             assert_eq!(pt_dirty, snapshot);
+            // S09 slice2an (#30 remainder): bound store+flush dirty-PT parity
+            // for the encode-refuse shapes — slice2ak covered only the 509
+            // span, slice2al/2am brought the raw bound install+store to 5/5.
+            // Refusal returns before any store write (and flush never runs),
+            // so a pre-dirtied PT must stay bit-identical here too.
+            {
+                use super::super::page_table::PageFlags;
+                let mut guard4 = good;
+                guard4[2] = USER_STACK_MAP_FLAGS.union(PageFlags::GUARD);
+                assert!(!user_stack_install_store_flush(
+                    &mut pt_dirty,
+                    base,
+                    phys,
+                    &guard4,
+                    true
+                ));
+                assert_eq!(pt_dirty, snapshot);
+                assert!(!user_stack_install_store_flush(
+                    &mut pt_dirty,
+                    base,
+                    phys,
+                    &good,
+                    false
+                ));
+                assert_eq!(pt_dirty, snapshot);
+                assert!(!user_stack_install_store_flush(
+                    &mut pt_dirty,
+                    base,
+                    phys + 1,
+                    &good,
+                    true
+                ));
+                assert_eq!(pt_dirty, snapshot);
+                assert!(!user_stack_install_store_flush(
+                    &mut pt_dirty,
+                    0x1FF000,
+                    phys,
+                    &good,
+                    true
+                ));
+                assert_eq!(pt_dirty, snapshot);
+                assert!(!user_stack_install_store_flush(
+                    &mut pt_dirty,
+                    0xFFFF_FFFF_FFFF_F000,
+                    phys,
+                    &good,
+                    true
+                ));
+                assert_eq!(pt_dirty, snapshot);
+            }
             let mut pt_dirty_store = [0x5A5A_5A5A_5A5A_5A5Au64; 512];
             let snapshot_store = pt_dirty_store;
             assert!(!user_stack_store_ptes(
