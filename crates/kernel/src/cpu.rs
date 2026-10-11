@@ -674,6 +674,39 @@ pub(crate) fn user_stack_install_store_ptes(
     user_stack_store_ptes(pt, stack_base, ptes)
 }
 
+/// TLB flush VA set (S09 slice2ag, #30 remainder, REVIEW #685 residual c):
+/// the exact per-page VAs the guest `invlpg` loop must flush after the
+/// bound install+store writes one PT. Pure const over [`user_stack_page_va`]
+/// so the flush set and the store/walk cannot drift apart (single-source
+/// VA rule). Fail-closed `None` on ANY store-refusal shape the flush must
+/// agree with: any per-page VA `None` (overflow) or pages spanning two PTs
+/// (`va >> 21` differs — the store owns one PT, a split store refuses with
+/// `pt` untouched so there is nothing to flush). Slot-collision needs no
+/// mirror (unreachable via consecutive VAs; store pins it defense-in-depth).
+/// Host-testable; the guest `invlpg` loop + CPL3 entry + QEMU proof ride next.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_stack_flush_vas(stack_base: u64) -> Option<[u64; USER_STACK_PAGES]> {
+    let mut vas = [0u64; USER_STACK_PAGES];
+    let mut i = 0usize;
+    while i < USER_STACK_PAGES {
+        let Some(va) = user_stack_page_va(stack_base, i) else {
+            return None;
+        };
+        vas[i] = va;
+        i += 1;
+    }
+    let pt_base = vas[0] >> 21;
+    let mut j = 1usize;
+    while j < USER_STACK_PAGES {
+        if (vas[j] >> 21) != pt_base {
+            return None;
+        }
+        j += 1;
+    }
+    Some(vas)
+}
+
 /// Walk every page of the future CPL3 user stack (S09 slice2u+2v, #30 remainder,
 /// REVIEW #664 step 2/3 + REVIEW #666 risk 2): `walk_full_leaf_flags` per 4 KiB page over
 /// `[stack_base, stack_base + USER_STACK_LEN)`, collecting one [`PageFlags`]
@@ -2358,6 +2391,36 @@ mod tests {
             true
         ));
         assert_eq!(refused, [0u64; 512]);
+    }
+
+    #[test]
+    fn user_stack_flush_vas_pins_invlpg_set_and_store_agreement() {
+        // S09 slice2ag (#30 remainder, REVIEW #685 residual c): the guest
+        // `invlpg` loop must flush exactly the VAs the store wrote — one
+        // rule (`user_stack_page_va`) with store-matching refusal shape.
+        let base = 0x0000_1000_0020_0000_u64;
+        let vas = user_stack_flush_vas(base).expect("good base must yield 4 VAs");
+        let mut i = 0usize;
+        while i < USER_STACK_PAGES {
+            assert_eq!(
+                vas[i],
+                user_stack_page_va(base, i).expect("good VA encodable")
+            );
+            assert_eq!(vas[i], base + (i as u64) * 4096);
+            i += 1;
+        }
+        // Agreement: store-true base has a flush set; store-refusal shapes
+        // (cross-PT span, VA overflow) have none — nothing was written, so
+        // nothing to flush.
+        let phys = 0x0000_0000_0060_0000_u64;
+        let good = [USER_STACK_MAP_FLAGS; USER_STACK_PAGES];
+        let ptes =
+            user_stack_install_ptes(base, phys, &good, true).expect("good install must encode");
+        let mut pt = [0u64; 512];
+        assert!(user_stack_store_ptes(&mut pt, base, ptes));
+        assert!(user_stack_flush_vas(base).is_some());
+        assert!(user_stack_flush_vas(0x1FF000).is_none());
+        assert!(user_stack_flush_vas(0xFFFF_FFFF_FFFF_F000).is_none());
     }
 
     #[test]
