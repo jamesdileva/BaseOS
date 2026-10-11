@@ -538,8 +538,9 @@ pub(crate) const fn user_stack_map_install_ready(
     true
 }
 
-/// Install PTE-word encoder (S09 slice2ac, #30 remainder, REVIEW #677 risk 1):
-/// the first REAL PTE-write call site — consumes [`user_stack_map_install_ready`]
+/// Install PTE-word encoder (S09 slice2ac/slice2af, #30 remainder,
+/// REVIEW #677 risk 1, REVIEW #683 closure (a)): PRIVATE helper, the first
+/// REAL PTE-write call site — consumes [`user_stack_map_install_ready`]
 /// (exact-word flags + encodable VAs + live NXE + 4-page coverage + base align)
 /// and produces the four `u64` leaf words the guest PT store writes. Fail-closed
 /// `None` on ANY refusal (readiness gate, `phys_base` misalign, per-page phys
@@ -549,10 +550,13 @@ pub(crate) const fn user_stack_map_install_ready(
 /// the readiness gate refuses it first. Pure const; the guest store loop
 /// (PT index per [`user_stack_page_va`], `invlpg`/CR3 reload, QEMU proof)
 /// rides with the next slice — this pins the word the store writes.
+/// Private since slice2af: only [`user_stack_install_store_ptes`] (same
+/// module) and in-module tests may call it; cross-module callers must use
+/// the bound entry so tampered words cannot bypass encode.
 #[allow(dead_code)]
 #[allow(clippy::manual_is_multiple_of)]
 #[must_use]
-pub(crate) const fn user_stack_install_ptes(
+const fn user_stack_install_ptes(
     stack_base: u64,
     phys_base: u64,
     pages: &[PageFlags],
@@ -579,8 +583,9 @@ pub(crate) const fn user_stack_install_ptes(
     Some(ptes)
 }
 
-/// Guest PT store loop (S09 slice2ad, #30 remainder, REVIEW #679 risk 1):
-/// writes the four [`user_stack_install_ptes`] words into the caller's
+/// Guest PT store loop (S09 slice2ad/slice2af, #30 remainder,
+/// REVIEW #679 risk 1, REVIEW #683 closure (a)): PRIVATE helper, writes
+/// the four bound-entry words into the caller's
 /// single 4 KiB PT at `page_table_index(va, 0)` per [`user_stack_page_va`].
 /// Two-phase (validate all VAs/indices first, then write) so refusal leaves
 /// `pt` untouched — no partial install. Fail-closed `false` on ANY refusal:
@@ -589,9 +594,11 @@ pub(crate) const fn user_stack_install_ptes(
 /// (overwrite; unreachable via consecutive VAs but pinned defense-in-depth).
 /// Plain `fn` (`&mut` store cannot be `const` on stable); host-testable.
 /// The guest TLB reload (`invlpg`/CR3) + CPL3 entry + QEMU proof ride next.
+/// Private since slice2af: only the bound entry (same module) and in-module
+/// tests may call it; it never re-checks phys/flags/NXE by design.
 #[allow(dead_code)]
 #[must_use]
-pub(crate) fn user_stack_store_ptes(
+fn user_stack_store_ptes(
     pt: &mut [u64; 512],
     stack_base: u64,
     ptes: [u64; USER_STACK_PAGES],
@@ -641,9 +648,10 @@ pub(crate) fn user_stack_store_ptes(
     true
 }
 
-/// Bound install+store entry (S09 slice2ae, #30 remainder, REVIEW #681
-/// residual 1): encodes via [`user_stack_install_ptes`] then stores via
-/// [`user_stack_store_ptes`] in one call so callers cannot inject a
+/// Bound install+store entry (S09 slice2ae/slice2af, #30 remainder,
+/// REVIEW #681 residual 1, REVIEW #683 closure (a)): the SOLE cross-module
+/// entry, encodes via the private installer then stores via the private
+/// store in one call so callers cannot inject a
 /// mismatched `ptes` array (the residual-1 silent-install gap: `store`
 /// alone trusts caller-supplied words and never re-checks they match
 /// `base`/`phys`/`flags`). Fail-closed `false` on ANY refusal (encode
