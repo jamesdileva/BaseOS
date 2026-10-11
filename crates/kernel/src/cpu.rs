@@ -715,9 +715,9 @@ fn user_stack_install_store_ptes(
     user_stack_store_ptes(pt, stack_base, ptes)
 }
 
-/// Bound install+store+flush entry (S09 slice2aj, #30 remainder, REVIEW #690
-/// risk 2): the SOLE cross-module entry — stores via
-/// [`user_stack_install_store_ptes`] (private) then flushes via
+/// Bound install+store+flush entry (S09 slice2aj/slice2ak, #30 remainder,
+/// REVIEW #690 risk 2, REVIEW #692 residual 2): the SOLE cross-module entry —
+/// stores via [`user_stack_install_store_ptes`] (private) then flushes via
 /// [`user_stack_flush_tlb`] (private) in one call, so callers cannot write
 /// PTEs and skip the flush (stale-TLB gap: store+flush agreement was
 /// test-only). Fail-closed `false` with `pt` untouched when the store
@@ -727,9 +727,18 @@ fn user_stack_install_store_ptes(
 /// uncalled this slice (no guest PTE written yet), so boot-neutral by
 /// construction. CPL3 entry + QEMU proof ride next.
 ///
+/// PT-liveness (slice2ak pin of REVIEW #692 residual 2): the bound entry pins
+/// the SAME `stack_base` for store+flush, but NOT that `pt` is the live PT —
+/// that stays a caller contract (same shape as [`invlpg_page`]'s VA-ownership
+/// rule): `pt` must be the live 4 KiB PT backing `stack_base`'s 2 MiB region
+/// (the table the live CR3 walk resolves for these VAs). A non-live `pt`
+/// writes harmless dead bytes (host-testable) but the guest `invlpg` still
+/// runs on accept — the future wiring slice must pass the live PT.
+///
 /// # Safety
 /// Same contract as [`invlpg_page`]: boot CPU only, post-`ExitBootServices`
-/// with the edited PT live. Host `cargo test` runs the no-op stub.
+/// with the edited PT live (see PT-liveness above). Host `cargo test` runs
+/// the no-op stub.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) unsafe fn user_stack_install_store_flush(
@@ -2592,6 +2601,9 @@ mod tests {
         // the sole cross-module path — accept stores+flushes, refusals leave
         // `pt` untouched and run no flush. Host stub is a no-op; asserts the
         // wiring, not hardware.
+        // S09 slice2ak (REVIEW #692 residual 2): refusal-untouched holds for
+        // a pre-dirtied PT too (not just zeroed) — no partial install on any
+        // refuse shape; PT-liveness itself stays a documented caller contract.
         // SAFETY: host stub no-op (see above).
         unsafe {
             let mut pt_bound = [0u64; 512];
@@ -2612,6 +2624,24 @@ mod tests {
                 true
             ));
             assert_eq!(pt_refused, [0u64; 512]);
+            let mut pt_dirty = [0xA5A5_A5A5_A5A5_A5A5u64; 512];
+            let snapshot = pt_dirty;
+            assert!(!user_stack_install_store_flush(
+                &mut pt_dirty,
+                base509,
+                phys,
+                &good,
+                true
+            ));
+            assert_eq!(pt_dirty, snapshot);
+            let mut pt_dirty_store = [0x5A5A_5A5A_5A5A_5A5Au64; 512];
+            let snapshot_store = pt_dirty_store;
+            assert!(!user_stack_store_ptes(
+                &mut pt_dirty_store,
+                base509,
+                ptes509
+            ));
+            assert_eq!(pt_dirty_store, snapshot_store);
         }
     }
 
