@@ -538,13 +538,32 @@ pub(crate) const fn user_stack_map_install_ready(
     true
 }
 
-/// Install PTE-word encoder (S09 slice2ac/slice2af, #30 remainder,
+/// Phys-frame validity (S09 slice2ao, #30 remainder): the future 4-page
+/// U-map install stub's frame-source rule — `phys_base` must be 4 KiB-aligned
+/// AND fit `PTE_ADDR_MASK` (`phys & !MASK == 0`, mirroring
+/// [`pte_encode_checked`](super::page_table::pte_encode_checked)'s
+/// align-or-range reject). Single-sources the base-frame rule so the encoder
+/// below cannot drift from the encode choke point (previously the encoder
+/// checked align-only while range lived one call deeper — an
+/// aligned-but-above-mask base passed the base check and failed only at page
+/// 0's encode). Per-page frames still go through `checked_add` +
+/// `pte_encode_checked` per page (base-valid does NOT imply span-valid: a
+/// base of `PTE_ADDR_MASK` itself passes here yet its 4-page span overflows
+/// the mask and the encoder refuses). Pure const; still no guest PTE written.
+#[allow(dead_code)]
+#[allow(clippy::manual_is_multiple_of)]
+#[must_use]
+pub(crate) const fn user_stack_phys_valid(phys_base: u64) -> bool {
+    phys_base % 4096 == 0 && phys_base & !super::page_table::PTE_ADDR_MASK == 0
+}
+
+/// Install PTE-word encoder (S09 slice2ac/slice2af/slice2ao, #30 remainder,
 /// REVIEW #677 risk 1, REVIEW #683 closure (a)): PRIVATE helper, the first
 /// REAL PTE-write call site — consumes [`user_stack_map_install_ready`]
 /// (exact-word flags + encodable VAs + live NXE + 4-page coverage + base align)
 /// and produces the four `u64` leaf words the guest PT store writes. Fail-closed
-/// `None` on ANY refusal (readiness gate, `phys_base` misalign, per-page phys
-/// `checked_add` overflow, or [`pte_encode_checked`](super::page_table::pte_encode_checked)
+/// `None` on ANY refusal (readiness gate, [`user_stack_phys_valid`] base-frame
+/// reject, per-page phys `checked_add` overflow, or [`pte_encode_checked`](super::page_table::pte_encode_checked)
 /// reject) so a partial install never reaches the store. `GUARD` naturally
 /// masks to 0 at encode (HW ignores bit 9) — but GUARD never reaches encode:
 /// the readiness gate refuses it first. Pure const; the guest store loop
@@ -565,7 +584,7 @@ const fn user_stack_install_ptes(
     if !user_stack_map_install_ready(stack_base, pages, nxe_enabled) {
         return None;
     }
-    if phys_base % 4096 != 0 {
+    if !user_stack_phys_valid(phys_base) {
         return None;
     }
     let mut ptes = [0u64; USER_STACK_PAGES];
@@ -2392,6 +2411,24 @@ mod tests {
         assert_eq!(user_stack_install_ptes(base + 1, phys, &good, true), None);
         // Misaligned phys base refuses at encode (no readiness cover).
         assert_eq!(user_stack_install_ptes(base, phys + 1, &good, true), None);
+        // S09 slice2ao (#30 remainder): phys-frame rule single-sourced in
+        // `user_stack_phys_valid` (align + PTE_ADDR_MASK fit) — the encoder
+        // consumes it, so the base check cannot drift from the encode choke
+        // point. Aligned-but-above-mask refuses; mask-top itself is
+        // base-valid yet its 4-page span overflows the mask, so the encoder
+        // still refuses (base-valid != span-valid).
+        use super::super::page_table::PTE_ADDR_MASK;
+        assert!(user_stack_phys_valid(phys));
+        assert!(!user_stack_phys_valid(phys + 1));
+        assert!(!user_stack_phys_valid(1 << 52));
+        assert!(!user_stack_phys_valid(u64::MAX));
+        assert!(user_stack_phys_valid(PTE_ADDR_MASK));
+        assert_eq!(user_stack_install_ptes(base, 1 << 52, &good, true), None);
+        assert_eq!(
+            user_stack_install_ptes(base, PTE_ADDR_MASK, &good, true),
+            None,
+            "mask-top base is valid but the 4-page span is not"
+        );
         // Short coverage refuses (no partial install).
         assert_eq!(user_stack_install_ptes(base, phys, &good[..3], true), None);
         // Aligned near-MAX VA base: per-page VA overflow refuses.
