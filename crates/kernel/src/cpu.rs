@@ -555,12 +555,15 @@ pub(crate) const fn user_stack_phys_valid(phys_base: u64) -> bool {
         && phys_base & !super::page_table::PTE_ADDR_MASK == 0
 }
 
-/// Frame-alloc binding (S09 slice2az, #30 remainder): allocate the 4
+/// Frame-alloc binding (S09 slice2az/slice2ba, #30 remainder): allocate the 4
 /// contiguous frames backing the future U-map from `alloc` and gate the base
 /// on [`user_stack_phys_valid`]. Fail-closed `None` on ANY refusal (alloc
 /// `None`, misaligned/above-mask base — frees the just-allocated range back
 /// before returning so the allocator state is untouched on the invalid-base
-/// path). Plain `fn` (`&mut` alloc cannot be `const`); host-testable. The
+/// path; REVIEW #723 nit 2: the free-back `is_ok` is debug-asserted — a
+/// just-allocated range must free cleanly, so failure signals allocator
+/// corruption and must not hide in debug builds; release still frees).
+/// Plain `fn` (`&mut` alloc cannot be `const`); host-testable. The
 /// guest wiring slice calls this post-EBS with a live `FrameAllocator` over
 /// `BootInfo`, then feeds the base into the bound
 /// [`user_stack_install_store_flush`] entry with the live PT from
@@ -569,6 +572,9 @@ pub(crate) const fn user_stack_phys_valid(phys_base: u64) -> bool {
 /// Note: the current guest `USER_STACK` BSS is `align(16)`, NOT 4 KiB — the
 /// wiring slice must source a 4 KiB-aligned `stack_base` (new `align(4096)`
 /// static or aligned carve) or `user_stack_map_install_ready` refuses.
+/// REVIEW #723 nit 1: the invalid-base free-back IS reachable — `from_boot_info`
+/// ingests `region.start` verbatim (no align-up), so a misaligned Usable
+/// region yields a misaligned alloc base; pinned by the misaligned-map test.
 #[allow(dead_code)]
 #[must_use]
 pub(crate) fn user_stack_alloc_frames(
@@ -576,7 +582,8 @@ pub(crate) fn user_stack_alloc_frames(
 ) -> Option<u64> {
     let base = alloc.alloc(USER_STACK_PAGES as u64)?;
     if !user_stack_phys_valid(base) {
-        let _ = alloc.free(base, USER_STACK_PAGES as u64);
+        let freed_ok = alloc.free(base, USER_STACK_PAGES as u64).is_ok();
+        debug_assert!(freed_ok, "user_stack_alloc_frames: free-back must succeed");
         return None;
     }
     Some(base)
@@ -2716,6 +2723,15 @@ mod tests {
         let snap = (fa.free_pages(), fa.free_span_count(), fa.cursor());
         assert_eq!(user_stack_alloc_frames(&mut fa), None);
         assert_eq!((fa.free_pages(), fa.free_span_count(), fa.cursor()), snap);
+        // REVIEW #723 nit 1: misaligned-base free-back branch. from_boot_info
+        // ingests start verbatim (no align-up), so a misaligned Usable region
+        // forces alloc -> phys-invalid -> free-back -> None with state restored.
+        let mut boot_bad = BootInfo::new();
+        assert!(boot_bad.push_region(MemoryRegion::new(0x100001, 16, MemoryKind::Usable)));
+        let mut fb = FrameAllocator::from_boot_info(&boot_bad);
+        let free0b = fb.free_pages();
+        assert_eq!(user_stack_alloc_frames(&mut fb), None);
+        assert_eq!(fb.free_pages(), free0b, "free-back must restore state");
     }
 
     #[test]
