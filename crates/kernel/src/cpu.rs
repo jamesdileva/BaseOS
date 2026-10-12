@@ -555,6 +555,33 @@ pub(crate) const fn user_stack_phys_valid(phys_base: u64) -> bool {
         && phys_base & !super::page_table::PTE_ADDR_MASK == 0
 }
 
+/// Frame-alloc binding (S09 slice2az, #30 remainder): allocate the 4
+/// contiguous frames backing the future U-map from `alloc` and gate the base
+/// on [`user_stack_phys_valid`]. Fail-closed `None` on ANY refusal (alloc
+/// `None`, misaligned/above-mask base — frees the just-allocated range back
+/// before returning so the allocator state is untouched on the invalid-base
+/// path). Plain `fn` (`&mut` alloc cannot be `const`); host-testable. The
+/// guest wiring slice calls this post-EBS with a live `FrameAllocator` over
+/// `BootInfo`, then feeds the base into the bound
+/// [`user_stack_install_store_flush`] entry with the live PT from
+/// `live_pt_phys_for_va` + `phys_to_table_ptr_mut`; re-walk + `ok=1` flip and
+/// CPL3 entry ride after. Uncalled this slice, so boot-neutral.
+/// Note: the current guest `USER_STACK` BSS is `align(16)`, NOT 4 KiB — the
+/// wiring slice must source a 4 KiB-aligned `stack_base` (new `align(4096)`
+/// static or aligned carve) or `user_stack_map_install_ready` refuses.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn user_stack_alloc_frames(
+    alloc: &mut super::frame_alloc::FrameAllocator,
+) -> Option<u64> {
+    let base = alloc.alloc(USER_STACK_PAGES as u64)?;
+    if !user_stack_phys_valid(base) {
+        let _ = alloc.free(base, USER_STACK_PAGES as u64);
+        return None;
+    }
+    Some(base)
+}
+
 /// Install PTE-word encoder (S09 slice2ac/slice2af/slice2ao, #30 remainder,
 /// REVIEW #677 risk 1, REVIEW #683 closure (a)): PRIVATE helper, the first
 /// REAL PTE-write call site — consumes [`user_stack_map_install_ready`]
@@ -2658,6 +2685,37 @@ mod tests {
             user_stack_install_ptes(base, 0xFFFF_FFFF_FFFF_F000, &good, true),
             None
         );
+    }
+
+    #[test]
+    fn user_stack_alloc_frames_binds_frame_allocator_fail_closed() {
+        // S09 slice2az (#30 remainder): the future live install must source
+        // frames from the BootInfo allocator, never literals. Host pins the
+        // binding: alloc-4 on a healthy map yields a phys-valid base that
+        // encodes; drain-to-empty yields None with state untouched; the
+        // allocated range is exactly 4 contiguous frames (re-free restores).
+        use super::super::frame_alloc::FrameAllocator;
+        use baseos_boot_info::{BootInfo, MemoryKind, MemoryRegion};
+        let mut boot = BootInfo::new();
+        assert!(boot.push_region(MemoryRegion::new(0x100000, 16, MemoryKind::Usable)));
+        let mut fa = FrameAllocator::from_boot_info(&boot);
+        let free0 = fa.free_pages();
+        let base = user_stack_alloc_frames(&mut fa).expect("healthy map must yield 4 frames");
+        assert!(user_stack_phys_valid(base));
+        assert_eq!(fa.free_pages(), free0 - USER_STACK_PAGES as u64);
+        let good = [USER_STACK_MAP_FLAGS; USER_STACK_PAGES];
+        let stack_base = 0x0000_1000_0020_0000_u64;
+        assert!(
+            user_stack_install_ptes(stack_base, base, &good, true).is_some(),
+            "alloc'd base must encode"
+        );
+        assert_eq!(fa.free(base, USER_STACK_PAGES as u64), Ok(()));
+        assert_eq!(fa.free_pages(), free0);
+        // Exhausted allocator: None, state untouched.
+        while fa.alloc(1).is_some() {}
+        let snap = (fa.free_pages(), fa.free_span_count(), fa.cursor());
+        assert_eq!(user_stack_alloc_frames(&mut fa), None);
+        assert_eq!((fa.free_pages(), fa.free_span_count(), fa.cursor()), snap);
     }
 
     #[test]
