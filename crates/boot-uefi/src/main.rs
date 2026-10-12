@@ -46,6 +46,7 @@ use baseos_kernel::latency::{LatencySamples, LatencyStats};
 use baseos_kernel::page_table::{
     guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
     user_isolation_selftest, walk_full, walk_full_leaf_flags, walk_full_leaf_raw, walk_step,
+    PAGE_OFFSET_MASK,
 };
 use baseos_kernel::sched::{Scheduler, QUANTUM_TICKS};
 use baseos_kernel::thread::check_jump_entry;
@@ -609,8 +610,10 @@ unsafe fn phys_to_table_ptr_mut(info: &BootInfo, phys: u64) -> Option<*mut [u64;
 /// from `pml4_base` through `lookup` and returns the PT table base (the
 /// table whose level-0 slot holds `va`'s leaf PTE). Fail-closed `None` on ANY
 /// refusal: lookup miss (`MissingTable`), cleared-`PRESENT` or `PS` mid-level
-/// (`NotPresent`), non-canonical `va`, or misaligned `pml4_base` (surfaced as
-/// a lookup miss when the PML4 itself is unresolvable). Pure over `lookup`
+/// (`NotPresent`), non-canonical `va`, or misaligned `pml4_base`
+/// (`pml4_base & PAGE_OFFSET_MASK != 0` checked explicitly, lookup-independent
+/// — a host/plain-array lookup ignores alignment, so the guard lives here,
+/// mirroring `walk_full`'s `MisalignedPhys`). Pure over `lookup`
 /// so host tests and the guest stub share one rule; the guest passes
 /// [`phys_to_table_ptr`] as `lookup` and writes through
 /// [`phys_to_table_ptr_mut`]. Uncalled this slice (no guest PTE written yet),
@@ -620,6 +623,9 @@ fn live_pt_phys_for_va<'a, F>(pml4_base: u64, va: u64, lookup: F) -> Option<u64>
 where
     F: Fn(u64) -> Option<&'a [u64; 512]>,
 {
+    if pml4_base & PAGE_OFFSET_MASK != 0 {
+        return None;
+    }
     let pml4 = lookup(pml4_base)?;
     let pdpt_base = walk_step(pml4, va, 3).ok()?;
     let pdpt = lookup(pdpt_base)?;
@@ -4717,6 +4723,21 @@ mod tests {
         assert_eq!(live_pt_phys_for_va(0x1000, 0x4000_0000, &lookup), None);
         // Lookup miss refuses (PML4 base unresolvable).
         assert_eq!(live_pt_phys_for_va(0x9000, 0x0, &lookup), None);
+        // Misaligned PML4 refuses lookup-independently (REVIEW #719 nit):
+        // even a lookup that WOULD resolve the misaligned base still gets
+        // None via the explicit PAGE_OFFSET_MASK guard (plain-array host
+        // lookups ignore alignment, unlike phys_to_table_ptr).
+        let lookup_misaligned = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                0x1001 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                0x2000 => Some(unsafe { &*(&pdpt as *const [u64; 512]) }),
+                0x3000 => Some(unsafe { &*(&pd as *const [u64; 512]) }),
+                0x4000 => Some(unsafe { &*(&pt as *const [u64; 512]) }),
+                _ => None,
+            }
+        };
+        assert_eq!(live_pt_phys_for_va(0x1001, 0x0, &lookup_misaligned), None);
         // Non-canonical VA refuses (0x0000_8000_0000_0000 is the hole start).
         assert_eq!(
             live_pt_phys_for_va(0x1000, 0x0000_8000_0000_0000, &lookup),
