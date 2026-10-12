@@ -939,7 +939,8 @@ where
 /// cannot drift from the host-tested shape — the probe calls this, and the
 /// host test below pins `ok == (report == Valid)` on every report shape.
 /// Pure const so host tests and the guest stub share one rule.
-#[allow(dead_code)]
+/// Slice2at: also consumed by [`crate::uart::emit_ustack_report`] (the bound
+/// `USTACK` serial body), so the rule has a serial consumer, not just tests.
 #[must_use]
 pub(crate) const fn user_stack_walk_ok(outcome: UserStackWalkOutcome) -> bool {
     match outcome {
@@ -954,8 +955,8 @@ pub(crate) const fn user_stack_walk_ok(outcome: UserStackWalkOutcome) -> bool {
 /// live line prints `ok` (via [`user_stack_walk_ok`]) PLUS this label —
 /// `"valid"` / `"perms-refused"` / `"walk-failed"` — to distinguish "walker
 /// reached supervisor pages and correctly refused" from "walker never
-/// reached the pages". Pure const; no guest `USTACK` line yet.
-#[allow(dead_code)]
+/// reached the pages". Pure const; slice2at binds it to serial via
+/// [`crate::uart::emit_ustack_report`] (host-pinned `USTACK ok=X label=Y`).
 #[must_use]
 pub(crate) const fn user_stack_walk_label(outcome: UserStackWalkOutcome) -> &'static str {
     match outcome {

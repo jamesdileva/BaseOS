@@ -374,6 +374,74 @@ pub(crate) fn write_tr_line(ok: bool, sel: u16) {
     let _ = emit_tr_line(&mut out, ok, sel);
 }
 
+/// Pure USTACK line formatter shared by the guest writer and host tests
+/// (S09 slice2at, #30 remainder, REVIEW #709 R2: the `ok`+`label` strings
+/// were host-pinned but no serial body bound them, so labels could drift).
+///
+/// Emits `USTACK ok=<0|1> label=<valid|perms-refused|walk-failed>\n`
+/// through a byte callback (`core`-only, no port I/O), so host tests pin
+/// the literal field order, names, and label spelling while
+/// [`write_ustack_line`] reuses this exact body for its COM1-direct write.
+/// `ok` is [`crate::cpu::user_stack_walk_ok`] and `label` is
+/// [`crate::cpu::user_stack_walk_label`] — callers should prefer
+/// [`emit_ustack_report`] so the pair cannot drift apart.
+/// `no_std`-clean; the guest passes a `com1_write_byte` closure (infallible).
+pub(crate) fn emit_ustack_line<E>(
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+    ok: bool,
+    label: &str,
+) -> Result<(), E> {
+    use baseos_boot_info::{write_str, write_u64_dec};
+    write_str(emit, "USTACK ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " label=")?;
+    write_str(emit, label)?;
+    write_str(emit, "\n")
+}
+
+/// Bound USTACK report emitter (S09 slice2at): the single call site the
+/// future guest `USTACK` line gates on — sources `ok` + `label` from the
+/// tri-state `outcome` via [`crate::cpu::user_stack_walk_ok`] /
+/// [`crate::cpu::user_stack_walk_label`] in one call so a hand-built
+/// `ok`/`label` pair cannot mismatch the report (e.g. `ok=1` with
+/// `label=walk-failed`). Pure `core`-only body over [`emit_ustack_line`].
+pub(crate) fn emit_ustack_report<E>(
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+    outcome: crate::cpu::UserStackWalkOutcome,
+) -> Result<(), E> {
+    emit_ustack_line(
+        emit,
+        crate::cpu::user_stack_walk_ok(outcome),
+        crate::cpu::user_stack_walk_label(outcome),
+    )
+}
+
+/// Emit `USTACK ok=<0|1> label=<...>\n` directly on COM1 (S09 slice2at:
+/// `ok` is 1 only when the live 4-page walk reports `Valid`; both refuse
+/// shapes print `ok=0` with a disambiguating `label`).
+///
+/// Safe wrapper: only calls [`com1_write_byte`] via [`emit_ustack_line`].
+/// Requires COM1 initialized; single-threaded bring-up context owns
+/// the UART exclusively.
+#[allow(dead_code)]
+pub(crate) fn write_ustack_line(ok: bool, label: &str) {
+    let mut out = |b: u8| {
+        com1_write_byte(b);
+        Ok::<(), core::convert::Infallible>(())
+    };
+    let _ = emit_ustack_line(&mut out, ok, label);
+}
+
+/// Bound COM1 USTACK report writer: [`emit_ustack_report`] over COM1.
+#[allow(dead_code)]
+pub(crate) fn write_ustack_report(outcome: crate::cpu::UserStackWalkOutcome) {
+    let mut out = |b: u8| {
+        com1_write_byte(b);
+        Ok::<(), core::convert::Infallible>(())
+    };
+    let _ = emit_ustack_report(&mut out, outcome);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +565,68 @@ mod tests {
         let line = run_tr(true, 0x28);
         assert!(line.starts_with("TR ok="));
         assert!(line.contains(" sel=0x"));
+        assert!(line.ends_with('\n'));
+    }
+
+    fn run_ustack(ok: bool, label: &str) -> String {
+        let mut out = Vec::new();
+        emit_ustack_line::<core::convert::Infallible>(
+            &mut |b| {
+                out.push(b);
+                Ok(())
+            },
+            ok,
+            label,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn run_ustack_report(outcome: crate::cpu::UserStackWalkOutcome) -> String {
+        let mut out = Vec::new();
+        emit_ustack_report::<core::convert::Infallible>(
+            &mut |b| {
+                out.push(b);
+                Ok(())
+            },
+            outcome,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn ustack_line_pins_ok_label_shape_and_report_binding() {
+        // S09 slice2at (REVIEW #709 R1/R2): the `ok`+`label` pair finally has
+        // a serial consumer, and the bound report is the call site the future
+        // guest line gates on — a hand-built mismatch cannot reach serial.
+        assert_eq!(run_ustack(true, "valid"), "USTACK ok=1 label=valid\n");
+        assert_eq!(
+            run_ustack(false, "perms-refused"),
+            "USTACK ok=0 label=perms-refused\n"
+        );
+        assert_eq!(
+            run_ustack(false, "walk-failed"),
+            "USTACK ok=0 label=walk-failed\n"
+        );
+        // Bound report agrees with the hand-built lines on every outcome and
+        // sources both fields from the shared cpu helpers (no literals here).
+        for outcome in [
+            crate::cpu::UserStackWalkOutcome::Valid,
+            crate::cpu::UserStackWalkOutcome::PermsRefused,
+            crate::cpu::UserStackWalkOutcome::WalkFailed,
+        ] {
+            assert_eq!(
+                run_ustack_report(outcome),
+                run_ustack(
+                    crate::cpu::user_stack_walk_ok(outcome),
+                    crate::cpu::user_stack_walk_label(outcome)
+                )
+            );
+        }
+        let line = run_ustack_report(crate::cpu::UserStackWalkOutcome::PermsRefused);
+        assert!(line.starts_with("USTACK ok="));
+        assert!(line.contains(" label="));
         assert!(line.ends_with('\n'));
     }
 }
