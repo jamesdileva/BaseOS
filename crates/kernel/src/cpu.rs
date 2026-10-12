@@ -230,9 +230,8 @@ pub(crate) const fn all_stack_map_flags_valid(pages: &[PageFlags]) -> bool {
     true
 }
 #[allow(dead_code)]
-#[allow(clippy::manual_is_multiple_of)]
 const _: () = {
-    assert!(USER_STACK_LEN % 4096 == 0);
+    assert!((USER_STACK_LEN as u64) & super::page_table::PAGE_OFFSET_MASK == 0);
     assert!(USER_STACK_PAGES == 4);
 };
 
@@ -509,7 +508,6 @@ pub(crate) const fn user_stack_page_va(stack_base: u64, index: usize) -> Option<
 /// install wiring, not the entry shape. Pure const; still no guest PTE
 /// written yet.
 #[allow(dead_code)]
-#[allow(clippy::manual_is_multiple_of)]
 #[must_use]
 pub(crate) const fn user_stack_map_install_ready(
     stack_base: u64,
@@ -519,7 +517,7 @@ pub(crate) const fn user_stack_map_install_ready(
     if !nxe_enabled {
         return false;
     }
-    if stack_base % 4096 != 0 {
+    if stack_base & super::page_table::PAGE_OFFSET_MASK != 0 {
         return false;
     }
     if pages.len() != USER_STACK_PAGES {
@@ -573,7 +571,6 @@ pub(crate) const fn user_stack_phys_valid(phys_base: u64) -> bool {
 /// module) and in-module tests may call it; cross-module callers must use
 /// the bound entry so tampered words cannot bypass encode.
 #[allow(dead_code)]
-#[allow(clippy::manual_is_multiple_of)]
 #[must_use]
 const fn user_stack_install_ptes(
     stack_base: u64,
@@ -927,7 +924,6 @@ where
 /// `iretq` yet.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::manual_is_multiple_of)]
 #[must_use]
 pub(crate) const fn user_entry_fully_valid_pages(
     user_rip: u64,
@@ -941,7 +937,11 @@ pub(crate) const fn user_entry_fully_valid_pages(
     stack_pages: &[PageFlags],
     nxe_enabled: bool,
 ) -> bool {
-    if code_len == 0 || code_len % 4096 != 0 || stack_len == 0 || stack_len % 4096 != 0 {
+    if code_len == 0
+        || code_len & super::page_table::PAGE_OFFSET_MASK != 0
+        || stack_len == 0
+        || stack_len & super::page_table::PAGE_OFFSET_MASK != 0
+    {
         return false;
     }
     if code_pages.len() as u64 != code_len / 4096 {
