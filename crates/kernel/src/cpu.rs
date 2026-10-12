@@ -887,6 +887,52 @@ where
     Some(pages)
 }
 
+/// Tri-state outcome of the future live user-stack walk (S09 slice2ar, #30
+/// remainder): `WalkFailed` (any per-page walk error — unmapped page,
+/// non-canonical base, lookup miss, VA overflow; nothing proven),
+/// `PermsRefused` (all 4 pages walked but [`all_stack_pages_valid_for`]
+/// refuses with the given live `nxe_enabled` — e.g. supervisor BSS while
+/// unmapped, or NXE=0 with NX bits set), `Valid` (walked AND perms-gated).
+/// The bool probe alone conflates the two refuse shapes; the future guest
+/// `USTACK` serial line must distinguish "walker never reached the pages"
+/// from "walker reached supervisor pages and correctly refused", so the
+/// report — not the bool — is the call site the guest line gates on.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UserStackWalkOutcome {
+    WalkFailed,
+    PermsRefused,
+    Valid,
+}
+
+/// Pure tri-state binding of [`walk_user_stack_pages`] to the live NXE pin
+/// (S09 slice2ar, #30 remainder): walks all 4 pages of
+/// `[stack_base, stack_base + USER_STACK_LEN)` via `walk_full_leaf_flags`,
+/// then gates the array on [`all_stack_pages_valid_for`] with
+/// `nxe_enabled`. Host-testable core of the guest-only
+/// [`probe_user_stack_pages_valid`] stub below (which supplies live EFER +
+/// the `USER_STACK` base); no guest `iretq` yet.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn user_stack_walk_report<'a, F>(
+    pml4_base: u64,
+    stack_base: u64,
+    lookup: F,
+    nxe_enabled: bool,
+) -> UserStackWalkOutcome
+where
+    F: Fn(u64) -> Option<&'a [u64; 512]>,
+{
+    let Some(pages) = walk_user_stack_pages(pml4_base, stack_base, lookup) else {
+        return UserStackWalkOutcome::WalkFailed;
+    };
+    if all_stack_pages_valid_for(&pages, nxe_enabled) {
+        UserStackWalkOutcome::Valid
+    } else {
+        UserStackWalkOutcome::PermsRefused
+    }
+}
+
 /// Guest-only stub binding the 4-page walk to the live NXE pin (S09 slice2u,
 /// REVIEW #664 step 2/3): reads live `EFER.NXE` (`efer_nxe_enabled(read_efer())`),
 /// walks the guest `USER_STACK` bytes via [`walk_user_stack_pages`] with the
@@ -908,10 +954,7 @@ where
 {
     let nxe_enabled = efer_nxe_enabled(read_efer());
     let base = core::ptr::addr_of!(USER_STACK) as u64;
-    match walk_user_stack_pages(pml4_base, base, lookup) {
-        Some(pages) => all_stack_pages_valid_for(&pages, nxe_enabled),
-        None => false,
-    }
+    user_stack_walk_report(pml4_base, base, lookup, nxe_enabled) == UserStackWalkOutcome::Valid
 }
 
 /// Fully-gated user-entry validity over per-page walks (S09 slice2r): the
@@ -2280,6 +2323,96 @@ mod tests {
         assert_eq!(
             walk_user_stack_pages(0x1000, u64::MAX - 4096, lookup_top_wrap),
             None
+        );
+    }
+
+    #[test]
+    fn user_stack_walk_report_disambiguates_walk_vs_perms() {
+        // S09 slice2ar (#30 remainder): the future guest `USTACK` serial line
+        // must distinguish "walker never reached the pages" (WalkFailed)
+        // from "walker reached supervisor pages and correctly refused"
+        // (PermsRefused) — the bool probe conflates both as `false`.
+        // Host-only; no guest PTE written yet.
+        use super::super::page_table::{encode_table_entry, pte_encode, PageFlags};
+        let stack_base = 0x0000_1000_0020_0000_u64;
+        let next = PageFlags::PRESENT | PageFlags::WRITABLE;
+        let leaf_nx =
+            PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC;
+        let leaf_sup = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXEC;
+        let build_tables = |leaf: PageFlags| {
+            let mut pml4: [u64; 512] = [0; 512];
+            let mut pdpt: [u64; 512] = [0; 512];
+            let mut pd: [u64; 512] = [0; 512];
+            let mut ptable: [u64; 512] = [0; 512];
+            pml4[32] = encode_table_entry(0x2000, next).unwrap();
+            pdpt[0] = encode_table_entry(0x3000, next).unwrap();
+            pd[1] = encode_table_entry(0x4000, next).unwrap();
+            let mut i = 0usize;
+            while i < USER_STACK_PAGES {
+                ptable[i] = pte_encode(0x60_0000 + (i as u64) * 4096, leaf);
+                i += 1;
+            }
+            (pml4, pdpt, pd, ptable)
+        };
+        // All-NX user pages: Valid while NXE=1, PermsRefused while NXE=0
+        // (bit 63 MBZ — the fail-closed degraded shape).
+        let (pml4, pdpt, pd, ptable) = build_tables(leaf_nx);
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd),
+                0x4000 => Some(&ptable),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            user_stack_walk_report(0x1000, stack_base, lookup, true),
+            UserStackWalkOutcome::Valid
+        );
+        assert_eq!(
+            user_stack_walk_report(0x1000, stack_base, lookup, false),
+            UserStackWalkOutcome::PermsRefused
+        );
+        // Supervisor-only pages (live-BSS shape: PRESENT+W+NX, no USER):
+        // the walk reaches them but the perms gate refuses — PermsRefused,
+        // never WalkFailed, under either NXE pin.
+        let (pml4s, pdpts, pds, ptables) = build_tables(leaf_sup);
+        let lookup_sup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4s),
+                0x2000 => Some(&pdpts),
+                0x3000 => Some(&pds),
+                0x4000 => Some(&ptables),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            user_stack_walk_report(0x1000, stack_base, lookup_sup, true),
+            UserStackWalkOutcome::PermsRefused
+        );
+        assert_eq!(
+            user_stack_walk_report(0x1000, stack_base, lookup_sup, false),
+            UserStackWalkOutcome::PermsRefused
+        );
+        // Unmapped PT (lookup miss): the walk never reaches the pages.
+        let lookup_miss = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            user_stack_walk_report(0x1000, stack_base, lookup_miss, true),
+            UserStackWalkOutcome::WalkFailed
+        );
+        // Near-top overflow base: VA math refuses before any walk.
+        let lookup_none = |_: u64| -> Option<&[u64; 512]> { None };
+        assert_eq!(
+            user_stack_walk_report(0x1000, u64::MAX - 4096, lookup_none, true),
+            UserStackWalkOutcome::WalkFailed
         );
     }
 
