@@ -406,7 +406,8 @@ pub(crate) fn emit_ustack_line<E>(
 /// [`crate::cpu::user_stack_walk_label`] in one call so a hand-built
 /// `ok`/`label` pair cannot mismatch the report (e.g. `ok=1` with
 /// `label=walk-failed`). Pure `core`-only body over [`emit_ustack_line`].
-pub(crate) fn emit_ustack_report<E>(
+/// `pub` since slice2av: the boot-uefi guest formats through this body.
+pub fn emit_ustack_report<E>(
     emit: &mut impl FnMut(u8) -> Result<(), E>,
     outcome: crate::cpu::UserStackWalkOutcome,
 ) -> Result<(), E> {
@@ -421,8 +422,8 @@ pub(crate) fn emit_ustack_report<E>(
 /// over COM1 — the SOLE guest COM1 call site for the `USTACK` line, so a
 /// hand-built `ok`+`label` mismatch (e.g. `ok=1` + `walk-failed`) cannot
 /// reach serial (REVIEW #711: raw `write_ustack_line(ok, label)` deleted).
-#[allow(dead_code)]
-pub(crate) fn write_ustack_report(outcome: crate::cpu::UserStackWalkOutcome) {
+/// `pub` since slice2av: the boot-uefi guest calls this live post-EBS.
+pub fn write_ustack_report(outcome: crate::cpu::UserStackWalkOutcome) {
     let mut out = |b: u8| {
         com1_write_byte(b);
         Ok::<(), core::convert::Infallible>(())
@@ -588,6 +589,22 @@ mod tests {
         // S09 slice2at (REVIEW #709 R1/R2): the `ok`+`label` pair finally has
         // a serial consumer, and the bound report is the call site the future
         // guest line gates on — a hand-built mismatch cannot reach serial.
+        // REVIEW #713 (2): the binding assert below is agreement-only
+        // (report vs hand-built share emit_ustack_line, so tautological) —
+        // pin every outcome's EXACT literal directly so a label/ok drift
+        // fails here even though both sides share the body.
+        assert_eq!(
+            run_ustack_report(crate::cpu::UserStackWalkOutcome::Valid),
+            "USTACK ok=1 label=valid\n"
+        );
+        assert_eq!(
+            run_ustack_report(crate::cpu::UserStackWalkOutcome::PermsRefused),
+            "USTACK ok=0 label=perms-refused\n"
+        );
+        assert_eq!(
+            run_ustack_report(crate::cpu::UserStackWalkOutcome::WalkFailed),
+            "USTACK ok=0 label=walk-failed\n"
+        );
         assert_eq!(run_ustack(true, "valid"), "USTACK ok=1 label=valid\n");
         assert_eq!(
             run_ustack(false, "perms-refused"),

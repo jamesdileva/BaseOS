@@ -21,6 +21,8 @@
   PFUS (S09 slice2b live-#PF U/S, REVIEW #622 risk 3): ok=1 us=0 w=0 p=0
   passes; us=1 / w=1 / p=1 fail (fail-closed value gate); ok=10 fails;
   missing p fails; newline-split fails.
+  USTACK (S09 slice2av live baseline, unmapped BSS): ok=0 with either
+  refuse label passes; ok=1 fails; missing label fails; newline-split fails.
   Exits 0 on PASS, 1 on FAIL.
 #>
 $ErrorActionPreference = "Stop"
@@ -47,6 +49,7 @@ $u = Get-Pat "userPat"
 $r = Get-Pat "rmbzPat"
 $f = Get-Pat "pfusPat"
 $t = Get-Pat "trPat"
+$s = Get-Pat "ustackPat"
 
 # Finding-1 lock: both patterns must carry the literal `w=1(\s|$)` tightening
 # so w=10 cannot match via the w=1 substring. Match the literal suffix
@@ -102,6 +105,15 @@ if (($r -notlike '*RMBZ ok=1 *') -or (-not $r.Contains('[^\r\n]*viol=0')) -or ($
 # so us=1 / w=1 / p=1 / missing-p / newline-split pairs fail.
 if (($f -notlike '*PFUS ok=1 *') -or (-not $f.Contains('us=0')) -or (-not $f.Contains('w=0')) -or (-not $f.Contains('[^\r\n]*p=0')) -or ($f -notlike '*p=0(\s|$)*')) {
   Write-Output "GATE TEST FAIL (PFUS pattern missing ok=1/us/w/p tightening: $f)"
+  exit 1
+}
+# S09 slice2av live-USTACK baseline (unmapped-BSS fail-closed gate):
+# pattern must carry the literal space after ok=0 (boundary, mirrors
+# GUARD), same-line label pin, and a label boundary so ok=1 /
+# missing-label / newline-split pairs fail. The PT-store slice flips
+# ok=0 to ok=1 valid.
+if (($s -notlike '*USTACK ok=0 *') -or (-not $s.Contains('[^\r\n]*label='))) {
+  Write-Output "GATE TEST FAIL (USTACK pattern missing ok=0/label tightening)"
   exit 1
 }
 # S09 slice2l TR gate (REVIEW #648 risk 1 load-bearing gap: TR liveness was
@@ -175,7 +187,12 @@ $cases = @(
   @("T-ten", $t, "TR ok=10 sel=0x28`n", $false, "ok=10 fails"),
   @("T-onex", $t, "TR ok=1x sel=0x28`n", $false, "ok=1x fails"),
   @("T-badsel", $t, "TR ok=1 sel=0x30`n", $false, "wrong sel fails"),
-  @("T-split", $t, "TR ok=1`n sel=0x28`n", $false, "newline-split fails")
+  @("T-split", $t, "TR ok=1`n sel=0x28`n", $false, "newline-split fails"),
+  @("S-good-perms", $s, "USTACK ok=0 label=perms-refused`n", $true, "ok=0 perms-refused passes"),
+  @("S-good-walk", $s, "USTACK ok=0 label=walk-failed`n", $true, "ok=0 walk-failed passes"),
+  @("S-ok1", $s, "USTACK ok=1 label=valid`n", $false, "ok=1 fails unmapped baseline"),
+  @("S-nolabel", $s, "USTACK ok=0`n", $false, "missing label fails"),
+  @("S-split", $s, "USTACK ok=0`n label=perms-refused`n", $false, "newline-split fails")
 )
 
 $failed = 0

@@ -897,11 +897,15 @@ where
 /// `USTACK` serial line must distinguish "walker never reached the pages"
 /// from "walker reached supervisor pages and correctly refused", so the
 /// report — not the bool — is the call site the guest line gates on.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UserStackWalkOutcome {
+pub enum UserStackWalkOutcome {
+    /// Walker never reached the pages (unmapped page, non-canonical base,
+    /// lookup miss) — proves nothing about permissions.
     WalkFailed,
+    /// Walker reached the pages and correctly refused (supervisor pages,
+    /// unmapped, or NXE=0 with NX bits set).
     PermsRefused,
+    /// Walked AND perms-gated.
     Valid,
 }
 
@@ -912,9 +916,8 @@ pub(crate) enum UserStackWalkOutcome {
 /// `nxe_enabled`. Host-testable core of the guest-only
 /// [`probe_user_stack_pages_valid`] stub below (which supplies live EFER +
 /// the `USER_STACK` base); no guest `iretq` yet.
-#[allow(dead_code)]
 #[must_use]
-pub(crate) fn user_stack_walk_report<'a, F>(
+pub fn user_stack_walk_report<'a, F>(
     pml4_base: u64,
     stack_base: u64,
     lookup: F,
@@ -942,7 +945,7 @@ where
 /// Slice2at: also consumed by [`crate::uart::emit_ustack_report`] (the bound
 /// `USTACK` serial body), so the rule has a serial consumer, not just tests.
 #[must_use]
-pub(crate) const fn user_stack_walk_ok(outcome: UserStackWalkOutcome) -> bool {
+pub const fn user_stack_walk_ok(outcome: UserStackWalkOutcome) -> bool {
     match outcome {
         UserStackWalkOutcome::Valid => true,
         UserStackWalkOutcome::WalkFailed => false,
@@ -958,7 +961,7 @@ pub(crate) const fn user_stack_walk_ok(outcome: UserStackWalkOutcome) -> bool {
 /// reached the pages". Pure const; slice2at binds it to serial via
 /// [`crate::uart::emit_ustack_report`] (host-pinned `USTACK ok=X label=Y`).
 #[must_use]
-pub(crate) const fn user_stack_walk_label(outcome: UserStackWalkOutcome) -> &'static str {
+pub const fn user_stack_walk_label(outcome: UserStackWalkOutcome) -> &'static str {
     match outcome {
         UserStackWalkOutcome::Valid => "valid",
         UserStackWalkOutcome::PermsRefused => "perms-refused",
@@ -1118,6 +1121,24 @@ static mut RING0_STACK: Ring0Stack = Ring0Stack([0; RING0_STACK_LEN]);
 #[cfg(not(test))]
 #[allow(dead_code)]
 static mut USER_STACK: UserStack = UserStack([0; USER_STACK_LEN]);
+
+/// Live base of the future CPL3 user stack (S09 slice2av, #30 remainder):
+/// the guest-only `USER_STACK` BSS address the live `USTACK` probe walks.
+/// Guest-only (`cfg(not(test))` — the host has no firmware BSS); post-EBS
+/// only, on the boot thread. Pure address load, no mapping installed yet.
+#[cfg(not(test))]
+#[must_use]
+pub fn user_stack_base() -> u64 {
+    core::ptr::addr_of!(USER_STACK) as u64
+}
+
+/// Host-test stub: efi_main never runs on the host, but it must compile
+/// under `cargo test`; the live probe is guest-only.
+#[cfg(test)]
+#[must_use]
+pub fn user_stack_base() -> u64 {
+    0
+}
 
 #[cfg(not(test))]
 static mut TSS: Tss = Tss::new();

@@ -40,6 +40,7 @@ use baseos_kernel::cpu::{cr3_pml4_base, efer_nxe_enabled, read_cr3, read_efer, I
 use baseos_kernel::cpu::{
     empty_tsc_pair, read_tsc_fenced, switch_sample_delta, tsc_delta, warm_tsc,
 };
+use baseos_kernel::cpu::{user_stack_base, user_stack_walk_report, UserStackWalkOutcome};
 use baseos_kernel::kernel_entry;
 use baseos_kernel::latency::{LatencySamples, LatencyStats};
 use baseos_kernel::page_table::{
@@ -62,7 +63,7 @@ use baseos_kernel::thread::{
     rbp_preserved_with_save,
 };
 use baseos_kernel::thread::{run_on_thread_stack, swap_target, Thread, ThreadState};
-use baseos_kernel::uart::{com1_write_byte, uart_init};
+use baseos_kernel::uart::{com1_write_byte, uart_init, write_ustack_report};
 use baseos_serial_marker::write_marker;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -882,6 +883,29 @@ unsafe fn probe_rmbz(info: &BootInfo) -> (bool, bool, usize, usize, usize) {
         ok_count,
         total,
         violations,
+    )
+}
+
+/// Live USTACK probe (S09 slice2av, #30 remainder): read live `CR3` +
+/// `EFER.NXE`, walk the guest `USER_STACK` BSS base via
+/// [`user_stack_walk_report`] with the identity-map lookup, and return the
+/// tri-state outcome. The caller emits it through the sole COM1
+/// [`write_ustack_report`] site. Unmapped-BSS baseline: the stack has no
+/// PT mapping yet, so a live walk correctly refuses (`ok=0`); the PT-store
+/// slice flips the gate to `ok=1 valid` once the mapping is installed.
+///
+/// # Safety
+/// Post-EBS only, on the boot thread: reads `CR3`/`EFER` and dereferences
+/// firmware page tables through [`phys_to_table_ptr`] (identity-mapped).
+unsafe fn probe_ustack(info: &BootInfo) -> UserStackWalkOutcome {
+    let cr3 = cr3_pml4_base(read_cr3());
+    let nxe_enabled = efer_nxe_enabled(read_efer());
+    let base = user_stack_base();
+    user_stack_walk_report(
+        cr3,
+        base,
+        |table_base| phys_to_table_ptr(info, table_base),
+        nxe_enabled,
     )
 }
 
@@ -2799,6 +2823,14 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // fail-closed Err containment, never a kernel panic.
             let (user_ok, user_passed, user_total) = user_isolation_selftest();
             write_user_line::<Infallible>(user_ok, user_passed, user_total, &mut emit).unwrap();
+            // S09 slice2av (#30 remainder, REVIEW #713: first live-USTACK
+            // wiring, not a 5th host-only polish): walk the guest USER_STACK
+            // BSS through live page tables with the live NXE pin and emit
+            // the bound USTACK line via the sole COM1 site. Unmapped-BSS
+            // baseline prints ok=0 fail-closed (ps1 hard-requires ok=0);
+            // the PT-store slice flips the gate to ok=1 valid.
+            let ustack_outcome = probe_ustack(&info);
+            write_ustack_report(ustack_outcome);
             // S04 slice 15: live leaf USER/NX audit of the PAGING probe
             // address — reporting-only baseline before any enforcement.
             // S04 slice 20 (REVIEW #147 risk 1): second probe of low-RAM
