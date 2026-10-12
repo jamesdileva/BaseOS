@@ -551,10 +551,10 @@ pub(crate) const fn user_stack_map_install_ready(
 /// base of `PTE_ADDR_MASK` itself passes here yet its 4-page span overflows
 /// the mask and the encoder refuses). Pure const; still no guest PTE written.
 #[allow(dead_code)]
-#[allow(clippy::manual_is_multiple_of)]
 #[must_use]
 pub(crate) const fn user_stack_phys_valid(phys_base: u64) -> bool {
-    phys_base % 4096 == 0 && phys_base & !super::page_table::PTE_ADDR_MASK == 0
+    phys_base & super::page_table::PAGE_OFFSET_MASK == 0
+        && phys_base & !super::page_table::PTE_ADDR_MASK == 0
 }
 
 /// Install PTE-word encoder (S09 slice2ac/slice2af/slice2ao, #30 remainder,
