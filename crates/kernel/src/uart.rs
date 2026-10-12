@@ -374,17 +374,18 @@ pub(crate) fn write_tr_line(ok: bool, sel: u16) {
     let _ = emit_tr_line(&mut out, ok, sel);
 }
 
-/// Pure USTACK line formatter shared by the guest writer and host tests
+/// Pure USTACK line formatter shared by the bound report body and host tests
 /// (S09 slice2at, #30 remainder, REVIEW #709 R2: the `ok`+`label` strings
 /// were host-pinned but no serial body bound them, so labels could drift).
 ///
 /// Emits `USTACK ok=<0|1> label=<valid|perms-refused|walk-failed>\n`
 /// through a byte callback (`core`-only, no port I/O), so host tests pin
 /// the literal field order, names, and label spelling while
-/// [`write_ustack_line`] reuses this exact body for its COM1-direct write.
+/// [`emit_ustack_report`] reuses this exact body for the bound report.
 /// `ok` is [`crate::cpu::user_stack_walk_ok`] and `label` is
-/// [`crate::cpu::user_stack_walk_label`] — callers should prefer
-/// [`emit_ustack_report`] so the pair cannot drift apart.
+/// [`crate::cpu::user_stack_walk_label`] — guest code must go through
+/// [`emit_ustack_report`] / [`write_ustack_report`] so the pair cannot
+/// drift apart (REVIEW #711: no raw `ok`+`label` COM1 writer exists).
 /// `no_std`-clean; the guest passes a `com1_write_byte` closure (infallible).
 pub(crate) fn emit_ustack_line<E>(
     emit: &mut impl FnMut(u8) -> Result<(), E>,
@@ -416,23 +417,10 @@ pub(crate) fn emit_ustack_report<E>(
     )
 }
 
-/// Emit `USTACK ok=<0|1> label=<...>\n` directly on COM1 (S09 slice2at:
-/// `ok` is 1 only when the live 4-page walk reports `Valid`; both refuse
-/// shapes print `ok=0` with a disambiguating `label`).
-///
-/// Safe wrapper: only calls [`com1_write_byte`] via [`emit_ustack_line`].
-/// Requires COM1 initialized; single-threaded bring-up context owns
-/// the UART exclusively.
-#[allow(dead_code)]
-pub(crate) fn write_ustack_line(ok: bool, label: &str) {
-    let mut out = |b: u8| {
-        com1_write_byte(b);
-        Ok::<(), core::convert::Infallible>(())
-    };
-    let _ = emit_ustack_line(&mut out, ok, label);
-}
-
-/// Bound COM1 USTACK report writer: [`emit_ustack_report`] over COM1.
+/// Bound COM1 USTACK report writer (S09 slice2au): [`emit_ustack_report`]
+/// over COM1 — the SOLE guest COM1 call site for the `USTACK` line, so a
+/// hand-built `ok`+`label` mismatch (e.g. `ok=1` + `walk-failed`) cannot
+/// reach serial (REVIEW #711: raw `write_ustack_line(ok, label)` deleted).
 #[allow(dead_code)]
 pub(crate) fn write_ustack_report(outcome: crate::cpu::UserStackWalkOutcome) {
     let mut out = |b: u8| {
