@@ -45,7 +45,7 @@ use baseos_kernel::kernel_entry;
 use baseos_kernel::latency::{LatencySamples, LatencyStats};
 use baseos_kernel::page_table::{
     guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
-    user_isolation_selftest, walk_full, walk_full_leaf_flags, walk_full_leaf_raw,
+    user_isolation_selftest, walk_full, walk_full_leaf_flags, walk_full_leaf_raw, walk_step,
 };
 use baseos_kernel::sched::{Scheduler, QUANTUM_TICKS};
 use baseos_kernel::thread::check_jump_entry;
@@ -581,6 +581,52 @@ unsafe fn phys_to_table_ptr(info: &BootInfo, phys: u64) -> Option<&[u64; 512]> {
         return None;
     }
     Some(&*(phys as *const [u64; 512]))
+}
+
+/// Mutable twin of [`phys_to_table_ptr`] (S09 slice2ax, #30 remainder): maps a
+/// live firmware PT frame to `*mut [u64; 512]` for the future 4-page U-map
+/// install stub (the bound `user_stack_install_store_flush` writes through
+/// the live PT, then `invlpg`s). Same fail-closed bounds gate
+/// ([`table_base_in_boot_map`]); uncalled this slice, so boot-neutral. The
+/// wiring slice must resolve `phys` via [`live_pt_phys_for_va`] (never a
+/// caller-supplied literal) and pass the live PT (see the PT-liveness
+/// contract on `user_stack_install_store_flush`).
+///
+/// # Safety
+/// Post-EBS only, on the boot thread: `phys` must be a live firmware
+/// page-table frame (bounds-checked above); caller owns exclusive access
+/// (single-threaded boot, `cli` in effect — same contract as `invlpg_page`).
+#[allow(dead_code)]
+unsafe fn phys_to_table_ptr_mut(info: &BootInfo, phys: u64) -> Option<*mut [u64; 512]> {
+    if !table_base_in_boot_map(info, phys) {
+        return None;
+    }
+    Some(phys as *mut [u64; 512])
+}
+
+/// Resolve the live PT frame backing `va` (S09 slice2ax, #30 remainder):
+/// chains three [`walk_step`]s (PML4 level 3 -> PDPT level 2 -> PD level 1)
+/// from `pml4_base` through `lookup` and returns the PT table base (the
+/// table whose level-0 slot holds `va`'s leaf PTE). Fail-closed `None` on ANY
+/// refusal: lookup miss (`MissingTable`), cleared-`PRESENT` or `PS` mid-level
+/// (`NotPresent`), non-canonical `va`, or misaligned `pml4_base` (surfaced as
+/// a lookup miss when the PML4 itself is unresolvable). Pure over `lookup`
+/// so host tests and the guest stub share one rule; the guest passes
+/// [`phys_to_table_ptr`] as `lookup` and writes through
+/// [`phys_to_table_ptr_mut`]. Uncalled this slice (no guest PTE written yet),
+/// so boot-neutral by construction. CPL3 entry + ok=1 flip ride next.
+#[allow(dead_code)]
+fn live_pt_phys_for_va<'a, F>(pml4_base: u64, va: u64, lookup: F) -> Option<u64>
+where
+    F: Fn(u64) -> Option<&'a [u64; 512]>,
+{
+    let pml4 = lookup(pml4_base)?;
+    let pdpt_base = walk_step(pml4, va, 3).ok()?;
+    let pdpt = lookup(pdpt_base)?;
+    let pd_base = walk_step(pdpt, va, 2).ok()?;
+    let pd = lookup(pd_base)?;
+    let pt_base = walk_step(pd, va, 1).ok()?;
+    Some(pt_base)
 }
 
 /// Emit the one-line `PAGING` diagnostic after the frame-allocator proof:
@@ -4636,6 +4682,61 @@ mod tests {
         assert_eq!(GET_MAP_MAX_ATTEMPTS, 4);
         assert_eq!(GET_MAP_POOL_SLACK, 4096);
         assert_eq!(STRUCTURAL_FAIL, usize::MAX);
+    }
+
+    #[test]
+    fn live_pt_phys_for_va_resolves_pt_and_fails_closed() {
+        // S09 slice2ax (#30 remainder): the future U-map install stub must
+        // resolve the live PT through the walker, never a literal. Four
+        // plain-array tables chained PML4 -> PDPT -> PD -> PT with the
+        // lookup closure over them; PRESENT|WRITABLE entries (0x3), 4 KiB
+        // page addrs 0x1000/0x2000/0x3000/0x4000.
+        use baseos_kernel::page_table::pte_encode;
+        use baseos_kernel::page_table::PageFlags;
+        let flags = PageFlags::PRESENT.union(PageFlags::WRITABLE);
+        let mut pml4 = [0u64; 512];
+        let mut pdpt = [0u64; 512];
+        let mut pd = [0u64; 512];
+        let pt = [0u64; 512];
+        // VA 0x0: PML4[0] -> PDPT, PDPT[0] -> PD, PD[0] -> PT.
+        pml4[0] = pte_encode(0x2000, flags);
+        pdpt[0] = pte_encode(0x3000, flags);
+        pd[0] = pte_encode(0x4000, flags);
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                0x2000 => Some(unsafe { &*(&pdpt as *const [u64; 512]) }),
+                0x3000 => Some(unsafe { &*(&pd as *const [u64; 512]) }),
+                0x4000 => Some(unsafe { &*(&pt as *const [u64; 512]) }),
+                _ => None,
+            }
+        };
+        // Good path resolves the PT frame (PD[0]'s phys).
+        assert_eq!(live_pt_phys_for_va(0x1000, 0x0, &lookup), Some(0x4000));
+        // Cleared-PRESENT mid-level refuses (PDPT[1] is zero for VA 0x4000_0000).
+        assert_eq!(live_pt_phys_for_va(0x1000, 0x4000_0000, &lookup), None);
+        // Lookup miss refuses (PML4 base unresolvable).
+        assert_eq!(live_pt_phys_for_va(0x9000, 0x0, &lookup), None);
+        // Non-canonical VA refuses (0x0000_8000_0000_0000 is the hole start).
+        assert_eq!(
+            live_pt_phys_for_va(0x1000, 0x0000_8000_0000_0000, &lookup),
+            None
+        );
+        // PS leaf mid-level refuses: PD[0] with PS set is a 2 MiB leaf, not
+        // a PT pointer, so walk_step fails closed (fresh tables: the good
+        // closure above borrows `pd`, so rebuild instead of mutating).
+        let mut pd_ps = [0u64; 512];
+        pd_ps[0] = pte_encode(0x4000, flags) | (1 << 7);
+        let lookup_ps = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                0x2000 => Some(unsafe { &*(&pdpt as *const [u64; 512]) }),
+                0x3000 => Some(unsafe { &*(&pd_ps as *const [u64; 512]) }),
+                0x4000 => Some(unsafe { &*(&pt as *const [u64; 512]) }),
+                _ => None,
+            }
+        };
+        assert_eq!(live_pt_phys_for_va(0x1000, 0x0, &lookup_ps), None);
     }
 
     #[test]
