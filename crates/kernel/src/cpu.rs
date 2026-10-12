@@ -933,6 +933,38 @@ where
     }
 }
 
+/// Bool delegation for the tri-state report (S09 slice2as, #30 remainder,
+/// REVIEW #707 nit): `true` iff `outcome == Valid`. Single-sources the
+/// `report => bool` rule so [`probe_user_stack_pages_valid`] (guest-only)
+/// cannot drift from the host-tested shape — the probe calls this, and the
+/// host test below pins `ok == (report == Valid)` on every report shape.
+/// Pure const so host tests and the guest stub share one rule.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_stack_walk_ok(outcome: UserStackWalkOutcome) -> bool {
+    match outcome {
+        UserStackWalkOutcome::Valid => true,
+        UserStackWalkOutcome::WalkFailed => false,
+        UserStackWalkOutcome::PermsRefused => false,
+    }
+}
+
+/// Serial label for the future guest `USTACK` line (S09 slice2as, #30
+/// remainder): the bool probe conflates both refuses as `false`, so the
+/// live line prints `ok` (via [`user_stack_walk_ok`]) PLUS this label —
+/// `"valid"` / `"perms-refused"` / `"walk-failed"` — to distinguish "walker
+/// reached supervisor pages and correctly refused" from "walker never
+/// reached the pages". Pure const; no guest `USTACK` line yet.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) const fn user_stack_walk_label(outcome: UserStackWalkOutcome) -> &'static str {
+    match outcome {
+        UserStackWalkOutcome::Valid => "valid",
+        UserStackWalkOutcome::PermsRefused => "perms-refused",
+        UserStackWalkOutcome::WalkFailed => "walk-failed",
+    }
+}
+
 /// Guest-only stub binding the 4-page walk to the live NXE pin (S09 slice2u,
 /// REVIEW #664 step 2/3): reads live `EFER.NXE` (`efer_nxe_enabled(read_efer())`),
 /// walks the guest `USER_STACK` bytes via [`walk_user_stack_pages`] with the
@@ -954,7 +986,7 @@ where
 {
     let nxe_enabled = efer_nxe_enabled(read_efer());
     let base = core::ptr::addr_of!(USER_STACK) as u64;
-    user_stack_walk_report(pml4_base, base, lookup, nxe_enabled) == UserStackWalkOutcome::Valid
+    user_stack_walk_ok(user_stack_walk_report(pml4_base, base, lookup, nxe_enabled))
 }
 
 /// Fully-gated user-entry validity over per-page walks (S09 slice2r): the
@@ -2413,6 +2445,36 @@ mod tests {
         assert_eq!(
             user_stack_walk_report(0x1000, u64::MAX - 4096, lookup_none, true),
             UserStackWalkOutcome::WalkFailed
+        );
+        // S09 slice2as (#30 remainder, REVIEW #707 nit): lock the bool
+        // delegation the guest-only probe uses — `ok == (report == Valid)` on
+        // every shape above — plus the future `USTACK` line labels.
+        assert!(user_stack_walk_ok(UserStackWalkOutcome::Valid));
+        assert!(!user_stack_walk_ok(UserStackWalkOutcome::PermsRefused));
+        assert!(!user_stack_walk_ok(UserStackWalkOutcome::WalkFailed));
+        assert!(user_stack_walk_ok(user_stack_walk_report(
+            0x1000, stack_base, lookup, true
+        )));
+        assert!(!user_stack_walk_ok(user_stack_walk_report(
+            0x1000, stack_base, lookup, false
+        )));
+        assert!(!user_stack_walk_ok(user_stack_walk_report(
+            0x1000, stack_base, lookup_sup, true
+        )));
+        assert!(!user_stack_walk_ok(user_stack_walk_report(
+            0x1000,
+            stack_base,
+            lookup_miss,
+            true
+        )));
+        assert_eq!(user_stack_walk_label(UserStackWalkOutcome::Valid), "valid");
+        assert_eq!(
+            user_stack_walk_label(UserStackWalkOutcome::PermsRefused),
+            "perms-refused"
+        );
+        assert_eq!(
+            user_stack_walk_label(UserStackWalkOutcome::WalkFailed),
+            "walk-failed"
         );
     }
 
