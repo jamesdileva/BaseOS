@@ -302,8 +302,11 @@ if ($serialText -and $serialText.Contains($marker)) {
   # must print ok=0 fail-closed (any label). Same-line shape mirrors the
   # PFUS gate (literal space after ok=0 stops ok=01 false-passing,
   # [^\r\n]* keeps the label same-line, (\s|$) terminates it). The
+  # S09 slice2aw gate-tightening (#30, REVIEW #715 nit): baseline pins the
+  # two fail-closed labels so an ok/label drift pair (ok=0 label=valid,
+  # which the bound report makes impossible) fails e2e, not just ok=1.
   # PT-store slice flips this gate to `USTACK ok=1 ... label=valid`.
-  $ustackPat = "USTACK ok=0 [^\r\n]*label=[a-z-]+(\s|$)"
+  $ustackPat = "USTACK ok=0 [^\r\n]*label=(perms-refused|walk-failed)(\s|$)"
   # S09 slice2l (REVIEW #648 risk 1 load-bearing gate gap: TR liveness was
   # human-reads-serial, not automated): `TR ok=1 [^\r\n]*sel=0x28(\s|$)`
   # mirrors the PFUS/RMBZ value gates — the literal space after `ok=1`

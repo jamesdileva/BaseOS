@@ -107,12 +107,13 @@ if (($f -notlike '*PFUS ok=1 *') -or (-not $f.Contains('us=0')) -or (-not $f.Con
   Write-Output "GATE TEST FAIL (PFUS pattern missing ok=1/us/w/p tightening: $f)"
   exit 1
 }
-# S09 slice2av live-USTACK baseline (unmapped-BSS fail-closed gate):
-# pattern must carry the literal space after ok=0 (boundary, mirrors
-# GUARD), same-line label pin, and a label boundary so ok=1 /
-# missing-label / newline-split pairs fail. The PT-store slice flips
-# ok=0 to ok=1 valid.
-if (($s -notlike '*USTACK ok=0 *') -or (-not $s.Contains('[^\r\n]*label='))) {
+# S09 slice2av live-USTACK baseline (unmapped-BSS fail-closed gate),
+# tightened slice2aw (REVIEW #715 nit): pattern must carry the literal
+# space after ok=0 (boundary, mirrors GUARD), same-line label pin, and
+# the exact fail-closed alternation so ok=1 / missing-label /
+# newline-split / ok-label drift (ok=0 label=valid) pairs fail. The
+# PT-store slice flips ok=0 to ok=1 valid.
+if (($s -notlike '*USTACK ok=0 *') -or (-not $s.Contains('[^\r\n]*label=(perms-refused|walk-failed)')) -or ($s -notlike '*label=(perms-refused|walk-failed)(\s|$)*')) {
   Write-Output "GATE TEST FAIL (USTACK pattern missing ok=0/label tightening)"
   exit 1
 }
@@ -191,6 +192,7 @@ $cases = @(
   @("S-good-perms", $s, "USTACK ok=0 label=perms-refused`n", $true, "ok=0 perms-refused passes"),
   @("S-good-walk", $s, "USTACK ok=0 label=walk-failed`n", $true, "ok=0 walk-failed passes"),
   @("S-ok1", $s, "USTACK ok=1 label=valid`n", $false, "ok=1 fails unmapped baseline"),
+  @("S-drift", $s, "USTACK ok=0 label=valid`n", $false, "ok=0 label=valid drift fails"),
   @("S-nolabel", $s, "USTACK ok=0`n", $false, "missing label fails"),
   @("S-split", $s, "USTACK ok=0`n label=perms-refused`n", $false, "newline-split fails")
 )
@@ -211,5 +213,5 @@ if ($failed -gt 0) {
   Write-Output "GATE TEST FAIL ($failed cases)"
   exit 1
 }
-Write-Output "GATE TEST PASS (61/61)"
+Write-Output "GATE TEST PASS (62/62)"
 exit 0
