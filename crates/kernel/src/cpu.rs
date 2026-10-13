@@ -1452,6 +1452,37 @@ pub unsafe fn read_efer() -> u64 {
     (u64::from(hi) << 32) | u64::from(lo)
 }
 
+/// `LA57` (5-level paging enable) bit in `CR4` (bit 12).
+pub const CR4_LA57_BIT: u64 = 1 << 12;
+
+/// True when `CR4.LA57` is set in a raw `CR4` value read via `mov {}, cr4`.
+///
+/// Pure / `const`-compatible so host tests and the guest share the exact
+/// decode rule (S09 slice2bl, #30: a set bit means the firmware runs
+/// 5-level paging and the 4-level [`crate::page_table::walk_full`] family
+/// mis-walks — the prime suspect for the slice2bk walker-vs-hardware
+/// writability divergence).
+#[must_use]
+pub const fn cr4_la57_enabled(cr4: u64) -> bool {
+    cr4 & CR4_LA57_BIT != 0
+}
+
+/// Read the live `CR4` on the boot CPU (S09 slice2bl, #30).
+///
+/// Pure register read (`mov {}, cr4`); valid on x86-64 at CPL0. The guest
+/// feeds the value into [`cr4_la57_enabled`] for the `PTDUMP` line so the
+/// 4-vs-5-level paging hypothesis is decided by serial evidence, not
+/// inspection.
+///
+/// # Safety
+/// Same contract as [`read_cr3`]: CPL0 guest, boot thread post-`EBS`.
+/// Host tests never call this; host coverage is the decode-rule test.
+pub unsafe fn read_cr4() -> u64 {
+    let value: u64;
+    core::arch::asm!("mov {}, cr4", out(reg) value, options(nomem, nostack, preserves_flags));
+    value
+}
+
 /// Live `RSP` read (S07 slice68, #21 nit 3 RSP-switch proof).
 ///
 /// Unprivileged `mov {}, rsp` — safe on all builds, so host `cargo test`
@@ -3196,6 +3227,18 @@ mod tests {
     }
 
     #[test]
+    fn cr4_la57_decode_pins_bit12() {
+        // S09 slice2bl (#30): `PTDUMP la57=` must decode exactly CR4 bit
+        // 12 — set means 5-level paging, which falsifies the 4-level
+        // walker assumption behind the slice2bk divergence.
+        assert_eq!(CR4_LA57_BIT, 1 << 12);
+        assert!(cr4_la57_enabled(CR4_LA57_BIT));
+        assert!(cr4_la57_enabled(u64::MAX));
+        assert!(!cr4_la57_enabled(0));
+        assert!(!cr4_la57_enabled(!CR4_LA57_BIT));
+    }
+
+    #[test]
     fn cr3_efer_wrappers_are_safe_without_unsafe_block() {
         // S05 slice 5: the decode wrappers are safe pure `const fn` — bind
         // to the plain `fn` type to prove safeness at compile time (an
@@ -3215,7 +3258,8 @@ mod tests {
         // (would fault outside the guest).
         let cr3: unsafe fn() -> u64 = read_cr3;
         let efer: unsafe fn() -> u64 = read_efer;
-        let _ = (cr3, efer);
+        let cr4: unsafe fn() -> u64 = read_cr4;
+        let _ = (cr3, efer, cr4);
     }
 
     #[test]

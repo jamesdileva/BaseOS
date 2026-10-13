@@ -35,7 +35,9 @@
 #![allow(unsafe_code)]
 
 use baseos_boot_info::{write_boot_summary, write_str, write_u64_dec, write_u64_hex, BootInfo};
-use baseos_kernel::cpu::{cr3_pml4_base, efer_nxe_enabled, read_cr3, read_efer, IrqGuard};
+use baseos_kernel::cpu::{
+    cr3_pml4_base, cr4_la57_enabled, efer_nxe_enabled, read_cr3, read_cr4, read_efer, IrqGuard,
+};
 #[cfg(not(test))]
 use baseos_kernel::cpu::{
     empty_tsc_pair, read_tsc_fenced, switch_sample_delta, tsc_delta, warm_tsc,
@@ -1100,6 +1102,78 @@ fn write_umap_line<E>(
     write_str(emit, "\n")
 }
 
+/// Live PT-frame probe for the quarantined split (S09 slice2bl, #30,
+/// REVIEW #749 cheapest disconfirming experiment): everything the
+/// slice2bk post-mortem needs to decide the walker-vs-hardware
+/// writability divergence, gathered with NO live store (read-only walk +
+/// one read of a present page, so it cannot `#PF`-escape like the fill).
+/// `frame` is the exact frame the live path would fill (same allocator
+/// order); `cr3` is raw (LA57/PCID bits intact) while the walks use
+/// [`cr3_pml4_base`]; `wok/wphys/wflags` are [`walk_full_leaf_flags`];
+/// `raw/lvl` are [`walk_full_leaf_raw`] (`lvl` 0=4K PTE, 1=2M leaf,
+/// 2=1G leaf, 0xFF=no walk); `map` is [`table_base_in_boot_map`];
+/// `rdok` is a gated identity read (only when `wok`, so a present page —
+/// reads never fault on RO, only writes do). `la57` is [`cr4_la57_enabled`]:
+/// set means 5-level paging and the 4-level walker assumption is false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PtDump {
+    frame: u64,
+    cr3: u64,
+    la57: bool,
+    wok: bool,
+    wphys: u64,
+    wflags: u64,
+    raw: u64,
+    lvl: u8,
+    map: bool,
+    rdok: bool,
+}
+
+impl PtDump {
+    fn empty() -> Self {
+        Self {
+            frame: STRUCTURAL_FAIL as u64,
+            cr3: STRUCTURAL_FAIL as u64,
+            la57: false,
+            wok: false,
+            wphys: STRUCTURAL_FAIL as u64,
+            wflags: 0,
+            raw: STRUCTURAL_FAIL as u64,
+            lvl: 0xFF,
+            map: false,
+            rdok: false,
+        }
+    }
+}
+
+/// Emit the one-line `PTDUMP` diagnostic right after the `UMAP` line:
+/// `PTDUMP frame=0x... cr3=0x... la57=<0|1> wok=<0|1> wphys=0x...
+/// wflags=0x... raw=0x... lvl=<n> map=<0|1> rdok=<0|1>`.
+/// Reporting-only companion to `UMAP`; the e2e script does not gate on it.
+fn write_ptdump_line<E>(dump: PtDump, emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<(), E> {
+    write_str(emit, "PTDUMP frame=")?;
+    write_u64_hex(emit, dump.frame)?;
+    write_str(emit, " cr3=")?;
+    write_u64_hex(emit, dump.cr3)?;
+    write_str(emit, " la57=")?;
+    write_u64_dec(emit, u64::from(dump.la57))?;
+    write_str(emit, " wok=")?;
+    write_u64_dec(emit, u64::from(dump.wok))?;
+    write_str(emit, " wphys=")?;
+    write_u64_hex(emit, dump.wphys)?;
+    write_str(emit, " wflags=")?;
+    write_u64_hex(emit, dump.wflags)?;
+    write_str(emit, " raw=")?;
+    write_u64_hex(emit, dump.raw)?;
+    write_str(emit, " lvl=")?;
+    write_u64_dec(emit, u64::from(dump.lvl))?;
+    write_str(emit, " map=")?;
+    write_u64_dec(emit, u64::from(dump.map))?;
+    write_str(emit, " rdok=")?;
+    write_u64_dec(emit, u64::from(dump.rdok))?;
+    write_str(emit, "\n")
+}
+
 /// Live U-map install (S09 slice2bb, #30 wiring): allocate 4 frames from a
 /// `FrameAllocator` over `info`, resolve the live PT backing the 4 KiB-aligned
 /// `user_stack_base()` via [`live_pt_phys_for_va`] (never a caller literal),
@@ -1128,15 +1202,19 @@ unsafe fn install_user_stack_mapping(info: &BootInfo) -> bool {
 const SPLIT_LIVE_SWAP_ENABLED: bool = false;
 
 /// Diag twin of [`install_user_stack_mapping`] (S09 slice2bd, #30; slice2be
-/// adds `rsn`; slice2bf adds `pd`): same install, plus `(stage, rsn, nxe, base, pt_phys, pd_pte)` for the
-/// `UMAP` line. Stage 0 on success, else 1=alloc, 2=pt-resolve, 3=mut-map,
+/// adds `rsn`; slice2bf adds `pd`; slice2bl adds the [`PtDump`] probe): same install, plus `(stage, rsn, nxe, base, pt_phys, pd_pte)` for the
+/// `UMAP` line plus the [`PtDump`] for the `PTDUMP` line. Stage 0 on success, else 1=alloc, 2=pt-resolve, 3=mut-map,
 /// 4=store-flush; `rsn` is the [`live_pt_resolve_detail`] reason on stage 2,
 /// else 0; `pd_pte` is the raw PD PTE ([`live_pd_pte_for_va]) or
-/// STRUCTURAL_FAIL when the upper walk misses.
+/// STRUCTURAL_FAIL when the upper walk misses. The dump is populated only
+/// on the quarantined stage=2 rsn=7 path (the exact probe frame the live
+/// path would fill); every other path returns [`PtDump::empty`].
 ///
 /// # Safety
 /// Same contract as [`install_user_stack_mapping`].
-unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, bool, u64, u64, u64) {
+unsafe fn install_user_stack_mapping_diag(
+    info: &BootInfo,
+) -> (bool, u8, u8, bool, u64, u64, u64, PtDump) {
     let mut alloc = FrameAllocator::from_boot_info(info);
     let nxe_enabled = efer_nxe_enabled(read_efer());
     let stack_base = user_stack_base();
@@ -1149,6 +1227,7 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
             stack_base,
             STRUCTURAL_FAIL as u64,
             STRUCTURAL_FAIL as u64,
+            PtDump::empty(),
         );
     };
     let cr3 = cr3_pml4_base(read_cr3());
@@ -1178,6 +1257,7 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
                     stack_base,
                     STRUCTURAL_FAIL as u64,
                     pd_raw,
+                    PtDump::empty(),
                 );
             }
             // S09 slice2bk (#30): live PD-split quarantined to
@@ -1192,15 +1272,55 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
             // return stage=2 rsn=7 with no alloc/store/swap until the
             // mapping theory is fixed. UMAP stays ok=0, USTACK stays ok=0,
             // boot stays PASS.
+            //
+            // S09 slice2bl (#30, REVIEW #749): before returning, run the
+            // read-only [`PtDump`] probe on the exact frame the live path
+            // would fill (same allocator order — one `alloc(1)` past the
+            // 4 stack frames) and report it on the `PTDUMP` line. No live
+            // store: walk + gated identity read only, then free. The
+            // `pt=` field carries the probe frame so serial ties UMAP to
+            // PTDUMP without a second allocation.
             if !SPLIT_LIVE_SWAP_ENABLED {
+                let mut dump = PtDump::empty();
+                let cr3_raw = read_cr3();
+                dump.cr3 = cr3_raw;
+                dump.la57 = cr4_la57_enabled(read_cr4());
+                if let Some(frame) = alloc.alloc(1) {
+                    dump.frame = frame;
+                    dump.map = table_base_in_boot_map(info, frame);
+                    let base = cr3_pml4_base(cr3_raw);
+                    if let Ok((phys, flags)) =
+                        walk_full_leaf_flags(base, frame, |b| phys_to_table_ptr(info, b))
+                    {
+                        dump.wok = true;
+                        dump.wphys = phys;
+                        dump.wflags = flags.bits();
+                    }
+                    if let Ok((_, raw, lvl)) =
+                        walk_full_leaf_raw(base, frame, |b| phys_to_table_ptr(info, b))
+                    {
+                        dump.raw = raw;
+                        dump.lvl = lvl;
+                    }
+                    if dump.wok {
+                        // Present page per the walker: reads never fault
+                        // on RO (only writes do), so sampling one word
+                        // proves identity readability without risking the
+                        // slice2bk `#PF`-escape.
+                        let _ = unsafe { *(frame as *const u64) };
+                        dump.rdok = true;
+                    }
+                    let _ = alloc.free(frame, 1);
+                }
                 return (
                     false,
                     2,
                     7,
                     nxe_enabled,
                     stack_base,
-                    STRUCTURAL_FAIL as u64,
+                    dump.frame,
                     pd_raw,
+                    dump,
                 );
             }
             let Some(pt_frame) = alloc.alloc(1) else {
@@ -1212,6 +1332,7 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
                     stack_base,
                     STRUCTURAL_FAIL as u64,
                     pd_raw,
+                    PtDump::empty(),
                 );
             };
             let pd_loc =
@@ -1226,6 +1347,7 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
                     stack_base,
                     STRUCTURAL_FAIL as u64,
                     pd_raw,
+                    PtDump::empty(),
                 );
             };
             let pd_ptr_opt = unsafe { phys_to_table_ptr_mut(info, pd_table_phys) };
@@ -1240,6 +1362,7 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
                     stack_base,
                     STRUCTURAL_FAIL as u64,
                     pd_raw,
+                    PtDump::empty(),
                 );
             };
             // S09 slice2bk (#30): fail-closed writability gate. The 2026-10-13
@@ -1270,6 +1393,7 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
                     stack_base,
                     STRUCTURAL_FAIL as u64,
                     pd_raw,
+                    PtDump::empty(),
                 );
             }
             if unsafe { split_2m_leaf_fill(pd_raw, &mut *pt_new_ptr).is_none() } {
@@ -1282,6 +1406,7 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
                     stack_base,
                     STRUCTURAL_FAIL as u64,
                     pd_raw,
+                    PtDump::empty(),
                 );
             }
             let Some(new_pd) = encode_pd_table_entry(pt_frame, pd_raw) else {
@@ -1294,6 +1419,7 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
                     stack_base,
                     STRUCTURAL_FAIL as u64,
                     pd_raw,
+                    PtDump::empty(),
                 );
             };
             // Swap-then-flush ordering (REVIEW #743 risk 2; REVIEW #745
@@ -1343,13 +1469,23 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
                     stack_base,
                     STRUCTURAL_FAIL as u64,
                     pd_raw,
+                    PtDump::empty(),
                 );
             };
             re_phys
         }
     };
     let Some(pt_ptr) = phys_to_table_ptr_mut(info, pt_phys) else {
-        return (false, 3, 0, nxe_enabled, stack_base, pt_phys, pd_raw);
+        return (
+            false,
+            3,
+            0,
+            nxe_enabled,
+            stack_base,
+            pt_phys,
+            pd_raw,
+            PtDump::empty(),
+        );
     };
     let pages = [USER_STACK_MAP_FLAGS; USER_STACK_PAGES];
     // SAFETY: post-EBS boot thread, `pt` is the live PT resolved above,
@@ -1358,9 +1494,27 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
         user_stack_install_store_flush(&mut *pt_ptr, stack_base, phys_base, &pages, nxe_enabled)
     };
     if ok {
-        (true, 0, 0, nxe_enabled, stack_base, pt_phys, pd_raw)
+        (
+            true,
+            0,
+            0,
+            nxe_enabled,
+            stack_base,
+            pt_phys,
+            pd_raw,
+            PtDump::empty(),
+        )
     } else {
-        (false, 4, 0, nxe_enabled, stack_base, pt_phys, pd_raw)
+        (
+            false,
+            4,
+            0,
+            nxe_enabled,
+            stack_base,
+            pt_phys,
+            pd_raw,
+            PtDump::empty(),
+        )
     }
 }
 
@@ -3310,11 +3464,14 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // Slice2bd: emit the UMAP diag first so serial pinpoints the stage.
             // Slice2be: rsn splits stage 2 (PS-leaf vs bounds-gate).
             // Slice2bf: pd carries the raw PD PTE (PS vs PRESENT split).
-            let (umap_ok, umap_stage, umap_rsn, umap_nxe, umap_base, umap_pt, umap_pd) =
+            // Slice2bl: PTDUMP carries the read-only live-PTE probe of the
+            // exact frame the quarantined split would fill (REVIEW #749).
+            let (umap_ok, umap_stage, umap_rsn, umap_nxe, umap_base, umap_pt, umap_pd, umap_dump) =
                 install_user_stack_mapping_diag(&info);
             let _ = write_umap_line::<Infallible>(
                 umap_ok, umap_stage, umap_rsn, umap_nxe, umap_base, umap_pt, umap_pd, &mut emit,
             );
+            let _ = write_ptdump_line::<Infallible>(umap_dump, &mut emit);
             let ustack_outcome = probe_ustack(&info);
             write_ustack_report(ustack_outcome);
             // S04 slice 15: live leaf USER/NX audit of the PAGING probe
@@ -5219,6 +5376,48 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "UMAP ok=0 stage=4 rsn=0 nxe=0 base=0x12340000 pt=0xabcd0000 pd=0x83\n"
+        );
+    }
+
+    #[test]
+    fn ptdump_line_pins_exact_shape() {
+        // S09 slice2bl (#30, REVIEW #749): host backstop for the live
+        // PTDUMP probe shape. The guest writer shares this body, so a
+        // format drift fails here; the empty probe pins the sentinels
+        // (frame/wphys/raw FAIL, lvl 0xFF = no walk).
+        let mut out = Vec::new();
+        write_ptdump_line::<core::convert::Infallible>(
+            PtDump {
+                frame: 0x0f80_3000,
+                cr3: 0x07f0_1000,
+                la57: false,
+                wok: true,
+                wphys: 0x0f80_3000,
+                wflags: 0x3,
+                raw: 0x0f80_3003,
+                lvl: 0,
+                map: true,
+                rdok: true,
+            },
+            &mut |b| {
+                out.push(b);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "PTDUMP frame=0xf803000 cr3=0x7f01000 la57=0 wok=1 wphys=0xf803000 wflags=0x3 raw=0xf803003 lvl=0 map=1 rdok=1\n"
+        );
+        let mut out_empty = Vec::new();
+        write_ptdump_line::<core::convert::Infallible>(PtDump::empty(), &mut |b| {
+            out_empty.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out_empty).unwrap(),
+            "PTDUMP frame=0xffffffffffffffff cr3=0xffffffffffffffff la57=0 wok=0 wphys=0xffffffffffffffff wflags=0x0 raw=0xffffffffffffffff lvl=255 map=0 rdok=0\n"
         );
     }
 
