@@ -559,19 +559,48 @@ pub const fn encode_table_entry(phys_base: u64, flags: PageFlags) -> Result<u64,
     }
 }
 
+/// Extra leaf status bits preserved across a 2M->4K split (REVIEW #738
+/// risk 1): `PCD`(4)/`PWT`(3) caching, `G`(8) global, `A`(5)/`D`(6)
+/// accessed/dirty. The live OVMF leaf `0xde000e3` carries `A+D` alongside
+/// `PRESENT+WRITABLE+PS`; dropping them would silently clear
+/// caching/global/history semantics. `PS`(7) is dropped (4K entries never
+/// carry it), bit 9 (OS-available) stays masked to 0, and 2M `PAT` (bit 12)
+/// is NOT preserved: it aliases address bit 12, so a `PAT=1` leaf refuses
+/// (`None`) via the 2M-misalignment gate instead of mis-fanning out
+/// (PAT relocation deferred, fail-closed).
+pub const SPLIT_PRESERVED_STATUS_MASK: u64 = (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8);
+/// Full flag word a split carries: HW loadable bits plus the preserved
+/// status bits above (`PS` always dropped).
+pub const SPLIT_FLAGS_MASK: u64 = PTE_HW_FLAGS_MASK | SPLIT_PRESERVED_STATUS_MASK;
+
 /// Split a 2 MiB `PS` leaf PD PTE into 512 4 KiB PT entries (S09 slice2bg,
 /// #30 remainder): pure host-testable half of the 2M-leaf unblock (slice2bf
 /// proved `pd=...e3` PRESENT+W+PS=1 at the stack range). `None` on
 /// cleared-PRESENT, `PS=0` (already a table pointer), or a 2M-misaligned
-/// base (low 21 address bits nonzero — would silently truncate the fan-out).
+/// base (low 21 address bits nonzero — would silently truncate the fan-out;
+/// this also gates 2M `PAT=1` at bit 12, which refuses fail-closed).
 /// On success returns `(pt_entries, leaf_2m_base)`: each entry maps
-/// `base + i*4096` with the leaf HW flags (`PRESENT`/`WRITABLE`/`USER`/
-/// `NO_EXEC` via [`PTE_HW_FLAGS_MASK`], `PS` dropped), so the split is
-/// permission-preserving; the caller ORs `USER`/`NO_EXEC` for the 4 stack
-/// slots and builds the replacement PD table-pointer entry. No guest
-/// wiring this slice (guest untouched, e2e stays on the `ok=0` baseline).
+/// `base + i*4096` with the leaf flags (`PRESENT`/`WRITABLE`/`USER`/
+/// `NO_EXEC` plus preserved `PCD`/`PWT`/`G`/`A`/`D` via
+/// [`SPLIT_FLAGS_MASK`], `PS` dropped), so the split is
+/// permission- and caching-preserving; the caller ORs `USER`/`NO_EXEC` for
+/// the 4 stack slots and builds the replacement PD table-pointer entry.
+/// Stack note (REVIEW #738 risk 2): returns ~4 KiB by value — host tests
+/// only; guest wiring must call [`split_2m_leaf_fill`] with a
+/// caller-provided buffer. No guest wiring this slice (guest untouched,
+/// e2e stays on the `ok=0` baseline).
 #[must_use]
 pub fn split_2m_leaf_to_pt(pd_pte: u64) -> Option<([u64; 512], u64)> {
+    let mut pt = [0u64; 512];
+    let base = split_2m_leaf_fill(pd_pte, &mut pt)?;
+    Some((pt, base))
+}
+
+/// Caller-provided-buffer split (REVIEW #738 risk 2 guest path): same
+/// contract as [`split_2m_leaf_to_pt`] but fills `out` in place and returns
+/// only the 2M base, so the guest pays no ~4 KiB by-value return on its
+/// kernel stack. `None` leaves `out` untouched.
+pub fn split_2m_leaf_fill(pd_pte: u64, out: &mut [u64; 512]) -> Option<u64> {
     if pd_pte & 1 == 0 {
         return None;
     }
@@ -582,14 +611,13 @@ pub fn split_2m_leaf_to_pt(pd_pte: u64) -> Option<([u64; 512], u64)> {
         return None;
     }
     let base = (pd_pte & PTE_ADDR_MASK) & !LARGE_2M_OFFSET_MASK;
-    let flags = pd_pte & PTE_HW_FLAGS_MASK;
-    let mut pt = [0u64; 512];
+    let flags = pd_pte & SPLIT_FLAGS_MASK;
     let mut i = 0usize;
     while i < 512 {
-        pt[i] = (base + (i as u64) * PAGE_SIZE) | flags;
+        out[i] = (base + (i as u64) * PAGE_SIZE) | flags;
         i += 1;
     }
-    Some((pt, base))
+    Some(base)
 }
 
 /// One hardware walk step: read the `level` table entry for `virt`.
@@ -1397,6 +1425,50 @@ mod tests {
             encode_table_entry(0xde00000, K_RW.union(PageFlags::NO_EXEC)).unwrap() | PTE_PS_BIT;
         let (nx_pt, _) = split_2m_leaf_to_pt(nx_leaf).expect("NX leaf must split");
         assert!(pte_decoded_flags(nx_pt[0]).contains(PageFlags::NO_EXEC));
+    }
+
+    #[test]
+    fn split_2m_leaf_fill_preserves_status_and_avoids_by_value_return() {
+        // REVIEW #738 risks 1+2: live `0xde000e3` carries A+D; the fill
+        // variant preserves them (+PCD/PWT/G), refuses PAT=1 fail-closed,
+        // and agrees with the owned variant without a 4K return.
+        let live: u64 = 0xde000e3;
+        let sentinel = [0xA5u64; 512];
+        let mut buf = sentinel;
+        // Refusals leave the caller buffer untouched.
+        assert_eq!(split_2m_leaf_fill(live & !1, &mut buf), None);
+        assert_eq!(buf, sentinel);
+        assert_eq!(
+            split_2m_leaf_fill(encode_table_entry(0xB000, K_RW).unwrap(), &mut buf),
+            None
+        );
+        assert_eq!(buf, sentinel);
+        // Live leaf splits: A+D preserved on every entry, PS dropped.
+        let base = split_2m_leaf_fill(live, &mut buf).expect("live leaf must split");
+        assert_eq!(base, 0xde00000);
+        for entry in buf.iter() {
+            assert_eq!(entry & PTE_PS_BIT, 0);
+            assert_eq!(entry & 0x60, 0x60, "A+D must survive the split");
+        }
+        assert_eq!(pte_decoded_phys(buf[0]), 0xde00000);
+        assert_eq!(pte_decoded_phys(buf[511]), 0xde00000 + 511 * PAGE_SIZE);
+        assert_eq!(pte_decoded_flags(buf[0]), K_RW);
+        // Owned wrapper agrees with the fill path entry-for-entry.
+        let (owned, owned_base) = split_2m_leaf_to_pt(live).expect("owned must split");
+        assert_eq!(owned_base, base);
+        assert_eq!(owned, buf);
+        // PCD/PWT/G preserved when set (caching/global semantics).
+        let cached: u64 = live | (1 << 3) | (1 << 4) | (1 << 8);
+        let mut cbuf = [0u64; 512];
+        split_2m_leaf_fill(cached, &mut cbuf).expect("cached leaf must split");
+        for entry in cbuf.iter() {
+            assert_eq!(entry & 0x118, 0x118);
+        }
+        // 2M PAT (bit 12) aliases address bit 12: refuses fail-closed.
+        assert_eq!(split_2m_leaf_to_pt(live | (1 << 12)), None);
+        let mut pbuf = sentinel;
+        assert_eq!(split_2m_leaf_fill(live | (1 << 12), &mut pbuf), None);
+        assert_eq!(pbuf, sentinel);
     }
 
     #[test]
