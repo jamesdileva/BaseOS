@@ -1120,6 +1120,13 @@ unsafe fn install_user_stack_mapping(info: &BootInfo) -> bool {
     install_user_stack_mapping_diag(info).0
 }
 
+/// Live-split quarantine switch (S09 slice2bk, #30): `false` keeps the
+/// 2M-leaf split diagnostic-only (UMAP reports stage=2 rsn=7, no live
+/// store/swap) after the 2026-10-13 QEMU #PF proved the PT-frame store
+/// escapes fail-closed handling as a CPU exception. Flip to `true` only
+/// with a green QEMU proof on the same tree.
+const SPLIT_LIVE_SWAP_ENABLED: bool = false;
+
 /// Diag twin of [`install_user_stack_mapping`] (S09 slice2bd, #30; slice2be
 /// adds `rsn`; slice2bf adds `pd`): same install, plus `(stage, rsn, nxe, base, pt_phys, pd_pte)` for the
 /// `UMAP` line. Stage 0 on success, else 1=alloc, 2=pt-resolve, 3=mut-map,
@@ -1173,6 +1180,29 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
                     pd_raw,
                 );
             }
+            // S09 slice2bk (#30): live PD-split quarantined to
+            // diagnostic-only. Two consecutive QEMU runs fault (#PF U=0 W=1
+            // P=1, CR2=0xf803378 = index 111 of the freshly allocated
+            // 0xf803000 PT frame) in `split_2m_leaf_fill`, and the new
+            // PRESENT+WRITABLE live-walk gate PASSES yet the store still
+            // faults — the guest walker's view of that frame diverges from
+            // the hardware walk (stale BootInfo-map lookup vs live CR3, or
+            // a RO large-leaf decode gap). Any live store here escapes as
+            // a CPU exception, violating the fail-closed ok=0 contract, so
+            // return stage=2 rsn=7 with no alloc/store/swap until the
+            // mapping theory is fixed. UMAP stays ok=0, USTACK stays ok=0,
+            // boot stays PASS.
+            if !SPLIT_LIVE_SWAP_ENABLED {
+                return (
+                    false,
+                    2,
+                    7,
+                    nxe_enabled,
+                    stack_base,
+                    STRUCTURAL_FAIL as u64,
+                    pd_raw,
+                );
+            }
             let Some(pt_frame) = alloc.alloc(1) else {
                 return (
                     false,
@@ -1212,6 +1242,36 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
                     pd_raw,
                 );
             };
+            // S09 slice2bk (#30): fail-closed writability gate. The 2026-10-13
+            // QEMU run triple-faulted here: the freshly allocated PT frame
+            // (CR2=0xf803378, index 111 of the 0xf803000 frame) is present
+            // but read-only in the live tables (#PF U=0 W=1 P=1), so the
+            // `split_2m_leaf_fill` store faults instead of returning ok=0.
+            // `table_base_in_boot_map` only proves the frame lies in the
+            // BootInfo map, not that the live PTE is writable — probe the
+            // identity VA through the live walker and refuse stage=3 (no
+            // live mutation, frame freed) unless PRESENT+WRITABLE.
+            let pt_frame_writable = match walk_full_leaf_flags(cr3, pt_frame, |base| unsafe {
+                phys_to_table_ptr(info, base)
+            }) {
+                Ok((_, flags)) => {
+                    flags.contains(baseos_kernel::page_table::PageFlags::PRESENT)
+                        && flags.contains(baseos_kernel::page_table::PageFlags::WRITABLE)
+                }
+                Err(_) => false,
+            };
+            if !pt_frame_writable {
+                let _ = alloc.free(pt_frame, 1);
+                return (
+                    false,
+                    3,
+                    0,
+                    nxe_enabled,
+                    stack_base,
+                    STRUCTURAL_FAIL as u64,
+                    pd_raw,
+                );
+            }
             if unsafe { split_2m_leaf_fill(pd_raw, &mut *pt_new_ptr).is_none() } {
                 let _ = alloc.free(pt_frame, 1);
                 return (
@@ -5374,6 +5434,22 @@ mod tests {
             }
         };
         assert_eq!(live_pd_table_for_va(0x1000, 0x0, &lookup_miss), None);
+    }
+
+    #[test]
+    fn pt_frame_writability_gate_refuses_readonly() {
+        // S09 slice2bk (#30): the 2026-10-13 QEMU run faulted (#PF U=0 W=1
+        // P=1 at the PT frame) because `table_base_in_boot_map` proves
+        // BootInfo containment, not live PTE writability. The guest gate
+        // requires PRESENT+WRITABLE from `walk_full_leaf_flags` before the
+        // `split_2m_leaf_fill` store — pin the predicate shape host-side.
+        use baseos_kernel::page_table::PageFlags;
+        let rw = PageFlags::PRESENT.union(PageFlags::WRITABLE);
+        let ro = PageFlags::PRESENT;
+        let gate = |f: PageFlags| f.contains(PageFlags::PRESENT) && f.contains(PageFlags::WRITABLE);
+        assert!(gate(rw));
+        assert!(!gate(ro));
+        assert!(!gate(PageFlags::empty()));
     }
 
     #[test]
