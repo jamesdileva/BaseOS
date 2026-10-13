@@ -50,7 +50,7 @@ use baseos_kernel::latency::{LatencySamples, LatencyStats};
 use baseos_kernel::page_table::{
     guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
     user_isolation_selftest, walk_full, walk_full_leaf_flags, walk_full_leaf_raw, walk_step,
-    PAGE_OFFSET_MASK,
+    WalkerError, PAGE_OFFSET_MASK,
 };
 use baseos_kernel::sched::{Scheduler, QUANTUM_TICKS};
 use baseos_kernel::thread::check_jump_entry;
@@ -627,16 +627,52 @@ fn live_pt_phys_for_va<'a, F>(pml4_base: u64, va: u64, lookup: F) -> Option<u64>
 where
     F: Fn(u64) -> Option<&'a [u64; 512]>,
 {
+    live_pt_resolve_detail(pml4_base, va, lookup).0
+}
+
+/// Stage-2 reason split for the `UMAP rsn=` field (S09 slice2be, #30):
+/// same three-step chain as [`live_pt_phys_for_va`] but returns
+/// `(pt_or_none, rsn)`. `rsn` 0=resolved, 1=misaligned-PML4,
+/// 2=PML4-lookup-miss (bounds gate), 3=PML4-step (cleared PRESENT/PS),
+/// 4=PDPT-lookup-miss, 5=PDPT-step, 6=PD-lookup-miss, 7=PD-step
+/// (includes the 2 MiB PS-leaf suspect), 8=non-canonical VA,
+/// 9=invalid level (unreachable). Pure over `lookup`, shared by the
+/// guest diag and host tests.
+fn live_pt_resolve_detail<'a, F>(pml4_base: u64, va: u64, lookup: F) -> (Option<u64>, u8)
+where
+    F: Fn(u64) -> Option<&'a [u64; 512]>,
+{
     if pml4_base & PAGE_OFFSET_MASK != 0 {
-        return None;
+        return (None, 1);
     }
-    let pml4 = lookup(pml4_base)?;
-    let pdpt_base = walk_step(pml4, va, 3).ok()?;
-    let pdpt = lookup(pdpt_base)?;
-    let pd_base = walk_step(pdpt, va, 2).ok()?;
-    let pd = lookup(pd_base)?;
-    let pt_base = walk_step(pd, va, 1).ok()?;
-    Some(pt_base)
+    let Some(pml4) = lookup(pml4_base) else {
+        return (None, 2);
+    };
+    let pdpt_base = match walk_step(pml4, va, 3) {
+        Ok(b) => b,
+        Err(WalkerError::NonCanonical) => return (None, 8),
+        Err(WalkerError::InvalidLevel) => return (None, 9),
+        Err(_) => return (None, 3),
+    };
+    let Some(pdpt) = lookup(pdpt_base) else {
+        return (None, 4);
+    };
+    let pd_base = match walk_step(pdpt, va, 2) {
+        Ok(b) => b,
+        Err(WalkerError::NonCanonical) => return (None, 8),
+        Err(WalkerError::InvalidLevel) => return (None, 9),
+        Err(_) => return (None, 5),
+    };
+    let Some(pd) = lookup(pd_base) else {
+        return (None, 6);
+    };
+    let pt_base = match walk_step(pd, va, 1) {
+        Ok(b) => b,
+        Err(WalkerError::NonCanonical) => return (None, 8),
+        Err(WalkerError::InvalidLevel) => return (None, 9),
+        Err(_) => return (None, 7),
+    };
+    (Some(pt_base), 0)
 }
 
 /// Emit the one-line `PAGING` diagnostic after the frame-allocator proof:
@@ -942,15 +978,20 @@ unsafe fn probe_rmbz(info: &BootInfo) -> (bool, bool, usize, usize, usize) {
     )
 }
 
-/// Emit the one-line `UMAP` install diagnostic (S09 slice2bd, #30):
-/// `UMAP ok=<0|1> stage=<n> nxe=<0|1> base=0x... pt=0x...` — `stage` is 0 on
-/// success, else 1=alloc, 2=pt-resolve, 3=mut-map, 4=store-flush; `pt` is the
-/// resolved live PT phys or STRUCTURAL_FAIL when unresolved. Reporting-only
-/// (ps1 requires presence, never `ok=1`) so the refusal stage is visible on
-/// serial without flipping the USTACK gate.
+/// Emit the one-line `UMAP` install diagnostic (S09 slice2bd, #30;
+/// slice2be adds `rsn=`):
+/// `UMAP ok=<0|1> stage=<n> rsn=<n> nxe=<0|1> base=0x... pt=0x...` — `stage` is 0 on
+/// success, else 1=alloc, 2=pt-resolve, 3=mut-map, 4=store-flush; `rsn` is 0
+/// except on stage 2, where it is the [`live_pt_resolve_detail`] reason
+/// (1=misaligned-PML4, 2=PML4-miss, 3=PML4-step, 4=PDPT-miss, 5=PDPT-step,
+/// 6=PD-miss, 7=PD-step incl. 2M PS leaf, 8=non-canonical, 9=invalid-level);
+/// `pt` is the resolved live PT phys or STRUCTURAL_FAIL when unresolved.
+/// Reporting-only (UMAP ungated, USTACK stays at the ok=0 baseline) so the
+/// refusal reason is visible on serial without flipping any gate.
 fn write_umap_line<E>(
     ok: bool,
     stage: u8,
+    rsn: u8,
     nxe: bool,
     base: u64,
     pt: u64,
@@ -960,6 +1001,8 @@ fn write_umap_line<E>(
     write_u64_dec(emit, u64::from(ok))?;
     write_str(emit, " stage=")?;
     write_u64_dec(emit, u64::from(stage))?;
+    write_str(emit, " rsn=")?;
+    write_u64_dec(emit, u64::from(rsn))?;
     write_str(emit, " nxe=")?;
     write_u64_dec(emit, u64::from(nxe))?;
     write_str(emit, " base=")?;
@@ -989,26 +1032,36 @@ unsafe fn install_user_stack_mapping(info: &BootInfo) -> bool {
     install_user_stack_mapping_diag(info).0
 }
 
-/// Diag twin of [`install_user_stack_mapping`] (S09 slice2bd, #30): same
-/// install, plus `(stage, nxe, base, pt_phys)` for the `UMAP` line. Stage 0
-/// on success, else 1=alloc, 2=pt-resolve, 3=mut-map, 4=store-flush.
+/// Diag twin of [`install_user_stack_mapping`] (S09 slice2bd, #30; slice2be
+/// adds `rsn`): same install, plus `(stage, rsn, nxe, base, pt_phys)` for the
+/// `UMAP` line. Stage 0 on success, else 1=alloc, 2=pt-resolve, 3=mut-map,
+/// 4=store-flush; `rsn` is the [`live_pt_resolve_detail`] reason on stage 2,
+/// else 0.
 ///
 /// # Safety
 /// Same contract as [`install_user_stack_mapping`].
-unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, bool, u64, u64) {
+unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, bool, u64, u64) {
     let mut alloc = FrameAllocator::from_boot_info(info);
     let nxe_enabled = efer_nxe_enabled(read_efer());
     let stack_base = user_stack_base();
     let Some(phys_base) = user_stack_alloc_frames(&mut alloc) else {
-        return (false, 1, nxe_enabled, stack_base, STRUCTURAL_FAIL as u64);
+        return (false, 1, 0, nxe_enabled, stack_base, STRUCTURAL_FAIL as u64);
     };
     let cr3 = cr3_pml4_base(read_cr3());
-    let Some(pt_phys) = live_pt_phys_for_va(cr3, stack_base, |base| phys_to_table_ptr(info, base))
-    else {
-        return (false, 2, nxe_enabled, stack_base, STRUCTURAL_FAIL as u64);
+    let (pt_opt, rsn) =
+        live_pt_resolve_detail(cr3, stack_base, |base| phys_to_table_ptr(info, base));
+    let Some(pt_phys) = pt_opt else {
+        return (
+            false,
+            2,
+            rsn,
+            nxe_enabled,
+            stack_base,
+            STRUCTURAL_FAIL as u64,
+        );
     };
     let Some(pt_ptr) = phys_to_table_ptr_mut(info, pt_phys) else {
-        return (false, 3, nxe_enabled, stack_base, pt_phys);
+        return (false, 3, 0, nxe_enabled, stack_base, pt_phys);
     };
     let pages = [USER_STACK_MAP_FLAGS; USER_STACK_PAGES];
     // SAFETY: post-EBS boot thread, `pt` is the live PT resolved above,
@@ -1017,9 +1070,9 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, bool, u
         user_stack_install_store_flush(&mut *pt_ptr, stack_base, phys_base, &pages, nxe_enabled)
     };
     if ok {
-        (true, 0, nxe_enabled, stack_base, pt_phys)
+        (true, 0, 0, nxe_enabled, stack_base, pt_phys)
     } else {
-        (false, 4, nxe_enabled, stack_base, pt_phys)
+        (false, 4, 0, nxe_enabled, stack_base, pt_phys)
     }
 }
 
@@ -2967,10 +3020,11 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // Install refusal (alloc/PT-resolve/store) leaves the re-walk
             // refusing (`ok=0`) fail-closed; ps1 hard-requires `ok=0` baseline.
             // Slice2bd: emit the UMAP diag first so serial pinpoints the stage.
-            let (umap_ok, umap_stage, umap_nxe, umap_base, umap_pt) =
+            // Slice2be: rsn splits stage 2 (PS-leaf vs bounds-gate).
+            let (umap_ok, umap_stage, umap_rsn, umap_nxe, umap_base, umap_pt) =
                 install_user_stack_mapping_diag(&info);
             let _ = write_umap_line::<Infallible>(
-                umap_ok, umap_stage, umap_nxe, umap_base, umap_pt, &mut emit,
+                umap_ok, umap_stage, umap_rsn, umap_nxe, umap_base, umap_pt, &mut emit,
             );
             let ustack_outcome = probe_ustack(&info);
             write_ustack_report(ustack_outcome);
@@ -4782,6 +4836,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
     fn live_pt_phys_for_va_resolves_pt_and_fails_closed() {
         // S09 slice2ax (#30 remainder): the future U-map install stub must
         // resolve the live PT through the walker, never a literal. Four
@@ -4854,11 +4909,13 @@ mod tests {
     #[test]
     fn umap_line_pins_exact_shape() {
         // S09 slice2bd (#30): host backstop for the live UMAP diag shape.
+        // Slice2be adds `rsn=` between `stage=` and `nxe=`.
         // The guest writer shares this body, so a format drift fails here.
         let mut out = Vec::new();
         write_umap_line::<core::convert::Infallible>(
             false,
             4,
+            0,
             false,
             0x1234_0000,
             0xabcd_0000,
@@ -4870,7 +4927,70 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "UMAP ok=0 stage=4 nxe=0 base=0x12340000 pt=0xabcd0000\n"
+            "UMAP ok=0 stage=4 rsn=0 nxe=0 base=0x12340000 pt=0xabcd0000\n"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    fn live_pt_resolve_detail_splits_stage2_reason() {
+        // S09 slice2be (#30): `rsn` must distinguish the PT-resolve
+        // sub-causes (bounds-gate miss vs PRESENT/PS step vs alignment).
+        use baseos_kernel::page_table::pte_encode;
+        use baseos_kernel::page_table::PageFlags;
+        let flags = PageFlags::PRESENT.union(PageFlags::WRITABLE);
+        let mut pml4 = [0u64; 512];
+        let mut pdpt = [0u64; 512];
+        let mut pd = [0u64; 512];
+        let pt = [0u64; 512];
+        pml4[0] = pte_encode(0x2000, flags);
+        pdpt[0] = pte_encode(0x3000, flags);
+        pd[0] = pte_encode(0x4000, flags);
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                0x2000 => Some(unsafe { &*(&pdpt as *const [u64; 512]) }),
+                0x3000 => Some(unsafe { &*(&pd as *const [u64; 512]) }),
+                0x4000 => Some(unsafe { &*(&pt as *const [u64; 512]) }),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            live_pt_resolve_detail(0x1000, 0x0, &lookup),
+            (Some(0x4000), 0)
+        );
+        assert_eq!(live_pt_resolve_detail(0x1001, 0x0, &lookup).1, 1);
+        assert_eq!(live_pt_resolve_detail(0x9000, 0x0, &lookup).1, 2);
+        // Cleared-PRESENT PDPT step for VA 0x4000_0000 is rsn=5
+        // (PML4[0] present, PDPT[1] zero).
+        assert_eq!(live_pt_resolve_detail(0x1000, 0x4000_0000, &lookup).1, 5);
+        // PDPT lookup miss: point PML4[0] at an unmapped table base.
+        let mut pml4_miss = [0u64; 512];
+        pml4_miss[0] = pte_encode(0x5000, flags);
+        let lookup_miss = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(unsafe { &*(&pml4_miss as *const [u64; 512]) }),
+                _ => None,
+            }
+        };
+        assert_eq!(live_pt_resolve_detail(0x1000, 0x0, &lookup_miss).1, 4);
+        // PD step with PS set (2 MiB leaf suspect) is rsn=7.
+        let mut pd_ps = [0u64; 512];
+        pd_ps[0] = pte_encode(0x4000, flags) | (1 << 7);
+        let lookup_ps = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                0x2000 => Some(unsafe { &*(&pdpt as *const [u64; 512]) }),
+                0x3000 => Some(unsafe { &*(&pd_ps as *const [u64; 512]) }),
+                0x4000 => Some(unsafe { &*(&pt as *const [u64; 512]) }),
+                _ => None,
+            }
+        };
+        assert_eq!(live_pt_resolve_detail(0x1000, 0x0, &lookup_ps).1, 7);
+        // Non-canonical VA is rsn=8.
+        assert_eq!(
+            live_pt_resolve_detail(0x1000, 0x0000_8000_0000_0000, &lookup).1,
+            8
         );
     }
 
