@@ -1138,6 +1138,12 @@ struct PtDump {
     fwok: bool,
     fraw: u64,
     flvl: u8,
+    awok: bool,
+    araw: u64,
+    alvl: u8,
+    cwok: bool,
+    craw: u64,
+    clvl: u8,
 }
 
 /// Historic slice2bk fault-frame base (S09 slice2bm, #30, REVIEW #751
@@ -1145,7 +1151,19 @@ struct PtDump {
 /// (`#PF` U=0 W=1 P=1, CR2=`0xf803378`). Walked read-only on every
 /// quarantined PTDUMP so the high-RAM leaf state is pinned even when the
 /// current-boot probe `frame` lands in low RAM.
+///
+/// REVIEW #755 (slice2bn): the index-111 paradox — a whole-2M RO leaf
+/// predicts a fault at index 0, but the slice2bk store filled 0..110 OK
+/// before faulting at 111. Walk three VAs in one boot to disconfirm:
+/// `FAULT_VA_PROBE` (base+0), `FAULT_VA_IDX110` (base+110*8 = 0xF803370,
+/// last OK store), `FAULT_VA_CR2` (CR2 0xF803378, faulting store). Same RO
+/// leaf on all three disconfirms RO-as-cause (misattribution wins);
+/// differing leaves confirm split/variance. Read-only, no `#PF` escape.
 const FAULT_VA_PROBE: u64 = 0xF803000;
+/// Last successful store address before the slice2bk fault (index 110).
+const FAULT_VA_IDX110: u64 = 0xF803370;
+/// Faulting store address itself (index 111, slice2bk CR2).
+const FAULT_VA_CR2: u64 = 0xF803378;
 
 impl PtDump {
     fn empty() -> Self {
@@ -1164,6 +1182,12 @@ impl PtDump {
             fwok: false,
             fraw: STRUCTURAL_FAIL as u64,
             flvl: 0xFF,
+            awok: false,
+            araw: STRUCTURAL_FAIL as u64,
+            alvl: 0xFF,
+            cwok: false,
+            craw: STRUCTURAL_FAIL as u64,
+            clvl: 0xFF,
         }
     }
 }
@@ -1171,7 +1195,8 @@ impl PtDump {
 /// Emit the one-line `PTDUMP` diagnostic right after the `UMAP` line:
 /// `PTDUMP frame=0x... cr3=0x... la57=<0|1> wok=<0|1> wphys=0x...
 /// wflags=0x... raw=0x... lvl=<n> map=<0|1> rdok=<0|1> rval=0x...
-/// fwok=<0|1> fraw=0x... flvl=<n>`.
+/// fwok=<0|1> fraw=0x... flvl=<n> awok=<0|1> araw=0x... alvl=<n>
+/// cwok=<0|1> craw=0x... clvl=<n>`.
 /// Reporting-only companion to `UMAP`; the e2e script does not gate on it.
 fn write_ptdump_line<E>(dump: PtDump, emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<(), E> {
     write_str(emit, "PTDUMP frame=")?;
@@ -1202,6 +1227,18 @@ fn write_ptdump_line<E>(dump: PtDump, emit: &mut impl FnMut(u8) -> Result<(), E>
     write_u64_hex(emit, dump.fraw)?;
     write_str(emit, " flvl=")?;
     write_u64_dec(emit, u64::from(dump.flvl))?;
+    write_str(emit, " awok=")?;
+    write_u64_dec(emit, u64::from(dump.awok))?;
+    write_str(emit, " araw=")?;
+    write_u64_hex(emit, dump.araw)?;
+    write_str(emit, " alvl=")?;
+    write_u64_dec(emit, u64::from(dump.alvl))?;
+    write_str(emit, " cwok=")?;
+    write_u64_dec(emit, u64::from(dump.cwok))?;
+    write_str(emit, " craw=")?;
+    write_u64_hex(emit, dump.craw)?;
+    write_str(emit, " clvl=")?;
+    write_u64_dec(emit, u64::from(dump.clvl))?;
     write_str(emit, "\n")
 }
 
@@ -1347,7 +1384,11 @@ unsafe fn install_user_stack_mapping_diag(
                     // REVIEW #751 finding 1 cheapest experiment (a): walk the
                     // historic fault-frame base itself so the high-RAM leaf
                     // state is pinned on this boot regardless of where the
-                    // quarantined probe frame landed.
+                    // quarantined probe frame landed. REVIEW #755 (slice2bn):
+                    // walk all three index-111-paradox VAs — base+0,
+                    // base+110*8 (last OK store), CR2 (faulting store) — so
+                    // one boot disconfirms RO-as-cause (same leaf on all
+                    // three) vs split/variance (differing leaves).
                     {
                         let fbase = cr3_pml4_base(cr3_raw);
                         if walk_full_leaf_flags(fbase, FAULT_VA_PROBE, |b| unsafe {
@@ -1364,6 +1405,36 @@ unsafe fn install_user_stack_mapping_diag(
                         {
                             dump.fraw = fraw;
                             dump.flvl = flvl;
+                        }
+                        if walk_full_leaf_flags(fbase, FAULT_VA_IDX110, |b| unsafe {
+                            phys_to_table_ptr(info, b)
+                        })
+                        .is_ok()
+                        {
+                            dump.awok = true;
+                        }
+                        if let Ok((_, araw, alvl)) =
+                            walk_full_leaf_raw(fbase, FAULT_VA_IDX110, |b| unsafe {
+                                phys_to_table_ptr(info, b)
+                            })
+                        {
+                            dump.araw = araw;
+                            dump.alvl = alvl;
+                        }
+                        if walk_full_leaf_flags(fbase, FAULT_VA_CR2, |b| unsafe {
+                            phys_to_table_ptr(info, b)
+                        })
+                        .is_ok()
+                        {
+                            dump.cwok = true;
+                        }
+                        if let Ok((_, craw, clvl)) =
+                            walk_full_leaf_raw(fbase, FAULT_VA_CR2, |b| unsafe {
+                                phys_to_table_ptr(info, b)
+                            })
+                        {
+                            dump.craw = craw;
+                            dump.clvl = clvl;
                         }
                     }
                     let _ = alloc.free(frame, 1);
@@ -5458,6 +5529,12 @@ mod tests {
                 fwok: true,
                 fraw: 0x0f80_3003,
                 flvl: 0,
+                awok: true,
+                araw: 0x0f80_3003,
+                alvl: 0,
+                cwok: true,
+                craw: 0x0f80_3003,
+                clvl: 0,
             },
             &mut |b| {
                 out.push(b);
@@ -5467,7 +5544,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "PTDUMP frame=0xf803000 cr3=0x7f01000 la57=0 wok=1 wphys=0xf803000 wflags=0x3 raw=0xf803003 lvl=0 map=1 rdok=1 rval=0xf803003 fwok=1 fraw=0xf803003 flvl=0\n"
+            "PTDUMP frame=0xf803000 cr3=0x7f01000 la57=0 wok=1 wphys=0xf803000 wflags=0x3 raw=0xf803003 lvl=0 map=1 rdok=1 rval=0xf803003 fwok=1 fraw=0xf803003 flvl=0 awok=1 araw=0xf803003 alvl=0 cwok=1 craw=0xf803003 clvl=0\n"
         );
         let mut out_empty = Vec::new();
         write_ptdump_line::<core::convert::Infallible>(PtDump::empty(), &mut |b| {
@@ -5477,7 +5554,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(out_empty).unwrap(),
-            "PTDUMP frame=0xffffffffffffffff cr3=0xffffffffffffffff la57=0 wok=0 wphys=0xffffffffffffffff wflags=0x0 raw=0xffffffffffffffff lvl=255 map=0 rdok=0 rval=0xffffffffffffffff fwok=0 fraw=0xffffffffffffffff flvl=255\n"
+            "PTDUMP frame=0xffffffffffffffff cr3=0xffffffffffffffff la57=0 wok=0 wphys=0xffffffffffffffff wflags=0x0 raw=0xffffffffffffffff lvl=255 map=0 rdok=0 rval=0xffffffffffffffff fwok=0 fraw=0xffffffffffffffff flvl=255 awok=0 araw=0xffffffffffffffff alvl=255 cwok=0 craw=0xffffffffffffffff clvl=255\n"
         );
     }
 
