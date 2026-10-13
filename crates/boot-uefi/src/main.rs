@@ -40,7 +40,11 @@ use baseos_kernel::cpu::{cr3_pml4_base, efer_nxe_enabled, read_cr3, read_efer, I
 use baseos_kernel::cpu::{
     empty_tsc_pair, read_tsc_fenced, switch_sample_delta, tsc_delta, warm_tsc,
 };
+use baseos_kernel::cpu::{
+    user_stack_alloc_frames, user_stack_install_store_flush, USER_STACK_MAP_FLAGS, USER_STACK_PAGES,
+};
 use baseos_kernel::cpu::{user_stack_base, user_stack_walk_report, UserStackWalkOutcome};
+use baseos_kernel::frame_alloc::FrameAllocator;
 use baseos_kernel::kernel_entry;
 use baseos_kernel::latency::{LatencySamples, LatencyStats};
 use baseos_kernel::page_table::{
@@ -938,13 +942,52 @@ unsafe fn probe_rmbz(info: &BootInfo) -> (bool, bool, usize, usize, usize) {
     )
 }
 
-/// Live USTACK probe (S09 slice2av, #30 remainder): read live `CR3` +
+/// Live U-map install (S09 slice2bb, #30 wiring): allocate 4 frames from a
+/// `FrameAllocator` over `info`, resolve the live PT backing the 4 KiB-aligned
+/// `user_stack_base()` via [`live_pt_phys_for_va`] (never a caller literal),
+/// map it mutably via [`phys_to_table_ptr_mut`], and run the bound
+/// [`user_stack_install_store_flush`] entry (encode + store + `invlpg`) with
+/// `[USER_STACK_MAP_FLAGS; USER_STACK_PAGES]` and the live NXE pin.
+/// Fail-closed `false` on ANY refusal (alloc `None`, PT resolve `None`,
+/// bounds-gated mut map `None`, bound entry `false`) with no partial state
+/// except consumed frames on a store refusal (allocator-level, fail-loud via
+/// the `ok=0` re-walk line, never silent).
+///
+/// # Safety
+/// Post-EBS only, on the boot thread: reads `CR3`/`EFER`, dereferences live
+/// firmware tables through [`phys_to_table_ptr`] / [`phys_to_table_ptr_mut`]
+/// (identity-mapped), executes `invlpg` via the bound entry.
+unsafe fn install_user_stack_mapping(info: &BootInfo) -> bool {
+    let mut alloc = FrameAllocator::from_boot_info(info);
+    let Some(phys_base) = user_stack_alloc_frames(&mut alloc) else {
+        return false;
+    };
+    let nxe_enabled = efer_nxe_enabled(read_efer());
+    let cr3 = cr3_pml4_base(read_cr3());
+    let stack_base = user_stack_base();
+    let Some(pt_phys) = live_pt_phys_for_va(cr3, stack_base, |base| phys_to_table_ptr(info, base))
+    else {
+        return false;
+    };
+    let Some(pt_ptr) = phys_to_table_ptr_mut(info, pt_phys) else {
+        return false;
+    };
+    let pages = [USER_STACK_MAP_FLAGS; USER_STACK_PAGES];
+    // SAFETY: post-EBS boot thread, `pt` is the live PT resolved above,
+    // `cli` in effect (same contract as `invlpg_page`).
+    unsafe {
+        user_stack_install_store_flush(&mut *pt_ptr, stack_base, phys_base, &pages, nxe_enabled)
+    }
+}
+
+/// Live USTACK probe (S09 slice2av, #30 remainder; slice2bb re-walks after
+/// the live U-map install): read live `CR3` +
 /// `EFER.NXE`, walk the guest `USER_STACK` BSS base via
 /// [`user_stack_walk_report`] with the identity-map lookup, and return the
 /// tri-state outcome. The caller emits it through the sole COM1
-/// [`write_ustack_report`] site. Unmapped-BSS baseline: the stack has no
-/// PT mapping yet, so a live walk correctly refuses (`ok=0`); the PT-store
-/// slice flips the gate to `ok=1 valid` once the mapping is installed.
+/// [`write_ustack_report`] site. Slice2bb: the caller installs the live
+/// U-map first, so the re-walk proves `ok=1 valid`; any install/store
+/// refusal leaves the walk refusing (`ok=0`) fail-closed.
 ///
 /// # Safety
 /// Post-EBS only, on the boot thread: reads `CR3`/`EFER` and dereferences
@@ -2875,12 +2918,12 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // fail-closed Err containment, never a kernel panic.
             let (user_ok, user_passed, user_total) = user_isolation_selftest();
             write_user_line::<Infallible>(user_ok, user_passed, user_total, &mut emit).unwrap();
-            // S09 slice2av (#30 remainder, REVIEW #713: first live-USTACK
-            // wiring, not a 5th host-only polish): walk the guest USER_STACK
-            // BSS through live page tables with the live NXE pin and emit
-            // the bound USTACK line via the sole COM1 site. Unmapped-BSS
-            // baseline prints ok=0 fail-closed (ps1 hard-requires ok=0);
-            // the PT-store slice flips the gate to ok=1 valid.
+            // S09 slice2bb (#30 wiring): install the live 4-page U-map
+            // (alloc-4 + bound store+flush through the live PT), then re-walk
+            // and emit the bound USTACK line via the sole COM1 site.
+            // Install refusal (alloc/PT-resolve/store) leaves the re-walk
+            // refusing (`ok=0`) fail-closed; ps1 hard-requires `ok=1 valid`.
+            let _ = install_user_stack_mapping(&info);
             let ustack_outcome = probe_ustack(&info);
             write_ustack_report(ustack_outcome);
             // S04 slice 15: live leaf USER/NX audit of the PAGING probe

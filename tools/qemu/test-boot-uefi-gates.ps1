@@ -21,8 +21,9 @@
   PFUS (S09 slice2b live-#PF U/S, REVIEW #622 risk 3): ok=1 us=0 w=0 p=0
   passes; us=1 / w=1 / p=1 fail (fail-closed value gate); ok=10 fails;
   missing p fails; newline-split fails.
-  USTACK (S09 slice2av live baseline, unmapped BSS): ok=0 with either
-  refuse label passes; ok=1 fails; missing label fails; newline-split fails.
+  USTACK (S09 slice2bb live U-map wiring): ok=1 label=valid passes;
+  ok=0 either-refuse fails; ok=0 label=valid drift fails; missing label
+  fails; newline-split fails.
   Exits 0 on PASS, 1 on FAIL.
 #>
 $ErrorActionPreference = "Stop"
@@ -107,14 +108,13 @@ if (($f -notlike '*PFUS ok=1 *') -or (-not $f.Contains('us=0')) -or (-not $f.Con
   Write-Output "GATE TEST FAIL (PFUS pattern missing ok=1/us/w/p tightening: $f)"
   exit 1
 }
-# S09 slice2av live-USTACK baseline (unmapped-BSS fail-closed gate),
-# tightened slice2aw (REVIEW #715 nit): pattern must carry the literal
-# space after ok=0 (boundary, mirrors GUARD), same-line label pin, and
-# the exact fail-closed alternation so ok=1 / missing-label /
-# newline-split / ok-label drift (ok=0 label=valid) pairs fail. The
-# PT-store slice flips ok=0 to ok=1 valid.
-if (($s -notlike '*USTACK ok=0 *') -or (-not $s.Contains('[^\r\n]*label=(perms-refused|walk-failed)')) -or ($s -notlike '*label=(perms-refused|walk-failed)(\s|$)*')) {
-  Write-Output "GATE TEST FAIL (USTACK pattern missing ok=0/label tightening)"
+# S09 slice2bb live U-map wiring (ok=1 valid gate): pattern must carry the
+# literal space after ok=1 (boundary, mirrors GUARD), same-line label pin,
+# and the exact `label=valid` value pin so ok=0 / missing-label /
+# newline-split / ok-label drift (ok=0 label=valid, ok=1 perms-refused)
+# pairs fail. The slice2av/slice2aw ok=0 baseline is superseded.
+if (($s -notlike '*USTACK ok=1 *') -or (-not $s.Contains('[^\r\n]*label=valid')) -or ($s -notlike '*label=valid(\s|$)*')) {
+  Write-Output "GATE TEST FAIL (USTACK pattern missing ok=1/label=valid tightening)"
   exit 1
 }
 # S09 slice2l TR gate (REVIEW #648 risk 1 load-bearing gap: TR liveness was
@@ -189,12 +189,13 @@ $cases = @(
   @("T-onex", $t, "TR ok=1x sel=0x28`n", $false, "ok=1x fails"),
   @("T-badsel", $t, "TR ok=1 sel=0x30`n", $false, "wrong sel fails"),
   @("T-split", $t, "TR ok=1`n sel=0x28`n", $false, "newline-split fails"),
-  @("S-good-perms", $s, "USTACK ok=0 label=perms-refused`n", $true, "ok=0 perms-refused passes"),
-  @("S-good-walk", $s, "USTACK ok=0 label=walk-failed`n", $true, "ok=0 walk-failed passes"),
-  @("S-ok1", $s, "USTACK ok=1 label=valid`n", $false, "ok=1 fails unmapped baseline"),
+  @("S-good-valid", $s, "USTACK ok=1 label=valid`n", $true, "ok=1 valid passes"),
+  @("S-refuse-perms", $s, "USTACK ok=0 label=perms-refused`n", $false, "ok=0 perms-refused fails wired gate"),
+  @("S-refuse-walk", $s, "USTACK ok=0 label=walk-failed`n", $false, "ok=0 walk-failed fails wired gate"),
   @("S-drift", $s, "USTACK ok=0 label=valid`n", $false, "ok=0 label=valid drift fails"),
-  @("S-nolabel", $s, "USTACK ok=0`n", $false, "missing label fails"),
-  @("S-split", $s, "USTACK ok=0`n label=perms-refused`n", $false, "newline-split fails")
+  @("S-wronglabel", $s, "USTACK ok=1 label=perms-refused`n", $false, "ok=1 wrong label fails"),
+  @("S-nolabel", $s, "USTACK ok=1`n", $false, "missing label fails"),
+  @("S-split", $s, "USTACK ok=1`n label=valid`n", $false, "newline-split fails")
 )
 
 $failed = 0
@@ -213,5 +214,5 @@ if ($failed -gt 0) {
   Write-Output "GATE TEST FAIL ($failed cases)"
   exit 1
 }
-Write-Output "GATE TEST PASS (62/62)"
+Write-Output "GATE TEST PASS (63/63)"
 exit 0

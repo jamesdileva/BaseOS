@@ -122,19 +122,23 @@ pub(crate) const fn ring0_stack_top_for(base: u64) -> u64 {
 #[repr(C, align(16))]
 struct Ring0Stack([u8; RING0_STACK_LEN]);
 
-/// Future CPL3 user-stack blob (S09 slice2t, #30 remainder): 16 KiB
-/// (`USER_STACK_LEN`), same `align(16)` shape as [`Ring0Stack`] so the base
-/// — and hence the [`user_stack_top_for`] top — is 16-byte aligned
-/// (SysV/Win64 ABI entry requirement, shared with [`user_rsp_valid`]).
-/// Guest-only static `USER_STACK` below owns the bytes; unused this slice
-/// (no mapping, no `iretq`), so boot-neutral by construction
-/// (QEMU serial-identical). Future stub must map all 4 pages U+W+NX and
-/// source per-page flags from the walker (`walk_full_leaf_flags` per page)
-/// into [`user_entry_cpl3_allowed`] with live `EFER.NXE` — never the inner
-/// [`user_entry_fully_valid_pages`] degraded path alone.
+/// Future CPL3 user-stack blob (S09 slice2t, #30 remainder; slice2bb wires
+/// `align(4096)`): 16 KiB (`USER_STACK_LEN`), `align(4096)` so the base is
+/// 4 KiB-aligned for the 4-page U-map install (`user_stack_map_install_ready`
+/// refuses a misaligned base) while staying 16-byte aligned for the
+/// [`user_stack_top_for`] top (4096 % 16 == 0; SysV/Win64 ABI entry
+/// requirement, shared with [`user_rsp_valid`]).
+/// Guest-only static `USER_STACK` below owns the bytes; the wiring slice maps
+/// all 4 pages U+W+NX via the bound [`user_stack_install_store_flush`] entry
+/// with frames from [`user_stack_alloc_frames`], then re-walks into
+/// [`user_stack_walk_ok`] == true (`USTACK ok=1 valid`).
+/// Single-PT note: 16 KiB at a 4 KiB base can still straddle a 2 MiB PT
+/// boundary if firmware places BSS unluckily — the store refuses fail-closed
+/// (`ok=0`, nothing written) and e2e fails loudly; measured OVMF placement
+/// is single-PT (this slice's QEMU proof).
 #[cfg(not(test))]
 #[allow(dead_code)]
-#[repr(C, align(16))]
+#[repr(C, align(4096))]
 struct UserStack([u8; USER_STACK_LEN]);
 
 /// RFLAGS image for a future `iretq` to CPL3 (S09 slice2m, #30 remainder):
@@ -178,7 +182,7 @@ pub(crate) const fn user_stack_top_for(base: u64) -> u64 {
 /// `USER_STACK_LEN / 4096 == 4` — the stub walks all four via
 /// [`walk_user_stack_pages`], never one flag for the whole range.
 #[allow(dead_code)]
-pub(crate) const USER_STACK_PAGES: usize = USER_STACK_LEN / 4096;
+pub const USER_STACK_PAGES: usize = USER_STACK_LEN / 4096;
 
 /// Required leaf flags for the future CPL3 user-stack mapping (S09 slice2x,
 /// #30 remainder): PRESENT+USER+WRITABLE+NO_EXEC. Single-sources the flag
@@ -187,7 +191,7 @@ pub(crate) const USER_STACK_PAGES: usize = USER_STACK_LEN / 4096;
 /// Must satisfy [`user_stack_perms_valid_for`] with NXE=1 and must NOT
 /// satisfy [`user_code_perms_valid`] (NX set) — code-side reuse refuses.
 #[allow(dead_code)]
-pub(crate) const USER_STACK_MAP_FLAGS: PageFlags = PageFlags::PRESENT
+pub const USER_STACK_MAP_FLAGS: PageFlags = PageFlags::PRESENT
     .union(PageFlags::USER)
     .union(PageFlags::WRITABLE)
     .union(PageFlags::NO_EXEC);
@@ -564,22 +568,20 @@ pub(crate) const fn user_stack_phys_valid(phys_base: u64) -> bool {
 /// just-allocated range must free cleanly, so failure signals allocator
 /// corruption and must not hide in debug builds; release still frees).
 /// Plain `fn` (`&mut` alloc cannot be `const`); host-testable. The
-/// guest wiring slice calls this post-EBS with a live `FrameAllocator` over
-/// `BootInfo`, then feeds the base into the bound
+/// guest wiring slice (slice2bb) calls this post-EBS with a live
+/// `FrameAllocator` over `BootInfo`, then feeds the base into the bound
 /// [`user_stack_install_store_flush`] entry with the live PT from
-/// `live_pt_phys_for_va` + `phys_to_table_ptr_mut`; re-walk + `ok=1` flip and
-/// CPL3 entry ride after. Uncalled this slice, so boot-neutral.
-/// Note: the current guest `USER_STACK` BSS is `align(16)`, NOT 4 KiB — the
-/// wiring slice must source a 4 KiB-aligned `stack_base` (new `align(4096)`
-/// static or aligned carve) or `user_stack_map_install_ready` refuses.
+/// `live_pt_phys_for_va` + `phys_to_table_ptr_mut`; re-walk + `ok=1` flip land
+/// in the same wiring slice, CPL3 entry rides after.
+/// Note (slice2bb): the guest `USER_STACK` BSS is now `align(4096)`, so
+/// `user_stack_base()` satisfies the 4 KiB `user_stack_map_install_ready`
+/// base rule by construction (single-PT placement proven live this slice).
 /// REVIEW #723 nit 1: the invalid-base free-back IS reachable — `from_boot_info`
 /// ingests `region.start` verbatim (no align-up), so a misaligned Usable
 /// region yields a misaligned alloc base; pinned by the misaligned-map test.
 #[allow(dead_code)]
 #[must_use]
-pub(crate) fn user_stack_alloc_frames(
-    alloc: &mut super::frame_alloc::FrameAllocator,
-) -> Option<u64> {
+pub fn user_stack_alloc_frames(alloc: &mut super::frame_alloc::FrameAllocator) -> Option<u64> {
     let base = alloc.alloc(USER_STACK_PAGES as u64)?;
     if !user_stack_phys_valid(base) {
         let freed_ok = alloc.free(base, USER_STACK_PAGES as u64).is_ok();
@@ -774,8 +776,8 @@ fn user_stack_install_store_ptes(
 /// refuses (flush never runs — nothing was written, so there is nothing to
 /// flush). A store success implies the VA set holds, so the flush returns
 /// `true` on every reachable accept path. `unsafe` for the `invlpg` loop;
-/// uncalled this slice (no guest PTE written yet), so boot-neutral by
-/// construction. CPL3 entry + QEMU proof ride next.
+/// called by the guest wiring slice (slice2bb) post-EBS with the live PT;
+/// CPL3 entry + QEMU `ok=1` proof land in the same wiring slice.
 ///
 /// PT-liveness (slice2ak pin of REVIEW #692 residual 2): the bound entry pins
 /// the SAME `stack_base` for store+flush, but NOT that `pt` is the live PT —
@@ -791,7 +793,7 @@ fn user_stack_install_store_ptes(
 /// the no-op stub.
 #[allow(dead_code)]
 #[must_use]
-pub(crate) unsafe fn user_stack_install_store_flush(
+pub unsafe fn user_stack_install_store_flush(
     pt: &mut [u64; 512],
     stack_base: u64,
     phys_base: u64,
@@ -2732,6 +2734,58 @@ mod tests {
         let free0b = fb.free_pages();
         assert_eq!(user_stack_alloc_frames(&mut fb), None);
         assert_eq!(fb.free_pages(), free0b, "free-back must restore state");
+    }
+
+    #[test]
+    fn user_stack_wiring_alloc_store_rewalk_agrees() {
+        // S09 slice2bb (#30 wiring): the guest sequence alloc -> bound
+        // store+flush -> re-walk must agree host-side before the live QEMU
+        // proof. Fake 4-level chain maps `stack_base` through PT `ptable`;
+        // the bound entry writes `ptable` (host `invlpg` stub is a no-op),
+        // then the tri-state re-walk over a lookup serving the written PT
+        // reports Valid with NXE=1 and PermsRefused with NXE=0.
+        use super::super::frame_alloc::FrameAllocator;
+        use super::super::page_table::{encode_table_entry, PageFlags};
+        use baseos_boot_info::{BootInfo, MemoryKind, MemoryRegion};
+        let stack_base = 0x0000_1000_0020_0000_u64;
+        let next = PageFlags::PRESENT | PageFlags::WRITABLE;
+        let mut pml4: [u64; 512] = [0; 512];
+        let mut pdpt: [u64; 512] = [0; 512];
+        let mut pd: [u64; 512] = [0; 512];
+        let mut ptable: [u64; 512] = [0; 512];
+        pml4[32] = encode_table_entry(0x2000, next).unwrap();
+        pdpt[0] = encode_table_entry(0x3000, next).unwrap();
+        pd[1] = encode_table_entry(0x4000, next).unwrap();
+        let mut boot = BootInfo::new();
+        assert!(boot.push_region(MemoryRegion::new(0x100000, 16, MemoryKind::Usable)));
+        let mut fa = FrameAllocator::from_boot_info(&boot);
+        let phys = user_stack_alloc_frames(&mut fa).expect("healthy map must yield 4 frames");
+        let pages = [USER_STACK_MAP_FLAGS; USER_STACK_PAGES];
+        // SAFETY: host `invlpg_page` stub is a no-op; asserts only the
+        // store+flush agreement, never hardware.
+        assert!(unsafe {
+            user_stack_install_store_flush(&mut ptable, stack_base, phys, &pages, true)
+        });
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(&pml4),
+                0x2000 => Some(&pdpt),
+                0x3000 => Some(&pd),
+                0x4000 => Some(&ptable),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            user_stack_walk_report(0x1000, stack_base, lookup, true),
+            UserStackWalkOutcome::Valid
+        );
+        assert!(user_stack_walk_ok(user_stack_walk_report(
+            0x1000, stack_base, lookup, true
+        )));
+        assert_eq!(
+            user_stack_walk_report(0x1000, stack_base, lookup, false),
+            UserStackWalkOutcome::PermsRefused
+        );
     }
 
     #[test]
