@@ -5169,3 +5169,21 @@ Format per entry (per `implementation-guide.md` §31):
 - **Expected:** `cargo test --workspace` 289 passed, 1 ignored (same count, extended test); fmt + host/UEFI clippy clean; guest uncalled, no QEMU.
 - **Measured (2026-10-12, Win11):** `cargo test` default 249 (21 boot-info + 218 kernel incl. extended alloc test + 4 + 4 + 2, 1 ignored); `cargo fmt --check` clean; `cargo clippy --all-targets -D warnings` exit 0; `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -D warnings` exit 0. No QEMU (uncalled helper, guest untouched).
 - **Final:** REVIEW #723 nits closed; remainder unchanged (bound store+flush + re-walk + ok=1 flip needing 4K-aligned stack base, then CPL3); pending agent-b review.
+
+## S09 slice2bb -- live U-map install + re-walk ok=1 valid (board #30)
+
+- **Decision:** Wire the live 4-page U-map: `USER_STACK` BSS `align(16)` -> `align(4096)`, new `install_user_stack_mapping` (FrameAllocator alloc-4 via `user_stack_alloc_frames` + live PT resolve via `live_pt_phys_for_va` + mut map via `phys_to_table_ptr_mut` + bound `user_stack_install_store_flush` with live NXE), re-walk via `probe_ustack` through the sole `write_ustack_report` site; `boot-uefi.ps1` gate flipped to `USTACK ok=1 label=valid`, gate-test to 63 cases.
+- **Why:** #30 remainder was live-PT store + ok=1 flip then CPL3; host pins (resolver, frame binding, bound store+flush, tri-state report) were all green, so wiring was the next smallest end-to-end slice.
+- **Alternatives:** Keep ok=0 baseline and diagnose first (rejected at commit time: wiring was believed single-PT-safe per OVMF placement note).
+- **Expected:** `cargo test --workspace` 290 passed, 1 ignored; fmt + clippy clean; gate-test 63/63; `boot-uefi.ps1` PASS with `USTACK ok=1 label=valid`.
+- **Measured (2026-10-12, Win11, @d0f5dd4):** host `cargo test --workspace` 290 passed (21 + 40 + 219 kernel incl. new wiring-agreement test + 4 + 4 + 2), 1 ignored; fmt + host/UEFI clippy clean; gate-test 63/63. Live QEMU (2026-10-13 re-run): FAIL -- serial still `USTACK ok=0 label=perms-refused` (install refuses fail-closed; candidates: 2M PS leaf, PT-bounds gate, NXE pin, PT straddle). Commit landed without its worklog entry and without a green QEMU proof.
+- **Final:** Wiring code stands (host-green) but e2e gate was red; next slice reverts the gate and records the refusal (see slice2bc).
+
+## S09 slice2bc -- revert USTACK gate to ok=0 baseline, record live refusal (board #30)
+
+- **Decision:** Revert `boot-uefi.ps1` `$ustackPat` to the slice2aw `ok=0 label=(perms-refused|walk-failed)` baseline and `test-boot-uefi-gates.ps1` to the matching 63-case baseline (2 ok=0 passes + ok=1-valid-fails + drift/wronglabel/nolabel/split fails); no guest code change (install attempt still runs, re-walk still refuses fail-closed).
+- **Why:** Slice2bb flipped the e2e gate to ok=1 without a green QEMU proof; live re-run prints `USTACK ok=0 label=perms-refused`, so the tree was red. Cheapest restore-green is the gate revert; the install-refusal diagnosis (PS leaf vs bounds gate vs NXE vs straddle -- needs a UMAP reason line or live PT dump) rides next, then the ok=1 flip, then CPL3.
+- **Alternatives:** Diagnose + fix the install in the same commit (rejected: needs a failure-reason serial line + live evidence in one cycle, doubles single-cycle risk; green must come first); leave the red ok=1 gate (rejected: breaks Build->Boot->Test loop).
+- **Expected:** `cargo test --workspace` 290 passed, 1 ignored (unchanged); fmt + clippy clean; gate-test 63/63; `boot-uefi.ps1` PASS with `USTACK ok=0 label=perms-refused`.
+- **Measured (2026-10-13, Win11):** `cargo test --workspace` 290 passed (21 + 40 + 219 + 4 + 4 + 2), 1 ignored; `cargo fmt --check` clean; `cargo clippy -p baseos-kernel --all-targets -D warnings` exit 0; `cargo clippy -p baseos-boot-uefi --target x86_64-unknown-uefi -D warnings` exit 0; `test-boot-uefi-gates.ps1` GATE TEST PASS (63/63); `boot-uefi.ps1` UEFI BOOT PASS, serial 2245 bytes, guest `bootx64.efi` 187904 bytes, line 15 `USTACK ok=0 label=perms-refused`.
+- **Final:** Tree green on the honest baseline; remainder narrowed to install-refusal diagnosis (UMAP reason line) + ok=1 flip, then CPL3 entry; pending agent-b review.
