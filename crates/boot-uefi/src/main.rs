@@ -942,6 +942,33 @@ unsafe fn probe_rmbz(info: &BootInfo) -> (bool, bool, usize, usize, usize) {
     )
 }
 
+/// Emit the one-line `UMAP` install diagnostic (S09 slice2bd, #30):
+/// `UMAP ok=<0|1> stage=<n> nxe=<0|1> base=0x... pt=0x...` — `stage` is 0 on
+/// success, else 1=alloc, 2=pt-resolve, 3=mut-map, 4=store-flush; `pt` is the
+/// resolved live PT phys or STRUCTURAL_FAIL when unresolved. Reporting-only
+/// (ps1 requires presence, never `ok=1`) so the refusal stage is visible on
+/// serial without flipping the USTACK gate.
+fn write_umap_line<E>(
+    ok: bool,
+    stage: u8,
+    nxe: bool,
+    base: u64,
+    pt: u64,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "UMAP ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " stage=")?;
+    write_u64_dec(emit, u64::from(stage))?;
+    write_str(emit, " nxe=")?;
+    write_u64_dec(emit, u64::from(nxe))?;
+    write_str(emit, " base=")?;
+    write_u64_hex(emit, base)?;
+    write_str(emit, " pt=")?;
+    write_u64_hex(emit, pt)?;
+    write_str(emit, "\n")
+}
+
 /// Live U-map install (S09 slice2bb, #30 wiring): allocate 4 frames from a
 /// `FrameAllocator` over `info`, resolve the live PT backing the 4 KiB-aligned
 /// `user_stack_base()` via [`live_pt_phys_for_va`] (never a caller literal),
@@ -957,26 +984,42 @@ unsafe fn probe_rmbz(info: &BootInfo) -> (bool, bool, usize, usize, usize) {
 /// Post-EBS only, on the boot thread: reads `CR3`/`EFER`, dereferences live
 /// firmware tables through [`phys_to_table_ptr`] / [`phys_to_table_ptr_mut`]
 /// (identity-mapped), executes `invlpg` via the bound entry.
+#[allow(dead_code)]
 unsafe fn install_user_stack_mapping(info: &BootInfo) -> bool {
+    install_user_stack_mapping_diag(info).0
+}
+
+/// Diag twin of [`install_user_stack_mapping`] (S09 slice2bd, #30): same
+/// install, plus `(stage, nxe, base, pt_phys)` for the `UMAP` line. Stage 0
+/// on success, else 1=alloc, 2=pt-resolve, 3=mut-map, 4=store-flush.
+///
+/// # Safety
+/// Same contract as [`install_user_stack_mapping`].
+unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, bool, u64, u64) {
     let mut alloc = FrameAllocator::from_boot_info(info);
-    let Some(phys_base) = user_stack_alloc_frames(&mut alloc) else {
-        return false;
-    };
     let nxe_enabled = efer_nxe_enabled(read_efer());
-    let cr3 = cr3_pml4_base(read_cr3());
     let stack_base = user_stack_base();
+    let Some(phys_base) = user_stack_alloc_frames(&mut alloc) else {
+        return (false, 1, nxe_enabled, stack_base, STRUCTURAL_FAIL as u64);
+    };
+    let cr3 = cr3_pml4_base(read_cr3());
     let Some(pt_phys) = live_pt_phys_for_va(cr3, stack_base, |base| phys_to_table_ptr(info, base))
     else {
-        return false;
+        return (false, 2, nxe_enabled, stack_base, STRUCTURAL_FAIL as u64);
     };
     let Some(pt_ptr) = phys_to_table_ptr_mut(info, pt_phys) else {
-        return false;
+        return (false, 3, nxe_enabled, stack_base, pt_phys);
     };
     let pages = [USER_STACK_MAP_FLAGS; USER_STACK_PAGES];
     // SAFETY: post-EBS boot thread, `pt` is the live PT resolved above,
     // `cli` in effect (same contract as `invlpg_page`).
-    unsafe {
+    let ok = unsafe {
         user_stack_install_store_flush(&mut *pt_ptr, stack_base, phys_base, &pages, nxe_enabled)
+    };
+    if ok {
+        (true, 0, nxe_enabled, stack_base, pt_phys)
+    } else {
+        (false, 4, nxe_enabled, stack_base, pt_phys)
     }
 }
 
@@ -2922,8 +2965,13 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // (alloc-4 + bound store+flush through the live PT), then re-walk
             // and emit the bound USTACK line via the sole COM1 site.
             // Install refusal (alloc/PT-resolve/store) leaves the re-walk
-            // refusing (`ok=0`) fail-closed; ps1 hard-requires `ok=1 valid`.
-            let _ = install_user_stack_mapping(&info);
+            // refusing (`ok=0`) fail-closed; ps1 hard-requires `ok=0` baseline.
+            // Slice2bd: emit the UMAP diag first so serial pinpoints the stage.
+            let (umap_ok, umap_stage, umap_nxe, umap_base, umap_pt) =
+                install_user_stack_mapping_diag(&info);
+            let _ = write_umap_line::<Infallible>(
+                umap_ok, umap_stage, umap_nxe, umap_base, umap_pt, &mut emit,
+            );
             let ustack_outcome = probe_ustack(&info);
             write_ustack_report(ustack_outcome);
             // S04 slice 15: live leaf USER/NX audit of the PAGING probe
@@ -4801,6 +4849,29 @@ mod tests {
             }
         };
         assert_eq!(live_pt_phys_for_va(0x1000, 0x0, &lookup_ps), None);
+    }
+
+    #[test]
+    fn umap_line_pins_exact_shape() {
+        // S09 slice2bd (#30): host backstop for the live UMAP diag shape.
+        // The guest writer shares this body, so a format drift fails here.
+        let mut out = Vec::new();
+        write_umap_line::<core::convert::Infallible>(
+            false,
+            4,
+            false,
+            0x1234_0000,
+            0xabcd_0000,
+            &mut |b| {
+                out.push(b);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "UMAP ok=0 stage=4 nxe=0 base=0x12340000 pt=0xabcd0000\n"
+        );
     }
 
     #[test]
