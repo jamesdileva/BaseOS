@@ -718,12 +718,16 @@ where
 }
 
 /// PD table-pointer encoder for the split swap (S09 slice2bi, #30,
-/// REVIEW #743 risks 3+5): `(pt_phys & ADDR) | PRESENT | WRITABLE |
-/// (leaf PCD/PWT)`. Drops `PS` (table pointer never carries it), `USER=0`
-/// (only the 4 stack PT slots become user via the later U-map install; the
-/// other 508 stay supervisor), `NX=0`, `G/A/D` (leaf history; A+D fan-out
-/// over-mark is safe-conservative, recorded in worklog), and bit 9. `None`
-/// on misaligned/unrepresentable `pt_phys`.
+/// REVIEW #743 risks 3+5; REVIEW #745 risk 3 fix): `(pt_phys & ADDR) |
+/// PRESENT | WRITABLE | (leaf PCD/PWT) | (leaf NX)`. Drops `PS` (table
+/// pointer never carries it), `USER=0` (only the 4 stack PT slots become
+/// user via the later U-map install; the other 508 stay supervisor),
+/// `G/A/D` (leaf history; A+D fan-out over-mark is safe-conservative,
+/// recorded in worklog), and bit 9. Preserves leaf NX so an NX=1 2M leaf
+/// never becomes executable during the swap window (the later install
+/// sets NX via USER_STACK_MAP_FLAGS on the 4 slots; the other 508 inherit
+/// the leaf NX through this pointer). `None` on misaligned/unrepresentable
+/// `pt_phys`.
 fn encode_pd_table_entry(pt_phys: u64, leaf_pte: u64) -> Option<u64> {
     if pt_phys & PAGE_OFFSET_MASK != 0 {
         return None;
@@ -733,6 +737,7 @@ fn encode_pd_table_entry(pt_phys: u64, leaf_pte: u64) -> Option<u64> {
     }
     let mut pte = (pt_phys & PTE_ADDR_MASK) | 0x3;
     pte |= leaf_pte & ((1 << 3) | (1 << 4));
+    pte |= leaf_pte & (1 << 63);
     Some(pte)
 }
 
@@ -1231,8 +1236,14 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
                     pd_raw,
                 );
             };
-            // Swap-then-flush ordering (REVIEW #743 risk 2): PD pointer
-            // swap first, then invlpg the 4 stack VAs, then re-walk. The
+            // Swap-then-flush ordering (REVIEW #743 risk 2; REVIEW #745
+            // risk 2 note): PD pointer swap first, then invlpg the 4 stack
+            // VAs, then re-walk. One INVLPG suffices to drop the cached 2M
+            // large-page TLB entry (Intel SDM: INVLPG invalidates any TLB
+            // entry for the linear address, including a large page
+            // containing it), so flushing all 4 stack aliases is strictly
+            // more than enough; the other 508 aliases map the same phys
+            // as supervisor and are re-covered by the re-walk gate. The
             // re-walk `ok=1` is the gate for the USTACK flip (CPL3 proof
             // rides next slice).
             unsafe {
@@ -1248,6 +1259,22 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
             let (re_opt, re_rsn) =
                 live_pt_resolve_detail(cr3, stack_base, |base| phys_to_table_ptr(info, base));
             let Some(re_phys) = re_opt else {
+                // REVIEW #745 risk 1 fix: undo the live mutation before
+                // failing closed. Restore the original 2M leaf, flush the
+                // same 4 VAs (drops the half-installed PT mapping from the
+                // TLB), free the PT frame, and return ok=0 stage=2 with the
+                // re-walk reason — no live mutation escapes on this path.
+                unsafe {
+                    (*pd_ptr)[pd_idx] = pd_raw;
+                    let mut i = 0usize;
+                    while i < USER_STACK_PAGES {
+                        if let Some(va) = stack_base.checked_add((i as u64) * 4096) {
+                            invlpg_split_page(va);
+                        }
+                        i += 1;
+                    }
+                }
+                let _ = alloc.free(pt_frame, 1);
                 return (
                     false,
                     2,
@@ -5270,9 +5297,10 @@ mod tests {
     #[test]
     #[allow(clippy::needless_borrows_for_generic_args)]
     fn split_swap_preserves_user_scoping_and_pd_encoding() {
-        // S09 slice2bi (#30, REVIEW #743 risks 3+5): split preserves flags
-        // with USER=0 everywhere; PD swap drops USER/PS/NX/G/A/D, keeps
-        // PCD/PWT; only the 4 stack slots become USER after the install.
+        // S09 slice2bi (#30, REVIEW #743 risks 3+5; REVIEW #745 risks 3+4):
+        // split preserves flags with USER=0 everywhere; PD swap drops
+        // USER/PS/G/A/D, keeps PCD/PWT, preserves leaf NX; the bound
+        // install then sets USER+NX on exactly the 4 stack slots.
         use baseos_kernel::page_table::pte_encode;
         use baseos_kernel::page_table::PageFlags;
         use baseos_kernel::page_table::PTE_PS_BIT;
@@ -5284,15 +5312,38 @@ mod tests {
         assert_eq!(base, 0xde00_0000);
         // USER scoping: all 508+4 start supervisor (leaf has no USER).
         assert!(pt.iter().all(|e| e & (1 << 2) == 0));
-        // PD swap encoding: PRESENT+W set, PS/USER/NX/G/A/D clear, PCD/PWT kept.
+        // PD swap encoding: PRESENT+W set, PS/USER/G/A/D clear, PCD/PWT kept.
         let new_pd = encode_pd_table_entry(0x9000, leaf).expect("encodable PT frame");
         assert_eq!(new_pd & 0x3, 0x3);
         assert_eq!(new_pd & PTE_PS_BIT, 0);
         assert_eq!(new_pd & (1 << 2), 0);
         assert_eq!(new_pd & (1 << 63), 0);
         assert_eq!(new_pd & PTE_ADDR_MASK, 0x9000);
+        // REVIEW #745 risk 3: leaf NX=1 is preserved through the PD pointer
+        // so the swap window never makes the 2M executable.
+        let nx_leaf = leaf | (1 << 63);
+        let nx_pd = encode_pd_table_entry(0x9000, nx_leaf).expect("NX leaf encodable");
+        assert_ne!(nx_pd & (1 << 63), 0);
         // Misaligned PT frame refuses.
         assert_eq!(encode_pd_table_entry(0x9001, leaf), None);
+        // REVIEW #745 risk 4: emulate the bound install the guest runs
+        // after the swap (host-safe: pte_encode only, no invlpg — the
+        // flush entry executes privileged invlpg even under host test
+        // because the kernel dep builds without cfg(test)) and pin the
+        // 4-user/508-supervisor scope on the same buffer.
+        let mut i = 0usize;
+        while i < USER_STACK_PAGES {
+            pt[i] = pte_encode(0xA0000 + (i as u64) * 4096, USER_STACK_MAP_FLAGS);
+            i += 1;
+        }
+        let user_count = pt.iter().filter(|e| *e & (1 << 2) != 0).count();
+        assert_eq!(user_count, USER_STACK_PAGES);
+        assert!(pt[0..USER_STACK_PAGES].iter().all(|e| e & (1 << 2) != 0));
+        assert!(pt[USER_STACK_PAGES..].iter().all(|e| e & (1 << 2) == 0));
+        assert!(
+            pt[0..USER_STACK_PAGES].iter().all(|e| e & (1 << 63) != 0),
+            "installed stack slots carry NX from USER_STACK_MAP_FLAGS"
+        );
         // PD table locator agrees with the raw PTE reader on the same walk.
         let mut pml4 = [0u64; 512];
         let mut pdpt = [0u64; 512];
