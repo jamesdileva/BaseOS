@@ -1112,9 +1112,16 @@ fn write_umap_line<E>(
 /// [`cr3_pml4_base`]; `wok/wphys/wflags` are [`walk_full_leaf_flags`];
 /// `raw/lvl` are [`walk_full_leaf_raw`] (`lvl` 0=4K PTE, 1=2M leaf,
 /// 2=1G leaf, 0xFF=no walk); `map` is [`table_base_in_boot_map`];
-/// `rdok` is a gated identity read (only when `wok`, so a present page —
-/// reads never fault on RO, only writes do). `la57` is [`cr4_la57_enabled`]:
+/// `rdok` is a value-checked mapped read: the first word of `frame` loaded
+/// through [`phys_to_table_ptr`] (the same bounds-gated mapping layer the
+/// walker uses, not a blind identity cast) into `rval`. `la57` is [`cr4_la57_enabled`]:
 /// set means 5-level paging and the 4-level walker assumption is false.
+/// `fwok/fraw/flvl` are the same [`walk_full_leaf_flags`]/[`walk_full_leaf_raw`]
+/// walk of the historic slice2bk fault-frame base `FAULT_VA_PROBE`
+/// (`0xF803000`, CR2 `0xf803378` = index 111): answers REVIEW #751 finding 1
+/// by pinning the high-RAM leaf state on the current boot even when the
+/// quarantined probe `frame` is low RAM (allocator-order variance across
+/// boots with different BootInfo region counts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PtDump {
     frame: u64,
@@ -1127,7 +1134,18 @@ struct PtDump {
     lvl: u8,
     map: bool,
     rdok: bool,
+    rval: u64,
+    fwok: bool,
+    fraw: u64,
+    flvl: u8,
 }
+
+/// Historic slice2bk fault-frame base (S09 slice2bm, #30, REVIEW #751
+/// finding 1): the freshly allocated PT frame whose index-111 store faulted
+/// (`#PF` U=0 W=1 P=1, CR2=`0xf803378`). Walked read-only on every
+/// quarantined PTDUMP so the high-RAM leaf state is pinned even when the
+/// current-boot probe `frame` lands in low RAM.
+const FAULT_VA_PROBE: u64 = 0xF803000;
 
 impl PtDump {
     fn empty() -> Self {
@@ -1142,13 +1160,18 @@ impl PtDump {
             lvl: 0xFF,
             map: false,
             rdok: false,
+            rval: STRUCTURAL_FAIL as u64,
+            fwok: false,
+            fraw: STRUCTURAL_FAIL as u64,
+            flvl: 0xFF,
         }
     }
 }
 
 /// Emit the one-line `PTDUMP` diagnostic right after the `UMAP` line:
 /// `PTDUMP frame=0x... cr3=0x... la57=<0|1> wok=<0|1> wphys=0x...
-/// wflags=0x... raw=0x... lvl=<n> map=<0|1> rdok=<0|1>`.
+/// wflags=0x... raw=0x... lvl=<n> map=<0|1> rdok=<0|1> rval=0x...
+/// fwok=<0|1> fraw=0x... flvl=<n>`.
 /// Reporting-only companion to `UMAP`; the e2e script does not gate on it.
 fn write_ptdump_line<E>(dump: PtDump, emit: &mut impl FnMut(u8) -> Result<(), E>) -> Result<(), E> {
     write_str(emit, "PTDUMP frame=")?;
@@ -1171,6 +1194,14 @@ fn write_ptdump_line<E>(dump: PtDump, emit: &mut impl FnMut(u8) -> Result<(), E>
     write_u64_dec(emit, u64::from(dump.map))?;
     write_str(emit, " rdok=")?;
     write_u64_dec(emit, u64::from(dump.rdok))?;
+    write_str(emit, " rval=")?;
+    write_u64_hex(emit, dump.rval)?;
+    write_str(emit, " fwok=")?;
+    write_u64_dec(emit, u64::from(dump.fwok))?;
+    write_str(emit, " fraw=")?;
+    write_u64_hex(emit, dump.fraw)?;
+    write_str(emit, " flvl=")?;
+    write_u64_dec(emit, u64::from(dump.flvl))?;
     write_str(emit, "\n")
 }
 
@@ -1304,11 +1335,36 @@ unsafe fn install_user_stack_mapping_diag(
                     }
                     if dump.wok {
                         // Present page per the walker: reads never fault
-                        // on RO (only writes do), so sampling one word
-                        // proves identity readability without risking the
-                        // slice2bk `#PF`-escape.
-                        let _ = unsafe { *(frame as *const u64) };
-                        dump.rdok = true;
+                        // on RO (only writes do). Sample the first word
+                        // through the same bounds-gated mapping layer the
+                        // walker uses (REVIEW #751 finding 2: value-checked,
+                        // not a tautological flag — `rval` is observed data).
+                        if let Some(table) = unsafe { phys_to_table_ptr(info, frame) } {
+                            dump.rval = table[0];
+                            dump.rdok = true;
+                        }
+                    }
+                    // REVIEW #751 finding 1 cheapest experiment (a): walk the
+                    // historic fault-frame base itself so the high-RAM leaf
+                    // state is pinned on this boot regardless of where the
+                    // quarantined probe frame landed.
+                    {
+                        let fbase = cr3_pml4_base(cr3_raw);
+                        if walk_full_leaf_flags(fbase, FAULT_VA_PROBE, |b| unsafe {
+                            phys_to_table_ptr(info, b)
+                        })
+                        .is_ok()
+                        {
+                            dump.fwok = true;
+                        }
+                        if let Ok((_, fraw, flvl)) =
+                            walk_full_leaf_raw(fbase, FAULT_VA_PROBE, |b| unsafe {
+                                phys_to_table_ptr(info, b)
+                            })
+                        {
+                            dump.fraw = fraw;
+                            dump.flvl = flvl;
+                        }
                     }
                     let _ = alloc.free(frame, 1);
                 }
@@ -5398,6 +5454,10 @@ mod tests {
                 lvl: 0,
                 map: true,
                 rdok: true,
+                rval: 0x0f80_3003,
+                fwok: true,
+                fraw: 0x0f80_3003,
+                flvl: 0,
             },
             &mut |b| {
                 out.push(b);
@@ -5407,7 +5467,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "PTDUMP frame=0xf803000 cr3=0x7f01000 la57=0 wok=1 wphys=0xf803000 wflags=0x3 raw=0xf803003 lvl=0 map=1 rdok=1\n"
+            "PTDUMP frame=0xf803000 cr3=0x7f01000 la57=0 wok=1 wphys=0xf803000 wflags=0x3 raw=0xf803003 lvl=0 map=1 rdok=1 rval=0xf803003 fwok=1 fraw=0xf803003 flvl=0\n"
         );
         let mut out_empty = Vec::new();
         write_ptdump_line::<core::convert::Infallible>(PtDump::empty(), &mut |b| {
@@ -5417,7 +5477,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(out_empty).unwrap(),
-            "PTDUMP frame=0xffffffffffffffff cr3=0xffffffffffffffff la57=0 wok=0 wphys=0xffffffffffffffff wflags=0x0 raw=0xffffffffffffffff lvl=255 map=0 rdok=0\n"
+            "PTDUMP frame=0xffffffffffffffff cr3=0xffffffffffffffff la57=0 wok=0 wphys=0xffffffffffffffff wflags=0x0 raw=0xffffffffffffffff lvl=255 map=0 rdok=0 rval=0xffffffffffffffff fwok=0 fraw=0xffffffffffffffff flvl=255\n"
         );
     }
 
