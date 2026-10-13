@@ -559,6 +559,39 @@ pub const fn encode_table_entry(phys_base: u64, flags: PageFlags) -> Result<u64,
     }
 }
 
+/// Split a 2 MiB `PS` leaf PD PTE into 512 4 KiB PT entries (S09 slice2bg,
+/// #30 remainder): pure host-testable half of the 2M-leaf unblock (slice2bf
+/// proved `pd=...e3` PRESENT+W+PS=1 at the stack range). `None` on
+/// cleared-PRESENT, `PS=0` (already a table pointer), or a 2M-misaligned
+/// base (low 21 address bits nonzero — would silently truncate the fan-out).
+/// On success returns `(pt_entries, leaf_2m_base)`: each entry maps
+/// `base + i*4096` with the leaf HW flags (`PRESENT`/`WRITABLE`/`USER`/
+/// `NO_EXEC` via [`PTE_HW_FLAGS_MASK`], `PS` dropped), so the split is
+/// permission-preserving; the caller ORs `USER`/`NO_EXEC` for the 4 stack
+/// slots and builds the replacement PD table-pointer entry. No guest
+/// wiring this slice (guest untouched, e2e stays on the `ok=0` baseline).
+#[must_use]
+pub fn split_2m_leaf_to_pt(pd_pte: u64) -> Option<([u64; 512], u64)> {
+    if pd_pte & 1 == 0 {
+        return None;
+    }
+    if pd_pte & PTE_PS_BIT == 0 {
+        return None;
+    }
+    if (pd_pte & PTE_ADDR_MASK) & LARGE_2M_OFFSET_MASK != 0 {
+        return None;
+    }
+    let base = (pd_pte & PTE_ADDR_MASK) & !LARGE_2M_OFFSET_MASK;
+    let flags = pd_pte & PTE_HW_FLAGS_MASK;
+    let mut pt = [0u64; 512];
+    let mut i = 0usize;
+    while i < 512 {
+        pt[i] = (base + (i as u64) * PAGE_SIZE) | flags;
+        i += 1;
+    }
+    Some((pt, base))
+}
+
 /// One hardware walk step: read the `level` table entry for `virt`.
 ///
 /// 4 KiB-only step: `PS` (bit 7) set on the entry is NOT followed as a
@@ -1336,6 +1369,34 @@ mod tests {
             }
         };
         assert_eq!(walk_full(0x1000, virt_2m, lookup), Ok(0x21_3456));
+    }
+
+    #[test]
+    fn split_2m_leaf_preserves_flags_and_fanout() {
+        // S09 slice2bg (#30): the live OVMF `pd=0xde000e3` case (PRESENT+W+PS).
+        let leaf = encode_table_entry(0xde00000, K_RW).unwrap() | PTE_PS_BIT;
+        let (pt, base) = split_2m_leaf_to_pt(leaf).expect("valid 2M leaf must split");
+        assert_eq!(base, 0xde00000);
+        assert_eq!(pt.len(), 512);
+        assert_eq!(pte_decoded_phys(pt[0]), 0xde00000);
+        assert_eq!(pte_decoded_phys(pt[511]), 0xde00000 + 511 * PAGE_SIZE);
+        // Flags preserved, PS dropped on every entry.
+        for entry in pt.iter() {
+            assert_eq!(entry & PTE_PS_BIT, 0);
+            assert_eq!(pte_decoded_flags(*entry), K_RW);
+        }
+        // Refusals: cleared-PRESENT, PS=0 table pointer, 2M-misaligned base.
+        assert_eq!(split_2m_leaf_to_pt(leaf & !1), None);
+        assert_eq!(
+            split_2m_leaf_to_pt(encode_table_entry(0xB000, K_RW).unwrap()),
+            None
+        );
+        assert_eq!(split_2m_leaf_to_pt(0x00DE_1000 | 0x83), None);
+        // NX leaf stays NX after the split (permission-preserving).
+        let nx_leaf =
+            encode_table_entry(0xde00000, K_RW.union(PageFlags::NO_EXEC)).unwrap() | PTE_PS_BIT;
+        let (nx_pt, _) = split_2m_leaf_to_pt(nx_leaf).expect("NX leaf must split");
+        assert!(pte_decoded_flags(nx_pt[0]).contains(PageFlags::NO_EXEC));
     }
 
     #[test]
