@@ -48,9 +48,9 @@ use baseos_kernel::frame_alloc::FrameAllocator;
 use baseos_kernel::kernel_entry;
 use baseos_kernel::latency::{LatencySamples, LatencyStats};
 use baseos_kernel::page_table::{
-    guard_selftest, perm_selftest, rmbz_audit_ok, rmbz_count_violations, table_base_in_boot_map,
-    user_isolation_selftest, walk_full, walk_full_leaf_flags, walk_full_leaf_raw, walk_step,
-    WalkerError, PAGE_OFFSET_MASK,
+    guard_selftest, page_table_index, perm_selftest, rmbz_audit_ok, rmbz_count_violations,
+    table_base_in_boot_map, user_isolation_selftest, walk_full, walk_full_leaf_flags,
+    walk_full_leaf_raw, walk_step, WalkerError, PAGE_OFFSET_MASK,
 };
 use baseos_kernel::sched::{Scheduler, QUANTUM_TICKS};
 use baseos_kernel::thread::check_jump_entry;
@@ -675,6 +675,28 @@ where
     (Some(pt_base), 0)
 }
 
+/// Raw PD PTE reader for the `UMAP pd=` field (S09 slice2bf, #30):
+/// walks PML4->PDPT->PD via [`walk_step`] and returns the raw PD entry
+/// for `va` (`Some(pte)`), or `None` when any upper level misses. Pure
+/// over `lookup`, shared by the guest diag and host tests. Splits the
+/// slice2be `rsn=7` bucket: `PRESENT=0` (cleared) vs `PS=1` (2 MiB leaf)
+/// vs `PRESENT=1 PS=0` (table pointer that `walk_step` still refused).
+fn live_pd_pte_for_va<'a, F>(pml4_base: u64, va: u64, lookup: F) -> Option<u64>
+where
+    F: Fn(u64) -> Option<&'a [u64; 512]>,
+{
+    if pml4_base & PAGE_OFFSET_MASK != 0 {
+        return None;
+    }
+    let pml4 = lookup(pml4_base)?;
+    let pdpt_base = walk_step(pml4, va, 3).ok()?;
+    let pdpt = lookup(pdpt_base)?;
+    let pd_base = walk_step(pdpt, va, 2).ok()?;
+    let pd = lookup(pd_base)?;
+    let idx = page_table_index(va, 1)?;
+    Some(pd[idx as usize])
+}
+
 /// Emit the one-line `PAGING` diagnostic after the frame-allocator proof:
 /// `PAGING ok=<0|1> cr3=0x... phys=0x...` — `ok` is 1 only when a full
 /// [`walk_full`] from the live `CR3` resolved the probe address; `phys` is
@@ -979,15 +1001,19 @@ unsafe fn probe_rmbz(info: &BootInfo) -> (bool, bool, usize, usize, usize) {
 }
 
 /// Emit the one-line `UMAP` install diagnostic (S09 slice2bd, #30;
-/// slice2be adds `rsn=`):
-/// `UMAP ok=<0|1> stage=<n> rsn=<n> nxe=<0|1> base=0x... pt=0x...` — `stage` is 0 on
+/// slice2be adds `rsn=`, slice2bf adds `pd=`):
+/// `UMAP ok=<0|1> stage=<n> rsn=<n> nxe=<0|1> base=0x... pt=0x... pd=0x...` — `stage` is 0 on
 /// success, else 1=alloc, 2=pt-resolve, 3=mut-map, 4=store-flush; `rsn` is 0
 /// except on stage 2, where it is the [`live_pt_resolve_detail`] reason
 /// (1=misaligned-PML4, 2=PML4-miss, 3=PML4-step, 4=PDPT-miss, 5=PDPT-step,
 /// 6=PD-miss, 7=PD-step incl. 2M PS leaf, 8=non-canonical, 9=invalid-level);
-/// `pt` is the resolved live PT phys or STRUCTURAL_FAIL when unresolved.
+/// `pt` is the resolved live PT phys or STRUCTURAL_FAIL when unresolved;
+/// `pd` is the raw PD PTE for the stack base ([`live_pd_pte_for_va]) or
+/// STRUCTURAL_FAIL when the upper walk misses — splits rsn=7 into
+/// PS-leaf (`pd & 0x80 != 0`) vs cleared-PRESENT (`pd & 1 == 0`).
 /// Reporting-only (UMAP ungated, USTACK stays at the ok=0 baseline) so the
 /// refusal reason is visible on serial without flipping any gate.
+#[allow(clippy::too_many_arguments)]
 fn write_umap_line<E>(
     ok: bool,
     stage: u8,
@@ -995,6 +1021,7 @@ fn write_umap_line<E>(
     nxe: bool,
     base: u64,
     pt: u64,
+    pd_pte: u64,
     emit: &mut impl FnMut(u8) -> Result<(), E>,
 ) -> Result<(), E> {
     write_str(emit, "UMAP ok=")?;
@@ -1009,6 +1036,8 @@ fn write_umap_line<E>(
     write_u64_hex(emit, base)?;
     write_str(emit, " pt=")?;
     write_u64_hex(emit, pt)?;
+    write_str(emit, " pd=")?;
+    write_u64_hex(emit, pd_pte)?;
     write_str(emit, "\n")
 }
 
@@ -1033,21 +1062,32 @@ unsafe fn install_user_stack_mapping(info: &BootInfo) -> bool {
 }
 
 /// Diag twin of [`install_user_stack_mapping`] (S09 slice2bd, #30; slice2be
-/// adds `rsn`): same install, plus `(stage, rsn, nxe, base, pt_phys)` for the
+/// adds `rsn`; slice2bf adds `pd`): same install, plus `(stage, rsn, nxe, base, pt_phys, pd_pte)` for the
 /// `UMAP` line. Stage 0 on success, else 1=alloc, 2=pt-resolve, 3=mut-map,
 /// 4=store-flush; `rsn` is the [`live_pt_resolve_detail`] reason on stage 2,
-/// else 0.
+/// else 0; `pd_pte` is the raw PD PTE ([`live_pd_pte_for_va]) or
+/// STRUCTURAL_FAIL when the upper walk misses.
 ///
 /// # Safety
 /// Same contract as [`install_user_stack_mapping`].
-unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, bool, u64, u64) {
+unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, bool, u64, u64, u64) {
     let mut alloc = FrameAllocator::from_boot_info(info);
     let nxe_enabled = efer_nxe_enabled(read_efer());
     let stack_base = user_stack_base();
     let Some(phys_base) = user_stack_alloc_frames(&mut alloc) else {
-        return (false, 1, 0, nxe_enabled, stack_base, STRUCTURAL_FAIL as u64);
+        return (
+            false,
+            1,
+            0,
+            nxe_enabled,
+            stack_base,
+            STRUCTURAL_FAIL as u64,
+            STRUCTURAL_FAIL as u64,
+        );
     };
     let cr3 = cr3_pml4_base(read_cr3());
+    let pd_raw = live_pd_pte_for_va(cr3, stack_base, |base| phys_to_table_ptr(info, base))
+        .unwrap_or(STRUCTURAL_FAIL as u64);
     let (pt_opt, rsn) =
         live_pt_resolve_detail(cr3, stack_base, |base| phys_to_table_ptr(info, base));
     let Some(pt_phys) = pt_opt else {
@@ -1058,10 +1098,11 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
             nxe_enabled,
             stack_base,
             STRUCTURAL_FAIL as u64,
+            pd_raw,
         );
     };
     let Some(pt_ptr) = phys_to_table_ptr_mut(info, pt_phys) else {
-        return (false, 3, 0, nxe_enabled, stack_base, pt_phys);
+        return (false, 3, 0, nxe_enabled, stack_base, pt_phys, pd_raw);
     };
     let pages = [USER_STACK_MAP_FLAGS; USER_STACK_PAGES];
     // SAFETY: post-EBS boot thread, `pt` is the live PT resolved above,
@@ -1070,9 +1111,9 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
         user_stack_install_store_flush(&mut *pt_ptr, stack_base, phys_base, &pages, nxe_enabled)
     };
     if ok {
-        (true, 0, 0, nxe_enabled, stack_base, pt_phys)
+        (true, 0, 0, nxe_enabled, stack_base, pt_phys, pd_raw)
     } else {
-        (false, 4, 0, nxe_enabled, stack_base, pt_phys)
+        (false, 4, 0, nxe_enabled, stack_base, pt_phys, pd_raw)
     }
 }
 
@@ -3021,10 +3062,11 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // refusing (`ok=0`) fail-closed; ps1 hard-requires `ok=0` baseline.
             // Slice2bd: emit the UMAP diag first so serial pinpoints the stage.
             // Slice2be: rsn splits stage 2 (PS-leaf vs bounds-gate).
-            let (umap_ok, umap_stage, umap_rsn, umap_nxe, umap_base, umap_pt) =
+            // Slice2bf: pd carries the raw PD PTE (PS vs PRESENT split).
+            let (umap_ok, umap_stage, umap_rsn, umap_nxe, umap_base, umap_pt, umap_pd) =
                 install_user_stack_mapping_diag(&info);
             let _ = write_umap_line::<Infallible>(
-                umap_ok, umap_stage, umap_rsn, umap_nxe, umap_base, umap_pt, &mut emit,
+                umap_ok, umap_stage, umap_rsn, umap_nxe, umap_base, umap_pt, umap_pd, &mut emit,
             );
             let ustack_outcome = probe_ustack(&info);
             write_ustack_report(ustack_outcome);
@@ -4910,6 +4952,7 @@ mod tests {
     fn umap_line_pins_exact_shape() {
         // S09 slice2bd (#30): host backstop for the live UMAP diag shape.
         // Slice2be adds `rsn=` between `stage=` and `nxe=`.
+        // Slice2bf adds `pd=` (raw PD PTE) after `pt=`.
         // The guest writer shares this body, so a format drift fails here.
         let mut out = Vec::new();
         write_umap_line::<core::convert::Infallible>(
@@ -4919,6 +4962,7 @@ mod tests {
             false,
             0x1234_0000,
             0xabcd_0000,
+            0x83,
             &mut |b| {
                 out.push(b);
                 Ok(())
@@ -4927,8 +4971,77 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "UMAP ok=0 stage=4 rsn=0 nxe=0 base=0x12340000 pt=0xabcd0000\n"
+            "UMAP ok=0 stage=4 rsn=0 nxe=0 base=0x12340000 pt=0xabcd0000 pd=0x83\n"
         );
+    }
+
+    #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    fn live_pd_pte_for_va_splits_ps_vs_present() {
+        // S09 slice2bf (#30): `pd=` must split the rsn=7 bucket into
+        // PS-leaf vs cleared-PRESENT vs table-pointer.
+        use baseos_kernel::page_table::pte_encode;
+        use baseos_kernel::page_table::PageFlags;
+        use baseos_kernel::page_table::PTE_PS_BIT;
+        let flags = PageFlags::PRESENT.union(PageFlags::WRITABLE);
+        let mut pml4 = [0u64; 512];
+        let mut pdpt = [0u64; 512];
+        let mut pd = [0u64; 512];
+        pml4[0] = pte_encode(0x2000, flags);
+        pdpt[0] = pte_encode(0x3000, flags);
+        pd[0] = pte_encode(0x4000, flags);
+        // Table pointer: PRESENT set, PS clear.
+        let raw = {
+            let lookup = |base: u64| -> Option<&[u64; 512]> {
+                match base {
+                    0x1000 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                    0x2000 => Some(unsafe { &*(&pdpt as *const [u64; 512]) }),
+                    0x3000 => Some(unsafe { &*(&pd as *const [u64; 512]) }),
+                    _ => None,
+                }
+            };
+            live_pd_pte_for_va(0x1000, 0x0, &lookup).unwrap()
+        };
+        assert_eq!(raw & 1, 1);
+        assert_eq!(raw & PTE_PS_BIT, 0);
+        // 2 MiB PS leaf: PS set.
+        pd[0] = pte_encode(0x20_0000, flags) | PTE_PS_BIT;
+        let raw_ps = {
+            let lookup = |base: u64| -> Option<&[u64; 512]> {
+                match base {
+                    0x1000 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                    0x2000 => Some(unsafe { &*(&pdpt as *const [u64; 512]) }),
+                    0x3000 => Some(unsafe { &*(&pd as *const [u64; 512]) }),
+                    _ => None,
+                }
+            };
+            live_pd_pte_for_va(0x1000, 0x0, &lookup).unwrap()
+        };
+        assert_ne!(raw_ps & PTE_PS_BIT, 0);
+        // Cleared PRESENT: bit 0 clear.
+        pd[0] &= !1;
+        let raw_np = {
+            let lookup = |base: u64| -> Option<&[u64; 512]> {
+                match base {
+                    0x1000 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                    0x2000 => Some(unsafe { &*(&pdpt as *const [u64; 512]) }),
+                    0x3000 => Some(unsafe { &*(&pd as *const [u64; 512]) }),
+                    _ => None,
+                }
+            };
+            live_pd_pte_for_va(0x1000, 0x0, &lookup).unwrap()
+        };
+        assert_eq!(raw_np & 1, 0);
+        // Upper miss: unmapped PDPT base.
+        let mut pml4_miss = [0u64; 512];
+        pml4_miss[0] = pte_encode(0x5000, flags);
+        let lookup_miss = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(unsafe { &*(&pml4_miss as *const [u64; 512]) }),
+                _ => None,
+            }
+        };
+        assert_eq!(live_pd_pte_for_va(0x1000, 0x0, &lookup_miss), None);
     }
 
     #[test]
