@@ -49,8 +49,9 @@ use baseos_kernel::kernel_entry;
 use baseos_kernel::latency::{LatencySamples, LatencyStats};
 use baseos_kernel::page_table::{
     guard_selftest, page_table_index, perm_selftest, rmbz_audit_ok, rmbz_count_violations,
-    table_base_in_boot_map, user_isolation_selftest, walk_full, walk_full_leaf_flags,
-    walk_full_leaf_raw, walk_step, WalkerError, PAGE_OFFSET_MASK,
+    split_2m_leaf_fill, table_base_in_boot_map, user_isolation_selftest, walk_full,
+    walk_full_leaf_flags, walk_full_leaf_raw, walk_step, WalkerError, PAGE_OFFSET_MASK,
+    PTE_ADDR_MASK, PTE_PS_BIT,
 };
 use baseos_kernel::sched::{Scheduler, QUANTUM_TICKS};
 use baseos_kernel::thread::check_jump_entry;
@@ -697,6 +698,59 @@ where
     Some(pd[idx as usize])
 }
 
+/// PD table location for the 2M-leaf split (S09 slice2bi, #30, REVIEW #743
+/// risk 2): same upper walk as [`live_pd_pte_for_va`] but returns
+/// `(pd_table_phys, pd_idx)` so the guest can swap the PD slot to the new
+/// PT frame. `None` on any upper miss. Pure over `lookup`, host-testable.
+fn live_pd_table_for_va<'a, F>(pml4_base: u64, va: u64, lookup: F) -> Option<(u64, usize)>
+where
+    F: Fn(u64) -> Option<&'a [u64; 512]>,
+{
+    if pml4_base & PAGE_OFFSET_MASK != 0 {
+        return None;
+    }
+    let pml4 = lookup(pml4_base)?;
+    let pdpt_base = walk_step(pml4, va, 3).ok()?;
+    let pdpt = lookup(pdpt_base)?;
+    let pd_base = walk_step(pdpt, va, 2).ok()?;
+    let idx = page_table_index(va, 1)? as usize;
+    Some((pd_base, idx))
+}
+
+/// PD table-pointer encoder for the split swap (S09 slice2bi, #30,
+/// REVIEW #743 risks 3+5): `(pt_phys & ADDR) | PRESENT | WRITABLE |
+/// (leaf PCD/PWT)`. Drops `PS` (table pointer never carries it), `USER=0`
+/// (only the 4 stack PT slots become user via the later U-map install; the
+/// other 508 stay supervisor), `NX=0`, `G/A/D` (leaf history; A+D fan-out
+/// over-mark is safe-conservative, recorded in worklog), and bit 9. `None`
+/// on misaligned/unrepresentable `pt_phys`.
+fn encode_pd_table_entry(pt_phys: u64, leaf_pte: u64) -> Option<u64> {
+    if pt_phys & PAGE_OFFSET_MASK != 0 {
+        return None;
+    }
+    if pt_phys & !PTE_ADDR_MASK != 0 {
+        return None;
+    }
+    let mut pte = (pt_phys & PTE_ADDR_MASK) | 0x3;
+    pte |= leaf_pte & ((1 << 3) | (1 << 4));
+    Some(pte)
+}
+
+/// Guest `invlpg` for one VA after the PD swap (S09 slice2bi, #30,
+/// REVIEW #743 risk 2: swap-then-flush before re-walk). Guest-only asm;
+/// host `cargo test` is a no-op stub so the ordering is unit-testable
+/// without privileged instructions.
+#[cfg(not(test))]
+unsafe fn invlpg_split_page(va: u64) {
+    unsafe {
+        core::arch::asm!("invlpg [{0}]", in(reg) va, options(nostack, preserves_flags));
+    }
+}
+
+/// Host-test stub: no-op.
+#[cfg(test)]
+unsafe fn invlpg_split_page(_va: u64) {}
+
 /// Emit the one-line `PAGING` diagnostic after the frame-allocator proof:
 /// `PAGING ok=<0|1> cr3=0x... phys=0x...` — `ok` is 1 only when a full
 /// [`walk_full`] from the live `CR3` resolved the probe address; `phys` is
@@ -1090,16 +1144,122 @@ unsafe fn install_user_stack_mapping_diag(info: &BootInfo) -> (bool, u8, u8, boo
         .unwrap_or(STRUCTURAL_FAIL as u64);
     let (pt_opt, rsn) =
         live_pt_resolve_detail(cr3, stack_base, |base| phys_to_table_ptr(info, base));
-    let Some(pt_phys) = pt_opt else {
-        return (
-            false,
-            2,
-            rsn,
-            nxe_enabled,
-            stack_base,
-            STRUCTURAL_FAIL as u64,
-            pd_raw,
-        );
+    // S09 slice2bi (#30, REVIEW #743 gate): 2M-leaf split path. When the
+    // resolve refuses at the PD step (rsn=7) with a PRESENT+PS leaf in
+    // `pd_raw`, allocate one PT frame, fill it via `split_2m_leaf_fill`
+    // (PAT=1 refuses fail-closed, buffer untouched), swap the PD slot to
+    // the new PT, `invlpg` the 4 stack VAs, then re-resolve and fall
+    // through to the normal install (which sets USER on exactly the 4
+    // stack slots; the other 508 stay supervisor). Alloc/fill failure
+    // never swaps: stays `ok=0 stage=2` with no partial state.
+    let pt_phys = match pt_opt {
+        Some(p) => p,
+        None => {
+            let is_ps_leaf =
+                pd_raw != STRUCTURAL_FAIL as u64 && pd_raw & 1 != 0 && pd_raw & PTE_PS_BIT != 0;
+            if rsn != 7 || !is_ps_leaf {
+                return (
+                    false,
+                    2,
+                    rsn,
+                    nxe_enabled,
+                    stack_base,
+                    STRUCTURAL_FAIL as u64,
+                    pd_raw,
+                );
+            }
+            let Some(pt_frame) = alloc.alloc(1) else {
+                return (
+                    false,
+                    2,
+                    7,
+                    nxe_enabled,
+                    stack_base,
+                    STRUCTURAL_FAIL as u64,
+                    pd_raw,
+                );
+            };
+            let pd_loc =
+                live_pd_table_for_va(cr3, stack_base, |base| phys_to_table_ptr(info, base));
+            let Some((pd_table_phys, pd_idx)) = pd_loc else {
+                let _ = alloc.free(pt_frame, 1);
+                return (
+                    false,
+                    2,
+                    7,
+                    nxe_enabled,
+                    stack_base,
+                    STRUCTURAL_FAIL as u64,
+                    pd_raw,
+                );
+            };
+            let pd_ptr_opt = unsafe { phys_to_table_ptr_mut(info, pd_table_phys) };
+            let pt_new_opt = unsafe { phys_to_table_ptr_mut(info, pt_frame) };
+            let (Some(pd_ptr), Some(pt_new_ptr)) = (pd_ptr_opt, pt_new_opt) else {
+                let _ = alloc.free(pt_frame, 1);
+                return (
+                    false,
+                    3,
+                    0,
+                    nxe_enabled,
+                    stack_base,
+                    STRUCTURAL_FAIL as u64,
+                    pd_raw,
+                );
+            };
+            if unsafe { split_2m_leaf_fill(pd_raw, &mut *pt_new_ptr).is_none() } {
+                let _ = alloc.free(pt_frame, 1);
+                return (
+                    false,
+                    2,
+                    7,
+                    nxe_enabled,
+                    stack_base,
+                    STRUCTURAL_FAIL as u64,
+                    pd_raw,
+                );
+            }
+            let Some(new_pd) = encode_pd_table_entry(pt_frame, pd_raw) else {
+                let _ = alloc.free(pt_frame, 1);
+                return (
+                    false,
+                    2,
+                    7,
+                    nxe_enabled,
+                    stack_base,
+                    STRUCTURAL_FAIL as u64,
+                    pd_raw,
+                );
+            };
+            // Swap-then-flush ordering (REVIEW #743 risk 2): PD pointer
+            // swap first, then invlpg the 4 stack VAs, then re-walk. The
+            // re-walk `ok=1` is the gate for the USTACK flip (CPL3 proof
+            // rides next slice).
+            unsafe {
+                (*pd_ptr)[pd_idx] = new_pd;
+                let mut i = 0usize;
+                while i < USER_STACK_PAGES {
+                    if let Some(va) = stack_base.checked_add((i as u64) * 4096) {
+                        invlpg_split_page(va);
+                    }
+                    i += 1;
+                }
+            }
+            let (re_opt, re_rsn) =
+                live_pt_resolve_detail(cr3, stack_base, |base| phys_to_table_ptr(info, base));
+            let Some(re_phys) = re_opt else {
+                return (
+                    false,
+                    2,
+                    re_rsn,
+                    nxe_enabled,
+                    stack_base,
+                    STRUCTURAL_FAIL as u64,
+                    pd_raw,
+                );
+            };
+            re_phys
+        }
     };
     let Some(pt_ptr) = phys_to_table_ptr_mut(info, pt_phys) else {
         return (false, 3, 0, nxe_enabled, stack_base, pt_phys, pd_raw);
@@ -5105,6 +5265,64 @@ mod tests {
             live_pt_resolve_detail(0x1000, 0x0000_8000_0000_0000, &lookup).1,
             8
         );
+    }
+
+    #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    fn split_swap_preserves_user_scoping_and_pd_encoding() {
+        // S09 slice2bi (#30, REVIEW #743 risks 3+5): split preserves flags
+        // with USER=0 everywhere; PD swap drops USER/PS/NX/G/A/D, keeps
+        // PCD/PWT; only the 4 stack slots become USER after the install.
+        use baseos_kernel::page_table::pte_encode;
+        use baseos_kernel::page_table::PageFlags;
+        use baseos_kernel::page_table::PTE_PS_BIT;
+        let flags = PageFlags::PRESENT.union(PageFlags::WRITABLE);
+        // Live shape 0xde000e3: P+W+A+D+PS at 2M base 0xde00000.
+        let leaf = pte_encode(0xde00_0000, flags) | PTE_PS_BIT | (1 << 5) | (1 << 6);
+        let mut pt = [0u64; 512];
+        let base = split_2m_leaf_fill(leaf, &mut pt).expect("live leaf must split");
+        assert_eq!(base, 0xde00_0000);
+        // USER scoping: all 508+4 start supervisor (leaf has no USER).
+        assert!(pt.iter().all(|e| e & (1 << 2) == 0));
+        // PD swap encoding: PRESENT+W set, PS/USER/NX/G/A/D clear, PCD/PWT kept.
+        let new_pd = encode_pd_table_entry(0x9000, leaf).expect("encodable PT frame");
+        assert_eq!(new_pd & 0x3, 0x3);
+        assert_eq!(new_pd & PTE_PS_BIT, 0);
+        assert_eq!(new_pd & (1 << 2), 0);
+        assert_eq!(new_pd & (1 << 63), 0);
+        assert_eq!(new_pd & PTE_ADDR_MASK, 0x9000);
+        // Misaligned PT frame refuses.
+        assert_eq!(encode_pd_table_entry(0x9001, leaf), None);
+        // PD table locator agrees with the raw PTE reader on the same walk.
+        let mut pml4 = [0u64; 512];
+        let mut pdpt = [0u64; 512];
+        let mut pd = [0u64; 512];
+        pml4[0] = pte_encode(0x2000, flags);
+        pdpt[0] = pte_encode(0x3000, flags);
+        pd[0] = leaf;
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                0x2000 => Some(unsafe { &*(&pdpt as *const [u64; 512]) }),
+                0x3000 => Some(unsafe { &*(&pd as *const [u64; 512]) }),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            live_pd_table_for_va(0x1000, 0x0, &lookup),
+            Some((0x3000, 0))
+        );
+        assert_eq!(live_pd_pte_for_va(0x1000, 0x0, &lookup), Some(leaf));
+        // Upper miss: locator and raw reader both fail closed.
+        let mut pml4_miss = [0u64; 512];
+        pml4_miss[0] = pte_encode(0x5000, flags);
+        let lookup_miss = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(unsafe { &*(&pml4_miss as *const [u64; 512]) }),
+                _ => None,
+            }
+        };
+        assert_eq!(live_pd_table_for_va(0x1000, 0x0, &lookup_miss), None);
     }
 
     #[test]
