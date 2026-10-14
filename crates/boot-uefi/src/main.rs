@@ -1257,6 +1257,7 @@ struct TryStore {
     high_fault: bool,
     low_code: u64,
     high_code: u64,
+    rip_ok: bool,
 }
 
 impl TryStore {
@@ -1266,13 +1267,17 @@ impl TryStore {
             high_fault: false,
             low_code: STRUCTURAL_FAIL as u64,
             high_code: STRUCTURAL_FAIL as u64,
+            rip_ok: false,
         }
     }
 }
 
 /// Emit the one-line `TRYSTORE` diagnostic right after the `PTDUMP` line:
-/// `TRYSTORE low=<0|1> high=<0|1> lcode=0x... hcode=0x...`.
-/// Reporting-only; the e2e script does not gate on it.
+/// `TRYSTORE low=<0|1> high=<0|1> lcode=0x... hcode=0x... rok=<0|1>`.
+/// `rok` is 1 only when the high-fault RIP decodes to the expected 3-byte
+/// `mov [rdi], rax` (`48 89 07`) on the same boot — the live emission proof
+/// for `TRYSTORE_SKIP_LEN` (REVIEW #761 R2). Reporting-only; the e2e script
+/// does not gate on it.
 fn write_trystore_line<E>(
     ts: TryStore,
     emit: &mut impl FnMut(u8) -> Result<(), E>,
@@ -1285,6 +1290,8 @@ fn write_trystore_line<E>(
     write_u64_hex(emit, ts.low_code)?;
     write_str(emit, " hcode=")?;
     write_u64_hex(emit, ts.high_code)?;
+    write_str(emit, " rok=")?;
+    write_u64_dec(emit, u64::from(ts.rip_ok))?;
     write_str(emit, "\n")
 }
 
@@ -1383,6 +1390,19 @@ const TRYSTORE_SKIP_LEN: u64 = 3;
 // text, invisible to dead-code analysis).
 const _: () = assert!(TRYSTORE_SKIP_LEN == 3);
 
+/// Expected encoding of the probe store `mov [rdi], rax` (REX.W `0x48` +
+/// opcode `0x89` + ModRM `0x07`). The guest decodes the 3 bytes at the
+/// captured fault RIP and reports `rok=1` only on an exact match — the live
+/// emission proof that the stub's `addq $3` skips exactly this instruction
+/// (REVIEW #761 R2). Pure; host tests pin match/mismatch.
+const TRYSTORE_PROBE_BYTES: [u8; 3] = [0x48, 0x89, 0x07];
+
+/// Pure byte-decode for the fault-RIP proof: `true` only when the 3 bytes
+/// at the captured fault RIP equal [`TRYSTORE_PROBE_BYTES`].
+fn trystore_rip_ok(bytes: [u8; 3]) -> bool {
+    bytes == TRYSTORE_PROBE_BYTES
+}
+
 /// Pure IDT gate encoder for the try-store catch stub: present DPL0
 /// 64-bit interrupt gate (type `0xE`, attr `0x8E`) with the caller `CS`
 /// selector (interrupts stay masked via `cli`; the gate only fields the
@@ -1419,14 +1439,17 @@ struct TryStoreIdtr {
 // `baseos-kernel`). Entry frame is `[err][RIP][CS][RFLAGS]`; after two
 // pushes the error code sits at `[rsp+16]` and the resume RIP at
 // `[rsp+24]`. Leaves the result in registers (the probe reads them as
-// `inout("r10")` fault flag / `inout("r11")` error code, both pre-zeroed,
-// so the no-fault path reports `(0, 0)` without any COM1 or memory
-// traffic): sets `r10=1`, `r11=err`, skips `TRYSTORE_SKIP_LEN` past the
-// faulting `mov [rdi], rax`, restores the two scratch registers,
-// discards the error-code slot, and `iretq`s. Preserves `rax`/`rcx` via
-// push/pop (the probe holds the slot in `rdi` and the pattern in `rax`
-// across the store); `rdi`/`r10`/`r11` are compiler-reserved outputs of
-// the faulting `asm!` block, so no other live state can hide there.
+// `inout("r10")` fault flag / `inout("r11")` error code / `inout("r12")`
+// fault RIP, all pre-zeroed, so the no-fault path reports `(0, 0, 0)`
+// without any COM1 or memory traffic): sets `r10=1`, `r11=err`,
+// `r12=fault-RIP`, skips `TRYSTORE_SKIP_LEN` past the faulting
+// `mov [rdi], rax`, restores the two scratch registers, discards the
+// error-code slot, and `iretq`s. Preserves `rax`/`rcx` via push/pop (the
+// probe holds the slot in `rdi` and the pattern in `rax` across the
+// store); `rdi`/`r10`/`r11`/`r12` are compiler-reserved outputs of the
+// faulting `asm!` block, so no other live state can hide there.
+// Slice2bq (#30, REVIEW #761 R2): `r12` carries the pre-skip fault RIP so
+// the guest can byte-decode the faulting instruction live.
 #[cfg(not(test))]
 core::arch::global_asm!(
     r#"
@@ -1436,6 +1459,8 @@ core::arch::global_asm!(
         push rcx
         mov rax, [rsp+16]
         mov r11, rax
+        mov rax, [rsp+24]
+        mov r12, rax
         mov r10, 1
         add qword ptr [rsp+24], 3
         pop rcx
@@ -1451,13 +1476,14 @@ extern "C" {
 }
 
 /// Bounded `#PF`-catch try-store probe (S09 slice2bo, #30, REVIEW #757;
-/// slice2bp closes REVIEW #759 risks 1+3):
+/// slice2bp closes REVIEW #759 risks 1+3; slice2bq closes REVIEW #761
+/// walker-gate + R2):
 /// saves the firmware IDTR (`sidt`), installs the scratch IDT with the
 /// catch stub on vector 14 (`lidt`), runs exactly two single-qword stores
 /// (low-RAM freshly allocated frame = expect success, `FAULT_VA_CR2` =
 /// expect fault), then restores the firmware IDTR (`lidt`) and frees the
 /// frame. Each store is one `mov [rdi], rax` (3 bytes — the stub skips
-/// exactly `TRYSTORE_SKIP_LEN`); the `r10`/`r11` result registers are
+/// exactly `TRYSTORE_SKIP_LEN`); the `r10`/`r11`/`r12` result registers are
 /// pre-zeroed `inout` operands, so at most one `#PF` per probe can land
 /// and the no-fault path needs no handler traffic. The high probe writes
 /// back the hoisted old word on success, so a surprise-RW outcome corrupts
@@ -1466,13 +1492,15 @@ extern "C" {
 /// holds (`SPLIT_LIVE_SWAP_ENABLED` untouched, still `false`).
 ///
 /// REVIEW #759 risk 1 (closed slice2bp): both old-word reads are hoisted
-/// BEFORE the `lidt` window. Reads never fault on present pages (only
-/// writes fault on RO), and the walker reports both VAs present on every
-/// quarantined boot — so an unexpected read fault now triple-faults loudly
-/// OUTSIDE the catcher instead of resuming +3 into the wrong instruction.
-/// REVIEW #759 risk 3 (closed slice2bp): `IF` is asserted (not assumed) via
-/// `pushfq`; risk 2 (SKIP_LEN emission proof) stays open — the const-assert
-/// + host pin hold the 3-byte contract, a fault-RIP byte decode rides next.
+/// BEFORE the `lidt` window. REVIEW #761 walker-gate (closed slice2bq):
+/// both hoisted reads are walker-gated — if either VA misses the live walk
+/// (`walk_full_leaf_flags` `Err`), the probe returns `empty()` (frame
+/// freed, IDT never swapped) instead of triple-faulting on a surprise
+/// not-present read outside the catcher. REVIEW #759 risk 3 (closed
+/// slice2bp): `IF` is asserted (not assumed) via `pushfq`; REVIEW #761 R2
+/// (closed slice2bq): the stub captures the pre-skip fault RIP into `r12`
+/// and the guest byte-decodes the 3 bytes there against
+/// `TRYSTORE_PROBE_BYTES`, reporting `rok=1` only on an exact match.
 ///
 /// # Safety
 /// Post-EBS only, on the boot thread: owns the `TRYSTORE_IDT` static,
@@ -1487,6 +1515,7 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
             high_fault: true,
             low_code: 0,
             high_code: 7,
+            rip_ok: true,
         };
     }
     #[cfg(not(test))]
@@ -1496,6 +1525,19 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         let Some(frame) = alloc.alloc(1) else {
             return TryStore::empty();
         };
+        // REVIEW #761 walker-gate: gate BOTH hoisted reads on the live walk.
+        // A surprise not-present on either VA fails closed here (frame freed,
+        // sentinels) instead of triple-faulting outside the catcher.
+        let cr3base = cr3_pml4_base(read_cr3());
+        let low_present =
+            walk_full_leaf_flags(cr3base, frame, |base| phys_to_table_ptr(info, base)).is_ok();
+        let high_present =
+            walk_full_leaf_flags(cr3base, FAULT_VA_CR2, |base| phys_to_table_ptr(info, base))
+                .is_ok();
+        if !low_present || !high_present {
+            let _ = alloc.free(frame, 1);
+            return TryStore::empty();
+        }
         // REVIEW #759 risk 1: hoist both old-word reads BEFORE the `lidt`
         // window (reads of walker-present pages cannot fault; see above).
         let low_slot = frame as *mut u64;
@@ -1535,7 +1577,8 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         // (old word hoisted above; restored here on the no-fault path).
         let mut low_flag: u64 = 0;
         let mut low_code: u64 = 0;
-        asm!("mov [rdi], rax", in("rdi") low_slot, in("rax") PATTERN, inout("r10") low_flag, inout("r11") low_code, options(nostack, preserves_flags));
+        let mut low_rip: u64 = 0;
+        asm!("mov [rdi], rax", in("rdi") low_slot, in("rax") PATTERN, inout("r10") low_flag, inout("r11") low_code, inout("r12") low_rip, options(nostack, preserves_flags));
         let low_fault = low_flag != 0;
         if !low_fault {
             core::ptr::write_volatile(low_slot, low_old);
@@ -1544,7 +1587,8 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         // (old word hoisted above; restored on a surprise no-fault path).
         let mut high_flag: u64 = 0;
         let mut high_code: u64 = 0;
-        asm!("mov [rdi], rax", in("rdi") high_slot, in("rax") PATTERN, inout("r10") high_flag, inout("r11") high_code, options(nostack, preserves_flags));
+        let mut high_rip: u64 = 0;
+        asm!("mov [rdi], rax", in("rdi") high_slot, in("rax") PATTERN, inout("r10") high_flag, inout("r11") high_code, inout("r12") high_rip, options(nostack, preserves_flags));
         let high_fault = high_flag != 0;
         if !high_fault {
             core::ptr::write_volatile(high_slot, high_old);
@@ -1552,11 +1596,39 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         // Restore the firmware IDT first, then free the frame.
         asm!("lidt [{0}]", in(reg) &saved, options(readonly, nostack, preserves_flags));
         let _ = alloc.free(frame, 1);
+        // REVIEW #761 R2: live emission proof — decode the 3 bytes at the
+        // captured fault RIP(s) (guest `.text`, always readable). `rok` is 1
+        // only when the high probe faulted with matching bytes AND a surprise
+        // low fault (if any) also decodes; any other outcome (no high fault,
+        // null RIP, mismatch) reports 0 without touching the fault path.
+        // Reading `low_rip` here also consumes the `r12` output of probe 1.
+        let low_decode_ok = if low_fault {
+            if low_rip == 0 {
+                false
+            } else {
+                let b0 = core::ptr::read_volatile(low_rip as *const u8);
+                let b1 = core::ptr::read_volatile((low_rip + 1) as *const u8);
+                let b2 = core::ptr::read_volatile((low_rip + 2) as *const u8);
+                trystore_rip_ok([b0, b1, b2])
+            }
+        } else {
+            low_rip == 0
+        };
+        let high_decode_ok = if high_fault && high_rip != 0 {
+            let b0 = core::ptr::read_volatile(high_rip as *const u8);
+            let b1 = core::ptr::read_volatile((high_rip + 1) as *const u8);
+            let b2 = core::ptr::read_volatile((high_rip + 2) as *const u8);
+            trystore_rip_ok([b0, b1, b2])
+        } else {
+            false
+        };
+        let rip_ok = low_decode_ok && high_decode_ok;
         TryStore {
             low_fault,
             high_fault,
             low_code,
             high_code,
+            rip_ok,
         }
     }
 }
@@ -5892,6 +5964,7 @@ mod tests {
         // S09 slice2bo (#30, REVIEW #757): host backstop for the bounded
         // try-store probe shape. The guest writer shares this body, so a
         // format drift fails here; the empty probe pins the sentinels.
+        // Slice2bq adds `rok=` (REVIEW #761 R2 live emission proof).
         let mut out = Vec::new();
         write_trystore_line::<core::convert::Infallible>(
             TryStore {
@@ -5899,6 +5972,7 @@ mod tests {
                 high_fault: true,
                 low_code: 0,
                 high_code: 7,
+                rip_ok: true,
             },
             &mut |b| {
                 out.push(b);
@@ -5908,7 +5982,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x7\n"
+            "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x7 rok=1\n"
         );
         let mut out_empty = Vec::new();
         write_trystore_line::<core::convert::Infallible>(TryStore::empty(), &mut |b| {
@@ -5918,8 +5992,20 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(out_empty).unwrap(),
-            "TRYSTORE low=0 high=0 lcode=0xffffffffffffffff hcode=0xffffffffffffffff\n"
+            "TRYSTORE low=0 high=0 lcode=0xffffffffffffffff hcode=0xffffffffffffffff rok=0\n"
         );
+    }
+
+    #[test]
+    fn trystore_rip_decode_pins_mov_encoding() {
+        // S09 slice2bq (#30, REVIEW #761 R2): the fault-RIP byte decode
+        // accepts exactly `mov [rdi], rax` (48 89 07) and rejects any
+        // mismatch — the pure half of the live emission proof.
+        assert!(trystore_rip_ok([0x48, 0x89, 0x07]));
+        assert!(!trystore_rip_ok([0x48, 0x89, 0x06]));
+        assert!(!trystore_rip_ok([0x90, 0x90, 0x90]));
+        assert!(!trystore_rip_ok([0x00, 0x00, 0x00]));
+        assert_eq!(TRYSTORE_PROBE_BYTES, [0x48, 0x89, 0x07]);
     }
 
     #[test]
