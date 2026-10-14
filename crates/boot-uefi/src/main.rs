@@ -1265,6 +1265,9 @@ struct TryStore {
     low_code: u64,
     high_code: u64,
     rip_ok: bool,
+    nmi_present: bool,
+    mce_present: bool,
+    idtr_ok: bool,
 }
 
 impl TryStore {
@@ -1275,7 +1278,15 @@ impl TryStore {
             low_code: STRUCTURAL_FAIL as u64,
             high_code: STRUCTURAL_FAIL as u64,
             rip_ok: false,
+            nmi_present: true,
+            mce_present: true,
+            idtr_ok: false,
         }
+    }
+    /// Fail-closed NMI gate: 1 only when the in-window SIDT check matched
+    /// AND both NMI/MCE present bits read via the live IDTR base are clear.
+    fn nmi_ok(&self) -> bool {
+        self.idtr_ok && !self.nmi_present && !self.mce_present
     }
 }
 
@@ -1303,13 +1314,13 @@ fn write_trystore_line<E>(
     write_str(emit, "\n")
 }
 
-/// Live NMI/MCE present-bit readback for the installed scratch IDT
-/// (S09 slice2by, #30, REVIEW #781 cheapest disconfirm): returns the
-/// CPU-visible present bits of slots 2 (NMI) and 18 (MCE). Both must be
-/// 0 — the installed table traps an in-window NMI/MCE via triple-fault
-/// (fail-loud), never a stale firmware handler. Reads the exact table
-/// the guest installed, so a future widening (extra present slot on 2/18)
-/// fails the live gate, not just the host pin.
+/// Pure writer-image helper for the scratch IDT (S09 slice2by, #30): returns
+/// the present bits of slots 2 (NMI) and 18 (MCE) of the passed table image.
+/// REVIEW #782 finding 1 (overclaim fix, slice2bz): this does NOT prove what
+/// the CPU sees — the guest reads the table the CPU uses via the live IDTR
+/// base inside the `lidt` window (see `try_store_probe`), never via a
+/// post-restore static read. Host tests pin this pure shape; the live SIDT
+/// pin is `trystore_idtr_matches` + the in-window `TRYSTORE-NMI idtr=` field.
 fn trystore_nmi_mce_present(table: &[[u64; 2]; 32]) -> (bool, bool) {
     const PRESENT_BIT: u64 = 1 << 47;
     (
@@ -1318,14 +1329,28 @@ fn trystore_nmi_mce_present(table: &[[u64; 2]; 32]) -> (bool, bool) {
     )
 }
 
+/// Pure SIDT-match check for the in-window live IDTR (S09 slice2bz, #30,
+/// REVIEW #782 finding 1): `true` only when the live `sidt` base equals the
+/// `lidt`-installed scratch base AND the limit equals `32*16-1` (511).
+/// The guest captures this inside the `lidt` window and reports it as
+/// `TRYSTORE-NMI idtr=<0|1>`; a post-use zeroing or IDTR/memory skew that
+/// the old writer-image readback would false-pass now fails `ok=0`.
+fn trystore_idtr_matches(live_base: u64, live_limit: u16, expected_base: u64) -> bool {
+    live_base == expected_base && live_limit == (32u16 * 16 - 1)
+}
+
 /// Emit the one-line `TRYSTORE-NMI` diagnostic right after the `TRYSTORE`
-/// line: `TRYSTORE-NMI ok=<0|1> nmi=<0|1> mce=<0|1>`. `nmi`/`mce` are the
-/// live present bits (expect 0/0); `ok` is 1 only when both are clear.
-/// Value gate (not value-free): any present NMI/MCE prints ok=0 fail-closed.
+/// line: `TRYSTORE-NMI ok=<0|1> nmi=<0|1> mce=<0|1> idtr=<0|1>`. `nmi`/`mce`
+/// are the present bits read via the LIVE IDTR base inside the `lidt`
+/// window (expect 0/0); `idtr` is 1 only when the in-window `sidt` base +
+/// limit matched the installed scratch table; `ok` is 1 only when all three
+/// hold. Value gate (not value-free): any present NMI/MCE or IDTR mismatch
+/// prints ok=0 fail-closed.
 fn write_trystore_nmi_line<E>(
     ok: bool,
     nmi_present: bool,
     mce_present: bool,
+    idtr_ok: bool,
     emit: &mut impl FnMut(u8) -> Result<(), E>,
 ) -> Result<(), E> {
     write_str(emit, "TRYSTORE-NMI ok=")?;
@@ -1334,6 +1359,8 @@ fn write_trystore_nmi_line<E>(
     write_u64_dec(emit, u64::from(nmi_present))?;
     write_str(emit, " mce=")?;
     write_u64_dec(emit, u64::from(mce_present))?;
+    write_str(emit, " idtr=")?;
+    write_u64_dec(emit, u64::from(idtr_ok))?;
     write_str(emit, "\n")
 }
 
@@ -1616,6 +1643,9 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
             low_code: 0,
             high_code: 7,
             rip_ok: true,
+            nmi_present: false,
+            mce_present: false,
+            idtr_ok: true,
         }
     }
     #[cfg(not(test))]
@@ -1663,11 +1693,30 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         let (lo, hi) = trystore_gate_for(handler, cs);
         let idt = core::ptr::addr_of_mut!(TRYSTORE_IDT);
         trystore_scratch_init(&mut *idt, lo, hi);
+        let ours_base = idt as u64;
         let ours = TryStoreIdtr {
             limit: (32u16 * 16 - 1),
             base: idt as u64,
         };
         asm!("lidt [{0}]", in(reg) &ours, options(readonly, nostack, preserves_flags));
+        // REVIEW #782 finding 1 (slice2bz): SIDT-verify INSIDE the window.
+        // The old code read `TRYSTORE_IDT` memory after the firmware restore,
+        // so a post-use zeroing or IDTR/memory skew would false-pass. Here
+        // `sidt` captures the CPU-visible IDTR while ours is installed, the
+        // base+limit must match, and slots 2/18 are read via the LIVE base
+        // (not the static), so the emission proves the installed table. On
+        // mismatch nothing wild is dereferenced: fail-closed (true, true).
+        let mut live = TryStoreIdtr { limit: 0, base: 0 };
+        asm!("sidt [{0}]", in(reg) &mut live, options(nostack, preserves_flags));
+        let live_limit = core::ptr::addr_of!(live.limit).read_unaligned();
+        let live_base = core::ptr::addr_of!(live.base).read_unaligned();
+        let idtr_ok = trystore_idtr_matches(live_base, live_limit, ours_base);
+        let (nmi_present, mce_present) = if idtr_ok {
+            let live_table = &*(live_base as *const [[u64; 2]; 32]);
+            trystore_nmi_mce_present(live_table)
+        } else {
+            (true, true)
+        };
         // Probe 1 (expect success): single store to the fresh low frame
         // (old word hoisted above; restored here on the no-fault path).
         let mut low_flag: u64 = 0;
@@ -1742,6 +1791,9 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
             low_code,
             high_code,
             rip_ok,
+            nmi_present,
+            mce_present,
+            idtr_ok,
         }
     }
 }
@@ -4111,19 +4163,19 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // reporting-only, e2e ungated.
             let ts = try_store_probe(&info);
             let _ = write_trystore_line::<Infallible>(ts, &mut emit);
-            // S09 slice2by (#30, REVIEW #781 live proof): read back the
-            // installed scratch table's NMI/MCE present bits on the same
-            // boot and emit them. Host-only assert becomes QEMU-observed.
-            #[cfg(not(test))]
-            {
-                let (nmi_p, mce_p) = trystore_nmi_mce_present(&*core::ptr::addr_of!(TRYSTORE_IDT));
-                let _ = write_trystore_nmi_line::<Infallible>(
-                    !nmi_p && !mce_p,
-                    nmi_p,
-                    mce_p,
-                    &mut emit,
-                );
-            }
+            // S09 slice2by (#30, REVIEW #781 live proof) + slice2bz (#30,
+            // REVIEW #782 finding 1): the NMI/MCE + SIDT values come from
+            // INSIDE the `lidt` window (live IDTR base read, SIDT-verified),
+            // carried in `ts` — never a post-restore static read, so a
+            // post-use zeroing or IDTR/memory skew fails `ok=0`, not a
+            // false pass. `ok = idtr && !nmi && !mce` via `nmi_ok()`.
+            let _ = write_trystore_nmi_line::<Infallible>(
+                ts.nmi_ok(),
+                ts.nmi_present,
+                ts.mce_present,
+                ts.idtr_ok,
+                &mut emit,
+            );
             let ao = alloc_order_snapshot(&info, umap_pt, umap_base);
             let _ = write_allocor_line::<Infallible>(ao, &mut emit);
             let ustack_outcome = probe_ustack(&info);
@@ -6099,6 +6151,9 @@ mod tests {
                 low_code: 0,
                 high_code: 7,
                 rip_ok: true,
+                nmi_present: false,
+                mce_present: false,
+                idtr_ok: true,
             },
             &mut |b| {
                 out.push(b);
@@ -6124,20 +6179,39 @@ mod tests {
 
     #[test]
     fn trystore_nmi_line_pins_live_readback_shape() {
-        // S09 slice2by (#30, REVIEW #781 live proof): host backstop for the
-        // NMI/MCE present-bit readback. The guest reads the installed table
-        // on the same boot, so a writer drift or a widened slot fails here
-        // and in QEMU. Fail-closed: any present bit forces ok=0.
+        // S09 slice2by (#30, REVIEW #781 live proof) + slice2bz (#30, REVIEW
+        // #782 finding 1): host backstop for the NMI/MCE + SIDT readback. The
+        // guest values come from inside the `lidt` window (live IDTR base +
+        // SIDT match as `idtr`), so a writer drift, widened slot, or
+        // IDTR/memory skew fails here and in QEMU. Fail-closed: any present
+        // bit or idtr mismatch forces ok=0.
         let (lo, hi) = trystore_gate_for(0x1234_5678_9abc_def0, 0x28);
         let mut table = [[0u64; 2]; 32];
         trystore_scratch_init(&mut table, lo, hi);
         let (nmi_p, mce_p) = trystore_nmi_mce_present(&table);
         assert!(!nmi_p && !mce_p);
+        // Pure SIDT-match pin: exact base + limit 511 passes, any drift fails.
+        assert!(trystore_idtr_matches(0x4000, 511, 0x4000));
+        assert!(!trystore_idtr_matches(0x4001, 511, 0x4000));
+        assert!(!trystore_idtr_matches(0x4000, 510, 0x4000));
+        assert!(!trystore_idtr_matches(0, 511, 0x4000));
+        let ts = TryStore {
+            low_fault: false,
+            high_fault: true,
+            low_code: 0,
+            high_code: 7,
+            rip_ok: true,
+            nmi_present: nmi_p,
+            mce_present: mce_p,
+            idtr_ok: true,
+        };
+        assert!(ts.nmi_ok());
         let mut out = Vec::new();
         write_trystore_nmi_line::<core::convert::Infallible>(
-            !nmi_p && !mce_p,
-            nmi_p,
-            mce_p,
+            ts.nmi_ok(),
+            ts.nmi_present,
+            ts.mce_present,
+            ts.idtr_ok,
             &mut |b| {
                 out.push(b);
                 Ok(())
@@ -6146,17 +6220,29 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "TRYSTORE-NMI ok=1 nmi=0 mce=0\n"
+            "TRYSTORE-NMI ok=1 nmi=0 mce=0 idtr=1\n"
         );
         // Corrupted present bit forces fail-closed.
         table[2][0] |= 1 << 47;
         let (nmi_p2, mce_p2) = trystore_nmi_mce_present(&table);
         assert!(nmi_p2 && !mce_p2);
+        let ts2 = TryStore {
+            low_fault: false,
+            high_fault: true,
+            low_code: 0,
+            high_code: 7,
+            rip_ok: true,
+            nmi_present: nmi_p2,
+            mce_present: mce_p2,
+            idtr_ok: true,
+        };
+        assert!(!ts2.nmi_ok());
         let mut out2 = Vec::new();
         write_trystore_nmi_line::<core::convert::Infallible>(
-            !nmi_p2 && !mce_p2,
-            nmi_p2,
-            mce_p2,
+            ts2.nmi_ok(),
+            ts2.nmi_present,
+            ts2.mce_present,
+            ts2.idtr_ok,
             &mut |b| {
                 out2.push(b);
                 Ok(())
@@ -6165,8 +6251,38 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(out2).unwrap(),
-            "TRYSTORE-NMI ok=0 nmi=1 mce=0\n"
+            "TRYSTORE-NMI ok=0 nmi=1 mce=0 idtr=1\n"
         );
+        // IDTR mismatch forces fail-closed even with clear present bits.
+        let ts3 = TryStore {
+            low_fault: false,
+            high_fault: true,
+            low_code: 0,
+            high_code: 7,
+            rip_ok: true,
+            nmi_present: false,
+            mce_present: false,
+            idtr_ok: false,
+        };
+        assert!(!ts3.nmi_ok());
+        let mut out3 = Vec::new();
+        write_trystore_nmi_line::<core::convert::Infallible>(
+            ts3.nmi_ok(),
+            ts3.nmi_present,
+            ts3.mce_present,
+            ts3.idtr_ok,
+            &mut |b| {
+                out3.push(b);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out3).unwrap(),
+            "TRYSTORE-NMI ok=0 nmi=0 mce=0 idtr=0\n"
+        );
+        // Empty probe is fail-closed on the NMI gate too.
+        assert!(!TryStore::empty().nmi_ok());
     }
 
     #[test]

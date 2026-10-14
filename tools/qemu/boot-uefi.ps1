@@ -307,14 +307,16 @@ if ($serialText -and $serialText.Contains($marker)) {
   # no-fault reports 0). See tools/qemu/test-boot-uefi-gates.ps1.
   $trystorePat = "TRYSTORE low=0 high=1 [^\r\n]*lcode=0x0[^\r\n]*hcode=0x3[^\r\n]*rok=1(\s|$)"
   # S09 slice2by NMI/MCE live readback (#30, REVIEW #781 cheapest
-  # disconfirm): the guest reads back the installed scratch IDT's present
-  # bits on the same boot and emits `TRYSTORE-NMI ok=1 nmi=0 mce=0`.
-  # Value gate (not value-free): any present NMI/MCE prints ok=0
-  # fail-closed. Same-line shape mirrors the TRYSTORE gate: literal space
-  # after ok=1 stops ok=10 false-passing, [ \t] mid-line keeps nmi/mce
-  # same-line (`(\s|$)` would match `\n` and false-pass a split pair),
-  # (\s|$) terminates mce. See tools/qemu/test-boot-uefi-gates.ps1.
-  $trystoreNmiPat = "TRYSTORE-NMI ok=1 [^\r\n]*nmi=0[ \t][^\r\n]*mce=0(\s|$)"
+  # disconfirm) + slice2bz (#30, REVIEW #782 finding 1 SIDT pin): the guest
+  # captures the live IDTR via `sidt` inside the `lidt` window, checks
+  # base+limit, reads slots 2/18 via the LIVE base, and emits
+  # `TRYSTORE-NMI ok=1 nmi=0 mce=0 idtr=1` (`ok = idtr && !nmi && !mce`).
+  # Value gate (not value-free): any present NMI/MCE or IDTR mismatch prints
+  # ok=0 fail-closed. Same-line shape mirrors the TRYSTORE gate: literal
+  # space after ok=1 stops ok=10 false-passing, [ \t] mid-line keeps
+  # nmi/mce/idtr same-line (`(\s|$)` would match `\n` and false-pass a split
+  # pair), (\s|$) terminates idtr. See test-boot-uefi-gates.ps1.
+  $trystoreNmiPat = "TRYSTORE-NMI ok=1 [^\r\n]*nmi=0[ \t][^\r\n]*mce=0[ \t][^\r\n]*idtr=1(\s|$)"
   # S09 slice2bb live U-map attempt (#30): the guest installs the 4-page
   # U+W+NX map (alloc-4 + bound store+flush through the live PT, 4K base)
   # then re-walks. Live QEMU 2026-10-13 still prints
@@ -440,7 +442,7 @@ if ($serialText -and $serialText.Contains($marker)) {
   $hasExc = $serialText.Contains($exc)
    if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasUser -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSwitchLat -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasTick -and $hasSti -and $hasIrqstack -and $hasThreadJump -and $hasThreadJumpRun -and    $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and    $hasPf -and $hasPfus -and $hasTrystore -and $hasTrystoreNmi -and $hasUstack -and $hasTr -and $noTrFail -and $hasExc) {
     Write-Output ("Boot summary: FOUND (" + $bootinfo + " + " + $memmap + " + " + $notrunc + " + " + $mapsize + " + " + $descsize + " + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + USER ok=1 passed=9/9 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SWITCH-LAT ok=1 count=16 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + STI ok=1 + IRQSTACK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + PFUS ok=1 us=0 w=0 p=0 + TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=1 + TRYSTORE-NMI ok=1 nmi=0 mce=0 + USTACK ok=0 label + TR ok=1 sel=0x28 + no TR ok=0 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + USER ok=1 passed=9/9 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SWITCH-LAT ok=1 count=16 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + STI ok=1 + IRQSTACK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + PFUS ok=1 us=0 w=0 p=0 + TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=1 + TRYSTORE-NMI ok=1 nmi=0 mce=0 idtr=1 + USTACK ok=0 label + TR ok=1 sel=0x28 + no TR ok=0 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -485,7 +487,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "PF ok=1 vector=14-shape present=$hasPf, " +
       "PFUS ok=1 us=0 w=0 p=0-shape present=$hasPfus, " +
       "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=1-shape present=$hasTrystore, " +
-      "TRYSTORE-NMI ok=1 nmi=0 mce=0-shape present=$hasTrystoreNmi, " +
+      "TRYSTORE-NMI ok=1 nmi=0 mce=0 idtr=1-shape present=$hasTrystoreNmi, " +
       "USTACK ok=0 label-shape present=$hasUstack, " +
       "TR ok=1 sel=0x28-shape present=$hasTr, " +
       "no TR ok=0 present=$noTrFail, " +
