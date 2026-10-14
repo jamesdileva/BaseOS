@@ -1288,6 +1288,86 @@ fn write_trystore_line<E>(
     write_str(emit, "\n")
 }
 
+/// BootInfo alloc-order correlation snapshot (S09 slice2bp, #30, REVIEW #757
+/// step 2 + REVIEW #759): ties the probe frame class to the firmware map on
+/// the SAME boot, killing the cross-boot variance hypothesis (slice2bk
+/// 0xf803000-high vs slice2bl+ 0x4000-low). `regions` = BootInfo region
+/// count, `usable` = usable bytes (0 on an invalid header, same contract as
+/// `usable_bytes`), `free` = fresh-allocator free pages, `mspans`/`fspans` =
+/// coalesced map / free span counts, `frame` = PTDUMP probe frame (the 5th
+/// alloc of the diag allocator; STRUCTURAL_FAIL when the quarantine path did
+/// not probe), `sbase` = UMAP stack VA (link-placed BSS: varies with guest
+/// size, NOT firmware variance — the control that separates link layout from
+/// allocator order). Reporting-only; the e2e script does not gate on it.
+/// Serial byte lengths are NOT comparable across slices (REVIEW #759 risk 4:
+/// each new reporting line grows the log by design).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AllocOrder {
+    regions: u64,
+    usable: u64,
+    free: u64,
+    mspans: u64,
+    fspans: u64,
+    frame: u64,
+    sbase: u64,
+}
+
+impl AllocOrder {
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self {
+            regions: 0,
+            usable: 0,
+            free: 0,
+            mspans: 0,
+            fspans: 0,
+            frame: STRUCTURAL_FAIL as u64,
+            sbase: STRUCTURAL_FAIL as u64,
+        }
+    }
+}
+
+/// Snapshot the alloc-order correlation for `info` on this boot. Pure reads
+/// over `info` plus a fresh (unmutated) `FrameAllocator` view: no alloc/free,
+/// so the live allocator cursor is untouched.
+fn alloc_order_snapshot(info: &BootInfo, frame: u64, sbase: u64) -> AllocOrder {
+    let alloc = FrameAllocator::from_boot_info(info);
+    AllocOrder {
+        regions: info.memory_map().len() as u64,
+        usable: info.usable_bytes(),
+        free: alloc.free_pages(),
+        mspans: alloc.map_span_count() as u64,
+        fspans: alloc.free_span_count() as u64,
+        frame,
+        sbase,
+    }
+}
+
+/// Emit the one-line `ALLOCOR` diagnostic right after the `TRYSTORE` line:
+/// `ALLOCOR regions=<n> usable=0x... free=<n> mspans=<n> fspans=<n>
+/// frame=0x... sbase=0x...`.
+/// Reporting-only; the e2e script does not gate on it.
+fn write_allocor_line<E>(
+    ao: AllocOrder,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "ALLOCOR regions=")?;
+    write_u64_dec(emit, ao.regions)?;
+    write_str(emit, " usable=")?;
+    write_u64_hex(emit, ao.usable)?;
+    write_str(emit, " free=")?;
+    write_u64_dec(emit, ao.free)?;
+    write_str(emit, " mspans=")?;
+    write_u64_dec(emit, ao.mspans)?;
+    write_str(emit, " fspans=")?;
+    write_u64_dec(emit, ao.fspans)?;
+    write_str(emit, " frame=")?;
+    write_u64_hex(emit, ao.frame)?;
+    write_str(emit, " sbase=")?;
+    write_u64_hex(emit, ao.sbase)?;
+    write_str(emit, "\n")
+}
+
 /// Skip distance (bytes) the `#PF` catch stub adds to the saved RIP to
 /// resume past the faulting store. The probe store is Intel-syntax
 /// `mov [rdi], rax` = REX.W (`0x48`) + opcode (`0x89`) + ModRM (`0x07`,
@@ -1370,7 +1450,8 @@ extern "C" {
     fn baseos_trystore_pf();
 }
 
-/// Bounded `#PF`-catch try-store probe (S09 slice2bo, #30, REVIEW #757):
+/// Bounded `#PF`-catch try-store probe (S09 slice2bo, #30, REVIEW #757;
+/// slice2bp closes REVIEW #759 risks 1+3):
 /// saves the firmware IDTR (`sidt`), installs the scratch IDT with the
 /// catch stub on vector 14 (`lidt`), runs exactly two single-qword stores
 /// (low-RAM freshly allocated frame = expect success, `FAULT_VA_CR2` =
@@ -1378,11 +1459,20 @@ extern "C" {
 /// frame. Each store is one `mov [rdi], rax` (3 bytes — the stub skips
 /// exactly `TRYSTORE_SKIP_LEN`); the `r10`/`r11` result registers are
 /// pre-zeroed `inout` operands, so at most one `#PF` per probe can land
-/// and the no-fault path needs no handler traffic. The high probe reads
-/// the old word first and writes it back on success, so a surprise-RW
-/// outcome corrupts nothing. `cli` stays in effect throughout
-/// (exceptions do not need `sti`); quarantine holds
-/// (`SPLIT_LIVE_SWAP_ENABLED` untouched, still `false`).
+/// and the no-fault path needs no handler traffic. The high probe writes
+/// back the hoisted old word on success, so a surprise-RW outcome corrupts
+/// nothing. Requires ambient `cli` (asserted on entry: `IF==1` fails closed
+/// with sentinels instead of triple-faulting inside the window); quarantine
+/// holds (`SPLIT_LIVE_SWAP_ENABLED` untouched, still `false`).
+///
+/// REVIEW #759 risk 1 (closed slice2bp): both old-word reads are hoisted
+/// BEFORE the `lidt` window. Reads never fault on present pages (only
+/// writes fault on RO), and the walker reports both VAs present on every
+/// quarantined boot — so an unexpected read fault now triple-faults loudly
+/// OUTSIDE the catcher instead of resuming +3 into the wrong instruction.
+/// REVIEW #759 risk 3 (closed slice2bp): `IF` is asserted (not assumed) via
+/// `pushfq`; risk 2 (SKIP_LEN emission proof) stays open — the const-assert
+/// + host pin hold the 3-byte contract, a fault-RIP byte decode rides next.
 ///
 /// # Safety
 /// Post-EBS only, on the boot thread: owns the `TRYSTORE_IDT` static,
@@ -1406,6 +1496,21 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         let Some(frame) = alloc.alloc(1) else {
             return TryStore::empty();
         };
+        // REVIEW #759 risk 1: hoist both old-word reads BEFORE the `lidt`
+        // window (reads of walker-present pages cannot fault; see above).
+        let low_slot = frame as *mut u64;
+        let high_slot = FAULT_VA_CR2 as *mut u64;
+        let low_old = core::ptr::read_volatile(low_slot);
+        let high_old = core::ptr::read_volatile(high_slot);
+        // REVIEW #759 risk 3: assert (not assume) ambient `cli`. Bit 9 of
+        // RFLAGS is IF; `IF==1` fails closed with sentinels (frame freed,
+        // IDT never swapped) instead of triple-faulting in the window.
+        let rflags: u64;
+        asm!("pushfq; pop {0}", out(reg) rflags, options(nomem, nostack, preserves_flags));
+        if rflags & (1 << 9) != 0 {
+            let _ = alloc.free(frame, 1);
+            return TryStore::empty();
+        }
         // Read current CS for the gate selector.
         let cs: u16;
         asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
@@ -1426,9 +1531,8 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
             base: idt as u64,
         };
         asm!("lidt [{0}]", in(reg) &ours, options(readonly, nostack, preserves_flags));
-        // Probe 1 (expect success): single store to the fresh low frame.
-        let low_slot = frame as *mut u64;
-        let low_old = core::ptr::read_volatile(low_slot);
+        // Probe 1 (expect success): single store to the fresh low frame
+        // (old word hoisted above; restored here on the no-fault path).
         let mut low_flag: u64 = 0;
         let mut low_code: u64 = 0;
         asm!("mov [rdi], rax", in("rdi") low_slot, in("rax") PATTERN, inout("r10") low_flag, inout("r11") low_code, options(nostack, preserves_flags));
@@ -1436,9 +1540,8 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         if !low_fault {
             core::ptr::write_volatile(low_slot, low_old);
         }
-        // Probe 2 (expect fault): single store to the historic CR2.
-        let high_slot = FAULT_VA_CR2 as *mut u64;
-        let high_old = core::ptr::read_volatile(high_slot);
+        // Probe 2 (expect fault): single store to the historic CR2
+        // (old word hoisted above; restored on a surprise no-fault path).
         let mut high_flag: u64 = 0;
         let mut high_code: u64 = 0;
         asm!("mov [rdi], rax", in("rdi") high_slot, in("rax") PATTERN, inout("r10") high_flag, inout("r11") high_code, options(nostack, preserves_flags));
@@ -3818,8 +3921,13 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // S09 slice2bo (#30, REVIEW #757): bounded #PF-catch try-store
             // right after PTDUMP — low-RAM expect-success vs high-RAM
             // expect-fault on the same boot; reporting-only, e2e ungated.
+            // S09 slice2bp (#30, REVIEW #757 step 2): ALLOCOR ties the
+            // PTDUMP probe frame to the BootInfo map on the same boot;
+            // reporting-only, e2e ungated.
             let ts = try_store_probe(&info);
             let _ = write_trystore_line::<Infallible>(ts, &mut emit);
+            let ao = alloc_order_snapshot(&info, umap_pt, umap_base);
+            let _ = write_allocor_line::<Infallible>(ao, &mut emit);
             let ustack_outcome = probe_ustack(&info);
             write_ustack_report(ustack_outcome);
             // S04 slice 15: live leaf USER/NX audit of the PAGING probe
@@ -5830,6 +5938,69 @@ mod tests {
         assert_ne!(lo & (1 << 47), 0);
         assert_eq!((lo >> 40) & 0xf, 0xe);
         assert_eq!((lo >> 45) & 0x3, 0);
+    }
+
+    #[test]
+    fn allocor_line_pins_exact_shape() {
+        // S09 slice2bp (#30, REVIEW #757 step 2): host backstop for the
+        // BootInfo alloc-order correlation line. The guest writer shares
+        // this body, so a format drift fails here.
+        let mut out = Vec::new();
+        write_allocor_line::<core::convert::Infallible>(
+            AllocOrder {
+                regions: 98,
+                usable: 0xce94000,
+                free: 52869,
+                mspans: 8,
+                fspans: 8,
+                frame: 0x4000,
+                sbase: 0xde14000,
+            },
+            &mut |b| {
+                out.push(b);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "ALLOCOR regions=98 usable=0xce94000 free=52869 mspans=8 fspans=8 frame=0x4000 sbase=0xde14000\n"
+        );
+        let mut out_empty = Vec::new();
+        write_allocor_line::<core::convert::Infallible>(AllocOrder::empty(), &mut |b| {
+            out_empty.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out_empty).unwrap(),
+            "ALLOCOR regions=0 usable=0x0 free=0 mspans=0 fspans=0 frame=0xffffffffffffffff sbase=0xffffffffffffffff\n"
+        );
+    }
+
+    #[test]
+    fn allocor_snapshot_reports_boot_map_without_mutating() {
+        // S09 slice2bp (#30): the snapshot is a pure view — region count
+        // matches the map length, free pages match a fresh allocator, and
+        // the passed-through frame/sbase ride untouched.
+        use baseos_boot_info::{BootInfo, MemoryKind, MemoryRegion};
+        let mut info = BootInfo::new();
+        assert!(info.push_region(MemoryRegion::new(0x1000, 4, MemoryKind::Usable)));
+        assert!(info.push_region(MemoryRegion::new(0x100000, 16, MemoryKind::Usable)));
+        let ao = alloc_order_snapshot(&info, 0x4000, 0xde14000);
+        assert_eq!(ao.regions, 2);
+        assert_eq!(ao.usable, 20 * 4096);
+        assert_eq!(ao.free, 20);
+        assert_eq!(ao.mspans, 2);
+        assert_eq!(ao.fspans, 2);
+        assert_eq!(ao.frame, 0x4000);
+        assert_eq!(ao.sbase, 0xde14000);
+        // Valid-empty header: empty map view, usable 0, zero free.
+        let empty = BootInfo::new();
+        let ao_empty = alloc_order_snapshot(&empty, STRUCTURAL_FAIL as u64, STRUCTURAL_FAIL as u64);
+        assert_eq!(ao_empty.regions, 0);
+        assert_eq!(ao_empty.usable, 0);
+        assert_eq!(ao_empty.free, 0);
     }
 
     #[test]
