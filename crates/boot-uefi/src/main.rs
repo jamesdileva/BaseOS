@@ -1654,11 +1654,17 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         let low_decode_ok = if low_fault {
             if !trystore_rip_walk_ok(cr3base, low_rip, |base| phys_to_table_ptr(info, base)) {
                 false
-            } else {
+            } else if let (Some(b1_rip), Some(b2_rip)) =
+                (low_rip.checked_add(1), low_rip.checked_add(2))
+            {
                 let b0 = core::ptr::read_volatile(low_rip as *const u8);
-                let b1 = core::ptr::read_volatile((low_rip + 1) as *const u8);
-                let b2 = core::ptr::read_volatile((low_rip + 2) as *const u8);
+                let b1 = core::ptr::read_volatile((b1_rip) as *const u8);
+                let b2 = core::ptr::read_volatile((b2_rip) as *const u8);
                 trystore_rip_ok([b0, b1, b2])
+            } else {
+                // REVIEW #771 nit (defense in depth): guard already refuses
+                // the wrap, but the byte reads must not wrap independently.
+                false
             }
         } else {
             low_rip == 0
@@ -1666,10 +1672,16 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         let high_decode_ok = if high_fault
             && trystore_rip_walk_ok(cr3base, high_rip, |base| phys_to_table_ptr(info, base))
         {
-            let b0 = core::ptr::read_volatile(high_rip as *const u8);
-            let b1 = core::ptr::read_volatile((high_rip + 1) as *const u8);
-            let b2 = core::ptr::read_volatile((high_rip + 2) as *const u8);
-            trystore_rip_ok([b0, b1, b2])
+            if let (Some(b1_rip), Some(b2_rip)) = (high_rip.checked_add(1), high_rip.checked_add(2))
+            {
+                let b0 = core::ptr::read_volatile(high_rip as *const u8);
+                let b1 = core::ptr::read_volatile((b1_rip) as *const u8);
+                let b2 = core::ptr::read_volatile((b2_rip) as *const u8);
+                trystore_rip_ok([b0, b1, b2])
+            } else {
+                // REVIEW #771 nit (defense in depth): see low path.
+                false
+            }
         } else {
             false
         };
