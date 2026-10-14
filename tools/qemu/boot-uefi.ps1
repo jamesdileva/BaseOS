@@ -296,6 +296,16 @@ if ($serialText -and $serialText.Contains($marker)) {
   # `(\s|$)` would match `\n` and false-pass a newline-split pair);
   # line-terminal `p` uses `(\s|$)`. CPL3 U=1 entry stays deferred.
   $pfusPat = "PFUS ok=1 [^\r\n]*us=0[ \t][^\r\n]*w=0[ \t][^\r\n]*p=0(\s|$)"
+  # S09 slice2bt TRYSTORE rok hard-require (#30, REVIEW #765 R1 + #767:
+  # three green rok=1 boots slice2bq+br+bs): the bounded #PF-catch must prove
+  # walk==CPU (low=0 high=1) with the historic code (hcode=0x3 = P+W present
+  # supervisor-write) AND the live emission proof (rok=1 = fault RIP decodes
+  # to 48 89 07). Value gate (not value-free): any low=1, high=0, wrong code,
+  # or rok=0 prints fail-closed. Same-line shape mirrors the PFUS/RMBZ gates:
+  # literal space after TRYSTORE stops prefix false-passing, [^\r\n]* keeps
+  # all fields same-line, (\s|$) terminates rok. lcode=0x0 rides pinned (low
+  # no-fault reports 0). See tools/qemu/test-boot-uefi-gates.ps1.
+  $trystorePat = "TRYSTORE low=0 high=1 [^\r\n]*lcode=0x0[^\r\n]*hcode=0x3[^\r\n]*rok=1(\s|$)"
   # S09 slice2bb live U-map attempt (#30): the guest installs the 4-page
   # U+W+NX map (alloc-4 + bound store+flush through the live PT, 4K base)
   # then re-walks. Live QEMU 2026-10-13 still prints
@@ -411,15 +421,16 @@ if ($serialText -and $serialText.Contains($marker)) {
     $ci1 = $serialText.IndexOf($chainHop1, $ci3)
     $chainOrderOk = ($ci1 -gt $ci3) -and $hasChainOk
   }
-  $hasPf = [regex]::IsMatch($serialText, $pfPat)
-  $hasPfus = [regex]::IsMatch($serialText, $pfusPat)
-  $hasUstack = [regex]::IsMatch($serialText, $ustackPat)
+   $hasPf = [regex]::IsMatch($serialText, $pfPat)
+   $hasPfus = [regex]::IsMatch($serialText, $pfusPat)
+   $hasTrystore = [regex]::IsMatch($serialText, $trystorePat)
+   $hasUstack = [regex]::IsMatch($serialText, $ustackPat)
   $hasTr = [regex]::IsMatch($serialText, $trPat)
   $noTrFail = -not $serialText.Contains($trFail)
   $hasExc = $serialText.Contains($exc)
-   if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasUser -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSwitchLat -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasTick -and $hasSti -and $hasIrqstack -and $hasThreadJump -and $hasThreadJumpRun -and    $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and $hasPf -and $hasPfus -and $hasUstack -and $hasTr -and $noTrFail -and $hasExc) {
+   if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasUser -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSwitchLat -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasTick -and $hasSti -and $hasIrqstack -and $hasThreadJump -and $hasThreadJumpRun -and    $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and    $hasPf -and $hasPfus -and $hasTrystore -and $hasUstack -and $hasTr -and $noTrFail -and $hasExc) {
     Write-Output ("Boot summary: FOUND (" + $bootinfo + " + " + $memmap + " + " + $notrunc + " + " + $mapsize + " + " + $descsize + " + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + USER ok=1 passed=9/9 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SWITCH-LAT ok=1 count=16 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + STI ok=1 + IRQSTACK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + PFUS ok=1 us=0 w=0 p=0 + USTACK ok=0 label + TR ok=1 sel=0x28 + no TR ok=0 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + USER ok=1 passed=9/9 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SWITCH-LAT ok=1 count=16 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + STI ok=1 + IRQSTACK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + PFUS ok=1 us=0 w=0 p=0 + TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=1 + USTACK ok=0 label + TR ok=1 sel=0x28 + no TR ok=0 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -463,6 +474,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "CHAIN-CURSOR ok=1 legs=3 present=$hasChainCursor, " +
       "PF ok=1 vector=14-shape present=$hasPf, " +
       "PFUS ok=1 us=0 w=0 p=0-shape present=$hasPfus, " +
+      "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=1-shape present=$hasTrystore, " +
       "USTACK ok=0 label-shape present=$hasUstack, " +
       "TR ok=1 sel=0x28-shape present=$hasTr, " +
       "no TR ok=0 present=$noTrFail, " +

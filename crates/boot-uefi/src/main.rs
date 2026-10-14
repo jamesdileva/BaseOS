@@ -1283,8 +1283,9 @@ impl TryStore {
 /// `TRYSTORE low=<0|1> high=<0|1> lcode=0x... hcode=0x... rok=<0|1>`.
 /// `rok` is 1 only when the high-fault RIP decodes to the expected 3-byte
 /// `mov [rdi], rax` (`48 89 07`) on the same boot — the live emission proof
-/// for `TRYSTORE_SKIP_LEN` (REVIEW #761 R2). Reporting-only; the e2e script
-/// does not gate on it.
+/// for `TRYSTORE_SKIP_LEN` (REVIEW #761 R2). S09 slice2bt (#30, REVIEW #767)
+/// hard-requires this line in `boot-uefi.ps1` (three green rok=1 boots
+/// slice2bq+br+bs): low=0 high=1 lcode=0x0 hcode=0x3 rok=1.
 fn write_trystore_line<E>(
     ts: TryStore,
     emit: &mut impl FnMut(u8) -> Result<(), E>,

@@ -21,6 +21,10 @@
   PFUS (S09 slice2b live-#PF U/S, REVIEW #622 risk 3): ok=1 us=0 w=0 p=0
   passes; us=1 / w=1 / p=1 fail (fail-closed value gate); ok=10 fails;
   missing p fails; newline-split fails.
+  TRYSTORE (S09 slice2bt rok hard-require, #30 REVIEW #767: three green
+  rok=1 boots slice2bq+br+bs): low=0 high=1 lcode=0x0 hcode=0x3 rok=1
+  passes; low=1 / high=0 / wrong-hcode / rok=0 fail (fail-closed value
+  gate); rok=10 fails; missing rok fails; newline-split fails.
   USTACK (S09 slice2bb live U-map attempt reverted to slice2aw ok=0
   baseline): ok=0 either-refuse passes; ok=1 valid fails; ok=0 label=valid
   drift fails; missing label fails; newline-split fails.
@@ -49,6 +53,7 @@ $g = Get-Pat "guardPat"
 $u = Get-Pat "userPat"
 $r = Get-Pat "rmbzPat"
 $f = Get-Pat "pfusPat"
+$y = Get-Pat "trystorePat"
 $t = Get-Pat "trPat"
 $s = Get-Pat "ustackPat"
 
@@ -106,6 +111,16 @@ if (($r -notlike '*RMBZ ok=1 *') -or (-not $r.Contains('[^\r\n]*viol=0')) -or ($
 # so us=1 / w=1 / p=1 / missing-p / newline-split pairs fail.
 if (($f -notlike '*PFUS ok=1 *') -or (-not $f.Contains('us=0')) -or (-not $f.Contains('w=0')) -or (-not $f.Contains('[^\r\n]*p=0')) -or ($f -notlike '*p=0(\s|$)*')) {
   Write-Output "GATE TEST FAIL (PFUS pattern missing ok=1/us/w/p tightening: $f)"
+  exit 1
+}
+# S09 slice2bt TRYSTORE rok hard-require (#30, REVIEW #767: three green
+# rok=1 boots slice2bq+br+bs): pattern must carry the literal space after
+# `low=0` / `high=1` (boundary, mirrors PFUS), same-line `lcode=0x0` /
+# `hcode=0x3` pins with the historic code (P+W present supervisor-write),
+# and a `rok=1(\s|$)` value pin so low=1 / high=0 / wrong-code / rok=0 /
+# missing-rok / newline-split pairs fail.
+if (($y -notlike '*TRYSTORE low=0 high=1 *') -or (-not $y.Contains('lcode=0x0')) -or (-not $y.Contains('hcode=0x3')) -or ($y -notlike '*rok=1(\s|$)*')) {
+  Write-Output "GATE TEST FAIL (TRYSTORE pattern missing low/high/lcode/hcode/rok tightening: $y)"
   exit 1
 }
 # S09 slice2bb live U-map attempt (reverted to slice2aw ok=0 baseline after
@@ -184,6 +199,14 @@ $cases = @(
   @("F-ten", $f, "PFUS ok=10 us=0 w=0 p=0`n", $false, "ok=10 fails"),
   @("F-nop", $f, "PFUS ok=1 us=0 w=0`n", $false, "missing p fails"),
   @("F-split", $f, "PFUS ok=1 us=0 w=0`n p=0`n", $false, "newline-split fails"),
+  @("Y-good", $y, "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=1`n", $true, "low/high/code/rok passes"),
+  @("Y-low1", $y, "TRYSTORE low=1 high=1 lcode=0x0 hcode=0x3 rok=1`n", $false, "low=1 fails fail-closed"),
+  @("Y-high0", $y, "TRYSTORE low=0 high=0 lcode=0x0 hcode=0x3 rok=1`n", $false, "high=0 fails fail-closed"),
+  @("Y-badhcode", $y, "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x7 rok=1`n", $false, "wrong hcode fails"),
+  @("Y-rok0", $y, "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=0`n", $false, "rok=0 fails fail-closed"),
+  @("Y-rok10", $y, "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=10`n", $false, "rok=10 fails"),
+  @("Y-norok", $y, "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3`n", $false, "missing rok fails"),
+  @("Y-split", $y, "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3`n rok=1`n", $false, "newline-split fails"),
   @("T-good", $t, "TR ok=1 sel=0x28`n", $true, "ok=1 sel=0x28 passes"),
   @("T-ok0", $t, "TR ok=0 sel=0x0`n", $false, "ok=0 fails fail-closed"),
   @("T-ten", $t, "TR ok=10 sel=0x28`n", $false, "ok=10 fails"),
@@ -215,5 +238,5 @@ if ($failed -gt 0) {
   Write-Output "GATE TEST FAIL ($failed cases)"
   exit 1
 }
-Write-Output "GATE TEST PASS (63/63)"
+Write-Output "GATE TEST PASS (71/71)"
 exit 0
