@@ -1463,6 +1463,19 @@ fn trystore_gate_for(handler: u64, cs: u16) -> (u64, u64) {
     (low, high)
 }
 
+/// Scratch-IDT initializer shared by the guest probe and host tests
+/// (S09 slice2bx, #30, REVIEW #777 finding 1): clears all 32 slots to
+/// `[0, 0]` then writes the vector-14 gate. Both call sites run this exact
+/// body, so a future widening (extra present slot) fails the host pin.
+fn trystore_scratch_init(table: &mut [[u64; 2]; 32], lo: u64, hi: u64) {
+    let mut i = 0usize;
+    while i < 32 {
+        table[i] = [0, 0];
+        i += 1;
+    }
+    table[14] = [lo, hi];
+}
+
 /// Scratch IDT for the bounded probe: 32 entries cover vector 14; only
 /// entry 14 is present, the rest stay non-present (any other vector this
 /// window triple-faults loudly instead of running a stale firmware
@@ -1615,12 +1628,7 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         let handler = baseos_trystore_pf as *const () as u64;
         let (lo, hi) = trystore_gate_for(handler, cs);
         let idt = core::ptr::addr_of_mut!(TRYSTORE_IDT);
-        let mut i = 0usize;
-        while i < 32 {
-            (*idt)[i] = [0, 0];
-            i += 1;
-        }
-        (*idt)[14] = [lo, hi];
+        trystore_scratch_init(&mut *idt, lo, hi);
         let ours = TryStoreIdtr {
             limit: (32u16 * 16 - 1),
             base: idt as u64,
@@ -6234,33 +6242,36 @@ mod tests {
 
     #[test]
     fn trystore_scratch_idt_fields_only_vector14_nmi_mce_fail_loud() {
-        // S09 slice2bw (#30): the scratch table the probe installs clears all
-        // 32 slots to `[0, 0]` then writes the gate to slot 14 only. NMI
-        // (vector 2) and machine-check (vector 18) therefore stay non-present
-        // in the window: an NMI/MCE then triple-faults loudly instead of
-        // running a stale firmware handler or recording a verdict. The guest
-        // loop body (`(*idt)[i] = [0, 0]; (*idt)[14] = [lo, hi]`) is the
-        // contract; this test pins its observable shape (zero = non-present,
-        // gate = present) so a future widening fails here.
+        // S09 slice2bx (#30, REVIEW #777 finding 1): run the exact guest
+        // initializer on a simulated table, then pin its observable shape.
+        // NMI (vector 2) and machine-check (vector 18) stay non-present, so
+        // an in-window NMI/MCE triple-faults loudly instead of running a
+        // stale firmware handler. A future widening (extra present slot)
+        // fails here because every non-14 slot is asserted clear.
         const PRESENT_BIT: u64 = 1 << 47;
-        let zero = [0u64, 0u64];
-        assert_eq!(zero[0] & PRESENT_BIT, 0);
-        assert_eq!(zero[1], 0);
+        let (lo, hi) = trystore_gate_for(0x1234_5678_9abc_def0, 0x28);
+        let mut table = [[0u64; 2]; 32];
+        // Fill with nonzero first so the zeroing is observed, not assumed.
+        for entry in table.iter_mut() {
+            *entry = [u64::MAX, u64::MAX];
+        }
+        trystore_scratch_init(&mut table, lo, hi);
         // NMI + MCE slots specifically (the non-maskable TOCTOU pair).
         for slot in [2usize, 18usize] {
-            assert!(slot < 32, "scratch IDT covers only vectors 0..32");
-            assert_eq!(zero[0] & PRESENT_BIT, 0);
+            assert_eq!(table[slot][0] & PRESENT_BIT, 0);
+            assert_eq!(table[slot], [0, 0]);
         }
         // The installed vector-14 gate is present (companion pin to
         // `trystore_gate_pins_present_interrupt_gate`).
-        let (lo, hi) = trystore_gate_for(0x1234_5678_9abc_def0, 0x28);
-        assert_ne!(lo & PRESENT_BIT, 0);
+        assert_eq!(table[14], [lo, hi]);
+        assert_ne!(table[14][0] & PRESENT_BIT, 0);
         assert_eq!(hi & 0xffff_ffff, 0x1234_5678);
-        // Every non-14 slot shares the zero shape (spot-check first, last,
-        // and the NMI/MCE pair's neighbours).
-        for slot in [0usize, 1usize, 2, 3, 13, 15, 18, 31] {
-            assert_ne!(slot, 14);
-            assert_eq!(zero[0] & PRESENT_BIT, 0);
+        // Every non-14 slot shares the zero shape.
+        for (idx, entry) in table.iter().enumerate() {
+            if idx == 14 {
+                continue;
+            }
+            assert_eq!(*entry, [0, 0], "slot {idx} must stay non-present");
         }
     }
 
