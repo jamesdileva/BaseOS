@@ -1329,6 +1329,25 @@ fn trystore_nmi_mce_present(table: &[[u64; 2]; 32]) -> (bool, bool) {
     )
 }
 
+/// Pure live-read resolver for the in-window NMI/MCE branch (S09 slice2ca,
+/// #30, REVIEW #782 finding 2): the guest `unsafe` deref of the live IDTR
+/// base is `cfg(not(test))` so host tests can never execute it — only the
+/// pure helpers were pinned. Routing the branch through this function pins
+/// the DECISION (not the deref): `(true, Some(table))` reads the present
+/// bits, every other combination fails closed to `(true, true)` without
+/// touching memory. In particular `idtr_ok == false` with `Some(table)`
+/// must NOT read (mismatch dereferences nothing wild), and `None` with
+/// `idtr_ok == true` must fail closed (defense in depth: no table, no read).
+fn trystore_resolve_live_nmi_mce(
+    idtr_ok: bool,
+    live_table: Option<&[[u64; 2]; 32]>,
+) -> (bool, bool) {
+    match (idtr_ok, live_table) {
+        (true, Some(table)) => trystore_nmi_mce_present(table),
+        _ => (true, true),
+    }
+}
+
 /// Pure SIDT-match check for the in-window live IDTR (S09 slice2bz, #30,
 /// REVIEW #782 finding 1): `true` only when the live `sidt` base equals the
 /// `lidt`-installed scratch base AND the limit equals `32*16-1` (511).
@@ -1711,11 +1730,14 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         let live_limit = core::ptr::addr_of!(live.limit).read_unaligned();
         let live_base = core::ptr::addr_of!(live.base).read_unaligned();
         let idtr_ok = trystore_idtr_matches(live_base, live_limit, ours_base);
+        // REVIEW #782 finding 2 (slice2ca): the branch decision runs through
+        // the pure `trystore_resolve_live_nmi_mce` so host tests pin it;
+        // only the `Some` arm dereferences, and only on `idtr_ok`.
         let (nmi_present, mce_present) = if idtr_ok {
             let live_table = &*(live_base as *const [[u64; 2]; 32]);
-            trystore_nmi_mce_present(live_table)
+            trystore_resolve_live_nmi_mce(true, Some(live_table))
         } else {
-            (true, true)
+            trystore_resolve_live_nmi_mce(false, None)
         };
         // Probe 1 (expect success): single store to the fresh low frame
         // (old word hoisted above; restored here on the no-fault path).
@@ -6283,6 +6305,35 @@ mod tests {
         );
         // Empty probe is fail-closed on the NMI gate too.
         assert!(!TryStore::empty().nmi_ok());
+    }
+
+    #[test]
+    fn trystore_live_resolver_pins_fail_closed_branches() {
+        // S09 slice2ca (#30, REVIEW #782 finding 2): the guest `unsafe`
+        // live-base deref is cfg(not(test)), so host tests pin the pure
+        // branch decision instead. Only (true, Some(clear)) reads clear;
+        // every other combination fails closed to (true, true) unread.
+        let (lo, hi) = trystore_gate_for(0x1234_5678_9abc_def0, 0x28);
+        let mut clear = [[0u64; 2]; 32];
+        trystore_scratch_init(&mut clear, lo, hi);
+        assert_eq!(
+            trystore_resolve_live_nmi_mce(true, Some(&clear)),
+            (false, false)
+        );
+        let mut corrupt = clear;
+        corrupt[18][0] |= 1 << 47;
+        assert_eq!(
+            trystore_resolve_live_nmi_mce(true, Some(&corrupt)),
+            (false, true)
+        );
+        // Mismatch with a table present must NOT read: fail-closed.
+        assert_eq!(
+            trystore_resolve_live_nmi_mce(false, Some(&clear)),
+            (true, true)
+        );
+        // No table must fail closed even when idtr claims ok.
+        assert_eq!(trystore_resolve_live_nmi_mce(true, None), (true, true));
+        assert_eq!(trystore_resolve_live_nmi_mce(false, None), (true, true));
     }
 
     #[test]
