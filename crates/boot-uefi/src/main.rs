@@ -1242,6 +1242,222 @@ fn write_ptdump_line<E>(dump: PtDump, emit: &mut impl FnMut(u8) -> Result<(), E>
     write_str(emit, "\n")
 }
 
+/// Bounded `#PF`-catch try-store result (S09 slice2bo, #30, REVIEW #757
+/// cheapest next experiment): `low_fault` is 1 when the single-qword store
+/// to a freshly allocated low-RAM frame faulted (expect 0: walker says RW),
+/// `high_fault` is 1 when the single-qword store to `FAULT_VA_CR2` faulted
+/// (expect 1: walker says RO leaf); `low_code`/`high_code` are the
+/// CPU-pushed `#PF` error codes captured by the catch stub (0 when no
+/// fault). Reporting-only companion to `PTDUMP`; the e2e script does not
+/// gate on it. `low=0 high=1` proves walk==CPU view on the same boot;
+/// any other combination re-opens the walker-vs-hardware divergence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TryStore {
+    low_fault: bool,
+    high_fault: bool,
+    low_code: u64,
+    high_code: u64,
+}
+
+impl TryStore {
+    fn empty() -> Self {
+        Self {
+            low_fault: false,
+            high_fault: false,
+            low_code: STRUCTURAL_FAIL as u64,
+            high_code: STRUCTURAL_FAIL as u64,
+        }
+    }
+}
+
+/// Emit the one-line `TRYSTORE` diagnostic right after the `PTDUMP` line:
+/// `TRYSTORE low=<0|1> high=<0|1> lcode=0x... hcode=0x...`.
+/// Reporting-only; the e2e script does not gate on it.
+fn write_trystore_line<E>(
+    ts: TryStore,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "TRYSTORE low=")?;
+    write_u64_dec(emit, u64::from(ts.low_fault))?;
+    write_str(emit, " high=")?;
+    write_u64_dec(emit, u64::from(ts.high_fault))?;
+    write_str(emit, " lcode=")?;
+    write_u64_hex(emit, ts.low_code)?;
+    write_str(emit, " hcode=")?;
+    write_u64_hex(emit, ts.high_code)?;
+    write_str(emit, "\n")
+}
+
+/// Skip distance (bytes) the `#PF` catch stub adds to the saved RIP to
+/// resume past the faulting store. The probe store is Intel-syntax
+/// `mov [rdi], rax` = REX.W (`0x48`) + opcode (`0x89`) + ModRM (`0x07`,
+/// mod=00 reg=000 rm=111 = `[rdi]`, no displacement) = exactly 3 bytes.
+/// Keep in sync with `baseos_trystore_pf` (`addq $3, ...`) and
+/// [`try_store_probe`] (single `mov [rdi], rax` between flag reset and
+/// flag read — no other faulting instruction may sit in that window).
+const TRYSTORE_SKIP_LEN: u64 = 3;
+
+// Compile-time pin (all targets, incl. the UEFI guest where `cargo test`
+// never runs): the stub skips exactly one 3-byte store. Counts as the
+// guest use of `TRYSTORE_SKIP_LEN` (the `addq $3` lives in `global_asm!`
+// text, invisible to dead-code analysis).
+const _: () = assert!(TRYSTORE_SKIP_LEN == 3);
+
+/// Pure IDT gate encoder for the try-store catch stub: present DPL0
+/// 64-bit interrupt gate (type `0xE`, attr `0x8E`) with the caller `CS`
+/// selector (interrupts stay masked via `cli`; the gate only fields the
+/// synchronous `#PF` from the probe stores). Returns the 16-byte entry as
+/// `(low, high)` for the `[[u64; 2]; 32]` table. No hardware touched;
+/// host tests pin present/type/selector/offset round-trip.
+fn trystore_gate_for(handler: u64, cs: u16) -> (u64, u64) {
+    let low = (handler & 0xffff)
+        | ((u64::from(cs)) << 16)
+        | (0x8e_u64 << 40)
+        | (((handler >> 16) & 0xffff) << 48);
+    let high = handler >> 32;
+    (low, high)
+}
+
+/// Scratch IDT for the bounded probe: 32 entries cover vector 14; only
+/// entry 14 is present, the rest stay non-present (any other vector this
+/// window triple-faults loudly instead of running a stale firmware
+/// handler). Restored to the firmware IDTR immediately after the two
+/// probe stores.
+#[cfg(not(test))]
+static mut TRYSTORE_IDT: [[u64; 2]; 32] = [[0, 0]; 32];
+
+/// Packed IDTR operand for `sidt`/`lidt` (guest-only).
+#[cfg(not(test))]
+#[repr(C, packed)]
+struct TryStoreIdtr {
+    limit: u16,
+    base: u64,
+}
+
+// S09 slice2bo (#30, REVIEW #757): returning `#PF` catch stub for the
+// bounded try-store. Intel syntax (like the `#DE`/`#PF` stubs in
+// `baseos-kernel`). Entry frame is `[err][RIP][CS][RFLAGS]`; after two
+// pushes the error code sits at `[rsp+16]` and the resume RIP at
+// `[rsp+24]`. Leaves the result in registers (the probe reads them as
+// `inout("r10")` fault flag / `inout("r11")` error code, both pre-zeroed,
+// so the no-fault path reports `(0, 0)` without any COM1 or memory
+// traffic): sets `r10=1`, `r11=err`, skips `TRYSTORE_SKIP_LEN` past the
+// faulting `mov [rdi], rax`, restores the two scratch registers,
+// discards the error-code slot, and `iretq`s. Preserves `rax`/`rcx` via
+// push/pop (the probe holds the slot in `rdi` and the pattern in `rax`
+// across the store); `rdi`/`r10`/`r11` are compiler-reserved outputs of
+// the faulting `asm!` block, so no other live state can hide there.
+#[cfg(not(test))]
+core::arch::global_asm!(
+    r#"
+    .global baseos_trystore_pf
+    baseos_trystore_pf:
+        push rax
+        push rcx
+        mov rax, [rsp+16]
+        mov r11, rax
+        mov r10, 1
+        add qword ptr [rsp+24], 3
+        pop rcx
+        pop rax
+        add rsp, 8
+        iretq
+"#
+);
+
+#[cfg(not(test))]
+extern "C" {
+    fn baseos_trystore_pf();
+}
+
+/// Bounded `#PF`-catch try-store probe (S09 slice2bo, #30, REVIEW #757):
+/// saves the firmware IDTR (`sidt`), installs the scratch IDT with the
+/// catch stub on vector 14 (`lidt`), runs exactly two single-qword stores
+/// (low-RAM freshly allocated frame = expect success, `FAULT_VA_CR2` =
+/// expect fault), then restores the firmware IDTR (`lidt`) and frees the
+/// frame. Each store is one `mov [rdi], rax` (3 bytes — the stub skips
+/// exactly `TRYSTORE_SKIP_LEN`); the `r10`/`r11` result registers are
+/// pre-zeroed `inout` operands, so at most one `#PF` per probe can land
+/// and the no-fault path needs no handler traffic. The high probe reads
+/// the old word first and writes it back on success, so a surprise-RW
+/// outcome corrupts nothing. `cli` stays in effect throughout
+/// (exceptions do not need `sti`); quarantine holds
+/// (`SPLIT_LIVE_SWAP_ENABLED` untouched, still `false`).
+///
+/// # Safety
+/// Post-EBS only, on the boot thread: owns the `TRYSTORE_IDT` static,
+/// swaps the live IDT for a bounded window, dereferences identity-mapped
+/// frames, `cli` in effect, COM1 untouched (caller emits the line).
+#[allow(unused_variables)]
+unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
+    #[cfg(test)]
+    {
+        return TryStore {
+            low_fault: false,
+            high_fault: true,
+            low_code: 0,
+            high_code: 7,
+        };
+    }
+    #[cfg(not(test))]
+    {
+        const PATTERN: u64 = 0x1bad_b002_1bad_b002;
+        let mut alloc = FrameAllocator::from_boot_info(info);
+        let Some(frame) = alloc.alloc(1) else {
+            return TryStore::empty();
+        };
+        // Read current CS for the gate selector.
+        let cs: u16;
+        asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
+        // Save the firmware IDTR, install the scratch table.
+        let mut saved = TryStoreIdtr { limit: 0, base: 0 };
+        asm!("sidt [{0}]", in(reg) &mut saved, options(nostack, preserves_flags));
+        let handler = baseos_trystore_pf as *const () as u64;
+        let (lo, hi) = trystore_gate_for(handler, cs);
+        let idt = core::ptr::addr_of_mut!(TRYSTORE_IDT);
+        let mut i = 0usize;
+        while i < 32 {
+            (*idt)[i] = [0, 0];
+            i += 1;
+        }
+        (*idt)[14] = [lo, hi];
+        let ours = TryStoreIdtr {
+            limit: (32u16 * 16 - 1),
+            base: idt as u64,
+        };
+        asm!("lidt [{0}]", in(reg) &ours, options(readonly, nostack, preserves_flags));
+        // Probe 1 (expect success): single store to the fresh low frame.
+        let low_slot = frame as *mut u64;
+        let low_old = core::ptr::read_volatile(low_slot);
+        let mut low_flag: u64 = 0;
+        let mut low_code: u64 = 0;
+        asm!("mov [rdi], rax", in("rdi") low_slot, in("rax") PATTERN, inout("r10") low_flag, inout("r11") low_code, options(nostack, preserves_flags));
+        let low_fault = low_flag != 0;
+        if !low_fault {
+            core::ptr::write_volatile(low_slot, low_old);
+        }
+        // Probe 2 (expect fault): single store to the historic CR2.
+        let high_slot = FAULT_VA_CR2 as *mut u64;
+        let high_old = core::ptr::read_volatile(high_slot);
+        let mut high_flag: u64 = 0;
+        let mut high_code: u64 = 0;
+        asm!("mov [rdi], rax", in("rdi") high_slot, in("rax") PATTERN, inout("r10") high_flag, inout("r11") high_code, options(nostack, preserves_flags));
+        let high_fault = high_flag != 0;
+        if !high_fault {
+            core::ptr::write_volatile(high_slot, high_old);
+        }
+        // Restore the firmware IDT first, then free the frame.
+        asm!("lidt [{0}]", in(reg) &saved, options(readonly, nostack, preserves_flags));
+        let _ = alloc.free(frame, 1);
+        TryStore {
+            low_fault,
+            high_fault,
+            low_code,
+            high_code,
+        }
+    }
+}
+
 /// Live U-map install (S09 slice2bb, #30 wiring): allocate 4 frames from a
 /// `FrameAllocator` over `info`, resolve the live PT backing the 4 KiB-aligned
 /// `user_stack_base()` via [`live_pt_phys_for_va`] (never a caller literal),
@@ -3599,6 +3815,11 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
                 umap_ok, umap_stage, umap_rsn, umap_nxe, umap_base, umap_pt, umap_pd, &mut emit,
             );
             let _ = write_ptdump_line::<Infallible>(umap_dump, &mut emit);
+            // S09 slice2bo (#30, REVIEW #757): bounded #PF-catch try-store
+            // right after PTDUMP — low-RAM expect-success vs high-RAM
+            // expect-fault on the same boot; reporting-only, e2e ungated.
+            let ts = try_store_probe(&info);
+            let _ = write_trystore_line::<Infallible>(ts, &mut emit);
             let ustack_outcome = probe_ustack(&info);
             write_ustack_report(ustack_outcome);
             // S04 slice 15: live leaf USER/NX audit of the PAGING probe
@@ -5556,6 +5777,68 @@ mod tests {
             String::from_utf8(out_empty).unwrap(),
             "PTDUMP frame=0xffffffffffffffff cr3=0xffffffffffffffff la57=0 wok=0 wphys=0xffffffffffffffff wflags=0x0 raw=0xffffffffffffffff lvl=255 map=0 rdok=0 rval=0xffffffffffffffff fwok=0 fraw=0xffffffffffffffff flvl=255 awok=0 araw=0xffffffffffffffff alvl=255 cwok=0 craw=0xffffffffffffffff clvl=255\n"
         );
+    }
+
+    #[test]
+    fn trystore_line_pins_exact_shape() {
+        // S09 slice2bo (#30, REVIEW #757): host backstop for the bounded
+        // try-store probe shape. The guest writer shares this body, so a
+        // format drift fails here; the empty probe pins the sentinels.
+        let mut out = Vec::new();
+        write_trystore_line::<core::convert::Infallible>(
+            TryStore {
+                low_fault: false,
+                high_fault: true,
+                low_code: 0,
+                high_code: 7,
+            },
+            &mut |b| {
+                out.push(b);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x7\n"
+        );
+        let mut out_empty = Vec::new();
+        write_trystore_line::<core::convert::Infallible>(TryStore::empty(), &mut |b| {
+            out_empty.push(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out_empty).unwrap(),
+            "TRYSTORE low=0 high=0 lcode=0xffffffffffffffff hcode=0xffffffffffffffff\n"
+        );
+    }
+
+    #[test]
+    fn trystore_gate_pins_present_interrupt_gate() {
+        // S09 slice2bo (#30): the scratch-IDT entry must be a present DPL0
+        // 64-bit interrupt gate for the stub handler with the caller CS.
+        let (lo, hi) = trystore_gate_for(0x1234_5678_9abc_def0, 0x28);
+        assert_eq!(lo & 0xffff, 0xdef0);
+        assert_eq!((lo >> 16) & 0xffff, 0x28);
+        assert_eq!((lo >> 32) & 0xff, 0);
+        assert_eq!((lo >> 40) & 0xff, 0x8e);
+        assert_eq!((lo >> 48) & 0xffff, 0x9abc);
+        assert_eq!(hi & 0xffff_ffff, 0x1234_5678);
+        assert_eq!(hi >> 32, 0);
+        // Present bit + type 0xE + DPL 0 round-trip exactly.
+        assert_ne!(lo & (1 << 47), 0);
+        assert_eq!((lo >> 40) & 0xf, 0xe);
+        assert_eq!((lo >> 45) & 0x3, 0);
+    }
+
+    #[test]
+    fn trystore_skip_len_matches_mov_store() {
+        // S09 slice2bo (#30): the stub skips exactly one
+        // `mov [rdi], rax` (REX.W + 0x89 + ModRM [rdi] = 3 bytes). If the
+        // probe store instruction ever changes, this const and the
+        // `addq $3` in `baseos_trystore_pf` must change together.
+        assert_eq!(TRYSTORE_SKIP_LEN, 3);
     }
 
     #[test]
