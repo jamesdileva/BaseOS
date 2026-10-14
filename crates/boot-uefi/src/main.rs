@@ -1421,6 +1421,13 @@ fn trystore_rip_ok(bytes: [u8; 3]) -> bool {
 /// tail). Callers fail to `rok=0` on `false` without touching memory.
 /// Pure over `lookup`, shared by the guest decode and host tests.
 ///
+/// Address-wrap fail-closed (S09 slice2bu, #30): `rip + 2` must not wrap
+/// past `u64::MAX` — a wrapping window would read bytes from VA page 0
+/// while the guard checked the top page, so `checked_add` refusal (`None`
+/// -> `false`) keeps the guard and the three volatile reads on the same
+/// two pages. Live fault RIPs are kernel `.text`, far from the wrap, so
+/// this only affects a corrupted `r12`.
+///
 /// Necessary-not-sufficient (REVIEW #765 residual 1, pinned by
 /// `trystore_rip_guard_passes_reserved_bit_leaf`): the walker checks
 /// canonical + `PRESENT` (+ table presence), NOT reserved-bit / PK
@@ -1434,7 +1441,9 @@ where
     if rip == 0 {
         return false;
     }
-    let tail = rip.saturating_add(2);
+    let Some(tail) = rip.checked_add(2) else {
+        return false;
+    };
     walk_full_leaf_flags(pml4_base, rip, lookup).is_ok()
         && walk_full_leaf_flags(pml4_base, tail, lookup).is_ok()
 }
@@ -6093,6 +6102,52 @@ mod tests {
         assert!(!trystore_rip_walk_ok(
             0x1000,
             0x0000_8000_0000_0000,
+            &lookup
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    fn trystore_rip_guard_refuses_address_wrap() {
+        // S09 slice2bu (#30): the 3-byte window must not wrap past
+        // `u64::MAX`. Four tables map exactly the top VA page
+        // (PML4[511] -> PDPT[511] -> PD[511] -> PT[511] leaf PRESENT);
+        // VA page 0 stays unmapped. Under the old `saturating_add(2)`
+        // guard, `rip = MAX-1` checked the top page twice and passed,
+        // while the guest's `(rip+2)` wrapped to page 0 and faulted
+        // outside the catcher. `checked_add` refuses the wrap instead.
+        use baseos_kernel::page_table::pte_encode;
+        use baseos_kernel::page_table::PageFlags;
+        let flags = PageFlags::PRESENT.union(PageFlags::WRITABLE);
+        let mut pml4 = [0u64; 512];
+        let mut pdpt = [0u64; 512];
+        let mut pd = [0u64; 512];
+        let mut pt = [0u64; 512];
+        pml4[511] = pte_encode(0x2000, flags);
+        pdpt[511] = pte_encode(0x3000, flags);
+        pd[511] = pte_encode(0x4000, flags);
+        pt[511] = pte_encode(0x5000, flags);
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                0x2000 => Some(unsafe { &*(&pdpt as *const [u64; 512]) }),
+                0x3000 => Some(unsafe { &*(&pd as *const [u64; 512]) }),
+                0x4000 => Some(unsafe { &*(&pt as *const [u64; 512]) }),
+                _ => None,
+            }
+        };
+        // Whole window inside the top page passes (no wrap).
+        assert!(trystore_rip_walk_ok(0x1000, 0xffff_ffff_ffff_fffd, &lookup));
+        // Wrap past u64::MAX refuses even though the saturated tail
+        // (same top page) is mapped — the guest would read page 0.
+        assert!(!trystore_rip_walk_ok(
+            0x1000,
+            0xffff_ffff_ffff_fffe,
+            &lookup
+        ));
+        assert!(!trystore_rip_walk_ok(
+            0x1000,
+            0xffff_ffff_ffff_ffff,
             &lookup
         ));
     }
