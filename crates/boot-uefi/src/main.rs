@@ -576,6 +576,13 @@ fn write_ebs_line(ok: bool, status: usize) {
 /// Map a physical table base to the next `&[u64; 512]` via the OVMF
 /// identity map (firmware identity-maps RAM, so phys == virt here).
 ///
+/// Identity-map assumption (REVIEW #763): the `phys as *const` cast below
+/// is correct ONLY while low-RAM firmware tables live identity-mapped
+/// (OVMF post-EBS). A future high-frame allocator emitting non-identity
+/// table phys must NOT reuse this helper — the [`table_base_in_boot_map`]
+/// bounds gate would pass a valid-but-unmapped phys and the cast would
+/// read the wrong VA (fail loudly there, not silent-empty here).
+///
 /// Fail-closed (`None` -> `walk_full` [`MissingTable`](baseos_kernel::page_table::WalkerError::MissingTable)):
 /// misaligned / zero / outside every [`BootInfo`] region (OOM) via
 /// [`table_base_in_boot_map`]. Callers must only pass bases produced by
@@ -1403,6 +1410,27 @@ fn trystore_rip_ok(bytes: [u8; 3]) -> bool {
     bytes == TRYSTORE_PROBE_BYTES
 }
 
+/// Decode guard for the post-restore RIP byte reads (S09 slice2br, #30,
+/// REVIEW #763 finding): the handler-supplied RIP in `r12` is untrusted
+/// (NMI clobber / wild RIP) and the IDT is already restored at decode
+/// time, so a blind `read_volatile(rip)` can `#PF`/triple-fault outside
+/// any catcher. Returns `true` only when `rip != 0` AND the live walker
+/// resolves BOTH `rip` and `rip + 2` (the 3-byte window may straddle a
+/// page boundary — checking only the first byte would still fault on the
+/// tail). Callers fail to `rok=0` on `false` without touching memory.
+/// Pure over `lookup`, shared by the guest decode and host tests.
+fn trystore_rip_walk_ok<'a, F>(pml4_base: u64, rip: u64, lookup: F) -> bool
+where
+    F: Fn(u64) -> Option<&'a [u64; 512]> + Copy,
+{
+    if rip == 0 {
+        return false;
+    }
+    let tail = rip.saturating_add(2);
+    walk_full_leaf_flags(pml4_base, rip, lookup).is_ok()
+        && walk_full_leaf_flags(pml4_base, tail, lookup).is_ok()
+}
+
 /// Pure IDT gate encoder for the try-store catch stub: present DPL0
 /// 64-bit interrupt gate (type `0xE`, attr `0x8E`) with the caller `CS`
 /// selector (interrupts stay masked via `cli`; the gate only fields the
@@ -1602,8 +1630,12 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         // low fault (if any) also decodes; any other outcome (no high fault,
         // null RIP, mismatch) reports 0 without touching the fault path.
         // Reading `low_rip` here also consumes the `r12` output of probe 1.
+        // REVIEW #763 decode-guard: bound-check each RIP through the live
+        // walker BEFORE any volatile byte read (IDT already restored — a
+        // corrupted `r12` must fail to `rok=0`, never `#PF` outside the
+        // catcher). `cr3base`/`info` are the pre-window live values.
         let low_decode_ok = if low_fault {
-            if low_rip == 0 {
+            if !trystore_rip_walk_ok(cr3base, low_rip, |base| phys_to_table_ptr(info, base)) {
                 false
             } else {
                 let b0 = core::ptr::read_volatile(low_rip as *const u8);
@@ -1614,7 +1646,9 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         } else {
             low_rip == 0
         };
-        let high_decode_ok = if high_fault && high_rip != 0 {
+        let high_decode_ok = if high_fault
+            && trystore_rip_walk_ok(cr3base, high_rip, |base| phys_to_table_ptr(info, base))
+        {
             let b0 = core::ptr::read_volatile(high_rip as *const u8);
             let b1 = core::ptr::read_volatile((high_rip + 1) as *const u8);
             let b2 = core::ptr::read_volatile((high_rip + 2) as *const u8);
@@ -6006,6 +6040,53 @@ mod tests {
         assert!(!trystore_rip_ok([0x90, 0x90, 0x90]));
         assert!(!trystore_rip_ok([0x00, 0x00, 0x00]));
         assert_eq!(TRYSTORE_PROBE_BYTES, [0x48, 0x89, 0x07]);
+    }
+
+    #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    fn trystore_rip_guard_refuses_bogus_rip() {
+        // S09 slice2br (#30, REVIEW #763 decode-guard): the post-restore
+        // decode must refuse a corrupted `r12` without touching memory.
+        // Four plain-array tables map exactly VA page 0x0 (PML4 -> PDPT ->
+        // PD -> PT, PT[0] leaf PRESENT); anything else refuses.
+        use baseos_kernel::page_table::pte_encode;
+        use baseos_kernel::page_table::PageFlags;
+        let flags = PageFlags::PRESENT.union(PageFlags::WRITABLE);
+        let mut pml4 = [0u64; 512];
+        let mut pdpt = [0u64; 512];
+        let mut pd = [0u64; 512];
+        let mut pt = [0u64; 512];
+        pml4[0] = pte_encode(0x2000, flags);
+        pdpt[0] = pte_encode(0x3000, flags);
+        pd[0] = pte_encode(0x4000, flags);
+        pt[0] = pte_encode(0x5000, flags);
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                0x2000 => Some(unsafe { &*(&pdpt as *const [u64; 512]) }),
+                0x3000 => Some(unsafe { &*(&pd as *const [u64; 512]) }),
+                0x4000 => Some(unsafe { &*(&pt as *const [u64; 512]) }),
+                _ => None,
+            }
+        };
+        // Mapped nonzero RIP (whole 3-byte window inside page 0) passes.
+        // Note VA page 0 is mapped here, but RIP 0 still refuses (null
+        // check runs before the walk — address 0 is never read).
+        assert!(trystore_rip_walk_ok(0x1000, 0x100, &lookup));
+        assert!(trystore_rip_walk_ok(0x1000, 0xFFD, &lookup));
+        // Null RIP refuses even though page 0 is mapped (no read of addr 0).
+        assert!(!trystore_rip_walk_ok(0x1000, 0x0, |_| None));
+        assert!(!trystore_rip_walk_ok(0x1000, 0, &lookup));
+        // Unmapped VA refuses (lookup miss / cleared PRESENT at PML4[1]).
+        assert!(!trystore_rip_walk_ok(0x1000, 0x4000_0000, &lookup));
+        // Page-boundary straddle refuses: 0xFFF + 2 lands in unmapped page 1.
+        assert!(!trystore_rip_walk_ok(0x1000, 0xFFF, &lookup));
+        // Non-canonical VA refuses.
+        assert!(!trystore_rip_walk_ok(
+            0x1000,
+            0x0000_8000_0000_0000,
+            &lookup
+        ));
     }
 
     #[test]
