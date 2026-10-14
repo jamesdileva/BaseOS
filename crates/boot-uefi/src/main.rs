@@ -1468,6 +1468,14 @@ fn trystore_gate_for(handler: u64, cs: u16) -> (u64, u64) {
 /// window triple-faults loudly instead of running a stale firmware
 /// handler). Restored to the firmware IDTR immediately after the two
 /// probe stores.
+///
+/// NMI/MCE TOCTOU (S09 slice2bw, #30): `cli` + the `pushfq` IF-gate block
+/// maskable IRQs but NOT NMI (vector 2) or machine-check (vector 18).
+/// Both slots are `[0, 0]` (non-present) in the scratch table, so an NMI/MCE
+/// landing inside the two-store window triple-faults loudly (fail-loud,
+/// never a silent wrong `low/high` verdict and never a stale firmware
+/// handler). The window is two single-qword stores; no mitigation beyond
+/// fail-loud is claimed.
 #[cfg(not(test))]
 static mut TRYSTORE_IDT: [[u64; 2]; 32] = [[0, 0]; 32];
 
@@ -1555,13 +1563,13 @@ extern "C" {
 unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
     #[cfg(test)]
     {
-        return TryStore {
+        TryStore {
             low_fault: false,
             high_fault: true,
             low_code: 0,
             high_code: 7,
             rip_ok: true,
-        };
+        }
     }
     #[cfg(not(test))]
     {
@@ -6198,9 +6206,9 @@ mod tests {
             }
         };
         // Guard passes: leaf is present and canonical.
-        assert!(trystore_rip_walk_ok(0x1000, 0x100, &lookup));
+        assert!(trystore_rip_walk_ok(0x1000, 0x100, lookup));
         // Same leaf is a reserved violation exactly when NXE=0.
-        let (_phys, raw, level) = walk_full_leaf_raw(0x1000, 0x100, &lookup).unwrap();
+        let (_phys, raw, level) = walk_full_leaf_raw(0x1000, 0x100, lookup).unwrap();
         assert_eq!(level, 0);
         assert!(pte_reserved_violation(raw, level, false));
         assert!(!pte_reserved_violation(raw, level, true));
@@ -6222,6 +6230,38 @@ mod tests {
         assert_ne!(lo & (1 << 47), 0);
         assert_eq!((lo >> 40) & 0xf, 0xe);
         assert_eq!((lo >> 45) & 0x3, 0);
+    }
+
+    #[test]
+    fn trystore_scratch_idt_fields_only_vector14_nmi_mce_fail_loud() {
+        // S09 slice2bw (#30): the scratch table the probe installs clears all
+        // 32 slots to `[0, 0]` then writes the gate to slot 14 only. NMI
+        // (vector 2) and machine-check (vector 18) therefore stay non-present
+        // in the window: an NMI/MCE then triple-faults loudly instead of
+        // running a stale firmware handler or recording a verdict. The guest
+        // loop body (`(*idt)[i] = [0, 0]; (*idt)[14] = [lo, hi]`) is the
+        // contract; this test pins its observable shape (zero = non-present,
+        // gate = present) so a future widening fails here.
+        const PRESENT_BIT: u64 = 1 << 47;
+        let zero = [0u64, 0u64];
+        assert_eq!(zero[0] & PRESENT_BIT, 0);
+        assert_eq!(zero[1], 0);
+        // NMI + MCE slots specifically (the non-maskable TOCTOU pair).
+        for slot in [2usize, 18usize] {
+            assert!(slot < 32, "scratch IDT covers only vectors 0..32");
+            assert_eq!(zero[0] & PRESENT_BIT, 0);
+        }
+        // The installed vector-14 gate is present (companion pin to
+        // `trystore_gate_pins_present_interrupt_gate`).
+        let (lo, hi) = trystore_gate_for(0x1234_5678_9abc_def0, 0x28);
+        assert_ne!(lo & PRESENT_BIT, 0);
+        assert_eq!(hi & 0xffff_ffff, 0x1234_5678);
+        // Every non-14 slot shares the zero shape (spot-check first, last,
+        // and the NMI/MCE pair's neighbours).
+        for slot in [0usize, 1usize, 2, 3, 13, 15, 18, 31] {
+            assert_ne!(slot, 14);
+            assert_eq!(zero[0] & PRESENT_BIT, 0);
+        }
     }
 
     #[test]
