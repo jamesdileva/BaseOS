@@ -54,6 +54,7 @@ $u = Get-Pat "userPat"
 $r = Get-Pat "rmbzPat"
 $f = Get-Pat "pfusPat"
 $y = Get-Pat "trystorePat"
+$yn = Get-Pat "trystoreNmiPat"
 $t = Get-Pat "trPat"
 $s = Get-Pat "ustackPat"
 
@@ -121,6 +122,16 @@ if (($f -notlike '*PFUS ok=1 *') -or (-not $f.Contains('us=0')) -or (-not $f.Con
 # missing-rok / newline-split pairs fail.
 if (($y -notlike '*TRYSTORE low=0 high=1 *') -or (-not $y.Contains('lcode=0x0')) -or (-not $y.Contains('hcode=0x3')) -or ($y -notlike '*rok=1(\s|$)*')) {
   Write-Output "GATE TEST FAIL (TRYSTORE pattern missing low/high/lcode/hcode/rok tightening: $y)"
+  exit 1
+}
+# S09 slice2by TRYSTORE-NMI live readback (#30, REVIEW #781: host-only ->
+# QEMU-observed): pattern must carry the literal space after `ok=1`
+# (boundary, mirrors TRYSTORE), same-line `nmi=0[ \t]` pin (mid-line:
+# `(\s|$)` would match `\n` and false-pass a split pair, same class as
+# PFUS us/w), and a `mce=0(\s|$)` value pin so nmi=1 / mce=1 / ok=0 /
+# missing-mce / newline-split pairs fail.
+if (($yn -notlike '*TRYSTORE-NMI ok=1 *') -or (-not $yn.Contains('nmi=0')) -or (-not $yn.Contains('[^\r\n]*mce=0')) -or ($yn -notlike '*mce=0(\s|$)*')) {
+  Write-Output "GATE TEST FAIL (TRYSTORE-NMI pattern missing ok=1/nmi/mce tightening: $yn)"
   exit 1
 }
 # S09 slice2bb live U-map attempt (reverted to slice2aw ok=0 baseline after
@@ -207,6 +218,13 @@ $cases = @(
   @("Y-rok10", $y, "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=10`n", $false, "rok=10 fails"),
   @("Y-norok", $y, "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3`n", $false, "missing rok fails"),
   @("Y-split", $y, "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3`n rok=1`n", $false, "newline-split fails"),
+  @("N-good", $yn, "TRYSTORE-NMI ok=1 nmi=0 mce=0`n", $true, "ok=1 nmi=0 mce=0 passes"),
+  @("N-nmi1", $yn, "TRYSTORE-NMI ok=1 nmi=1 mce=0`n", $false, "nmi=1 fails fail-closed"),
+  @("N-mce1", $yn, "TRYSTORE-NMI ok=1 nmi=0 mce=1`n", $false, "mce=1 fails fail-closed"),
+  @("N-ok0", $yn, "TRYSTORE-NMI ok=0 nmi=0 mce=0`n", $false, "ok=0 fails fail-closed"),
+  @("N-ten", $yn, "TRYSTORE-NMI ok=10 nmi=0 mce=0`n", $false, "ok=10 fails"),
+  @("N-nomce", $yn, "TRYSTORE-NMI ok=1 nmi=0`n", $false, "missing mce fails"),
+  @("N-split", $yn, "TRYSTORE-NMI ok=1 nmi=0`n mce=0`n", $false, "newline-split fails"),
   @("T-good", $t, "TR ok=1 sel=0x28`n", $true, "ok=1 sel=0x28 passes"),
   @("T-ok0", $t, "TR ok=0 sel=0x0`n", $false, "ok=0 fails fail-closed"),
   @("T-ten", $t, "TR ok=10 sel=0x28`n", $false, "ok=10 fails"),
@@ -238,5 +256,5 @@ if ($failed -gt 0) {
   Write-Output "GATE TEST FAIL ($failed cases)"
   exit 1
 }
-Write-Output "GATE TEST PASS (71/71)"
+Write-Output "GATE TEST PASS (78/78)"
 exit 0

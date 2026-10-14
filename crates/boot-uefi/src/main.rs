@@ -1303,6 +1303,40 @@ fn write_trystore_line<E>(
     write_str(emit, "\n")
 }
 
+/// Live NMI/MCE present-bit readback for the installed scratch IDT
+/// (S09 slice2by, #30, REVIEW #781 cheapest disconfirm): returns the
+/// CPU-visible present bits of slots 2 (NMI) and 18 (MCE). Both must be
+/// 0 — the installed table traps an in-window NMI/MCE via triple-fault
+/// (fail-loud), never a stale firmware handler. Reads the exact table
+/// the guest installed, so a future widening (extra present slot on 2/18)
+/// fails the live gate, not just the host pin.
+fn trystore_nmi_mce_present(table: &[[u64; 2]; 32]) -> (bool, bool) {
+    const PRESENT_BIT: u64 = 1 << 47;
+    (
+        table[2][0] & PRESENT_BIT != 0,
+        table[18][0] & PRESENT_BIT != 0,
+    )
+}
+
+/// Emit the one-line `TRYSTORE-NMI` diagnostic right after the `TRYSTORE`
+/// line: `TRYSTORE-NMI ok=<0|1> nmi=<0|1> mce=<0|1>`. `nmi`/`mce` are the
+/// live present bits (expect 0/0); `ok` is 1 only when both are clear.
+/// Value gate (not value-free): any present NMI/MCE prints ok=0 fail-closed.
+fn write_trystore_nmi_line<E>(
+    ok: bool,
+    nmi_present: bool,
+    mce_present: bool,
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+) -> Result<(), E> {
+    write_str(emit, "TRYSTORE-NMI ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " nmi=")?;
+    write_u64_dec(emit, u64::from(nmi_present))?;
+    write_str(emit, " mce=")?;
+    write_u64_dec(emit, u64::from(mce_present))?;
+    write_str(emit, "\n")
+}
+
 /// BootInfo alloc-order correlation snapshot (S09 slice2bp, #30, REVIEW #757
 /// step 2 + REVIEW #759): ties the probe frame class to the firmware map on
 /// the SAME boot, killing the cross-boot variance hypothesis (slice2bk
@@ -4077,6 +4111,19 @@ pub extern "efiapi" fn efi_main(image_handle: *const (), system_table: *const u8
             // reporting-only, e2e ungated.
             let ts = try_store_probe(&info);
             let _ = write_trystore_line::<Infallible>(ts, &mut emit);
+            // S09 slice2by (#30, REVIEW #781 live proof): read back the
+            // installed scratch table's NMI/MCE present bits on the same
+            // boot and emit them. Host-only assert becomes QEMU-observed.
+            #[cfg(not(test))]
+            {
+                let (nmi_p, mce_p) = trystore_nmi_mce_present(&*core::ptr::addr_of!(TRYSTORE_IDT));
+                let _ = write_trystore_nmi_line::<Infallible>(
+                    !nmi_p && !mce_p,
+                    nmi_p,
+                    mce_p,
+                    &mut emit,
+                );
+            }
             let ao = alloc_order_snapshot(&info, umap_pt, umap_base);
             let _ = write_allocor_line::<Infallible>(ao, &mut emit);
             let ustack_outcome = probe_ustack(&info);
@@ -6072,6 +6119,53 @@ mod tests {
         assert_eq!(
             String::from_utf8(out_empty).unwrap(),
             "TRYSTORE low=0 high=0 lcode=0xffffffffffffffff hcode=0xffffffffffffffff rok=0\n"
+        );
+    }
+
+    #[test]
+    fn trystore_nmi_line_pins_live_readback_shape() {
+        // S09 slice2by (#30, REVIEW #781 live proof): host backstop for the
+        // NMI/MCE present-bit readback. The guest reads the installed table
+        // on the same boot, so a writer drift or a widened slot fails here
+        // and in QEMU. Fail-closed: any present bit forces ok=0.
+        let (lo, hi) = trystore_gate_for(0x1234_5678_9abc_def0, 0x28);
+        let mut table = [[0u64; 2]; 32];
+        trystore_scratch_init(&mut table, lo, hi);
+        let (nmi_p, mce_p) = trystore_nmi_mce_present(&table);
+        assert!(!nmi_p && !mce_p);
+        let mut out = Vec::new();
+        write_trystore_nmi_line::<core::convert::Infallible>(
+            !nmi_p && !mce_p,
+            nmi_p,
+            mce_p,
+            &mut |b| {
+                out.push(b);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "TRYSTORE-NMI ok=1 nmi=0 mce=0\n"
+        );
+        // Corrupted present bit forces fail-closed.
+        table[2][0] |= 1 << 47;
+        let (nmi_p2, mce_p2) = trystore_nmi_mce_present(&table);
+        assert!(nmi_p2 && !mce_p2);
+        let mut out2 = Vec::new();
+        write_trystore_nmi_line::<core::convert::Infallible>(
+            !nmi_p2 && !mce_p2,
+            nmi_p2,
+            mce_p2,
+            &mut |b| {
+                out2.push(b);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out2).unwrap(),
+            "TRYSTORE-NMI ok=0 nmi=1 mce=0\n"
         );
     }
 
