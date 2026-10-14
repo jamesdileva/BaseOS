@@ -1419,6 +1419,13 @@ fn trystore_rip_ok(bytes: [u8; 3]) -> bool {
 /// page boundary — checking only the first byte would still fault on the
 /// tail). Callers fail to `rok=0` on `false` without touching memory.
 /// Pure over `lookup`, shared by the guest decode and host tests.
+///
+/// Necessary-not-sufficient (REVIEW #765 residual 1, pinned by
+/// `trystore_rip_guard_passes_reserved_bit_leaf`): the walker checks
+/// canonical + `PRESENT` (+ table presence), NOT reserved-bit / PK
+/// violations — a present-but-reserved code leaf passes this guard and
+/// would still `#PF` on the volatile read. Unlikely for live code pages
+/// (`NXE=1`), so the guard stays as-is; the gap is documented, not closed.
 fn trystore_rip_walk_ok<'a, F>(pml4_base: u64, rip: u64, lookup: F) -> bool
 where
     F: Fn(u64) -> Option<&'a [u64; 512]> + Copy,
@@ -6087,6 +6094,48 @@ mod tests {
             0x0000_8000_0000_0000,
             &lookup
         ));
+    }
+
+    #[test]
+    fn trystore_rip_guard_passes_reserved_bit_leaf() {
+        // S09 slice2bs (#30, REVIEW #765 residual 1): the decode guard is
+        // necessary-not-sufficient. A PRESENT leaf carrying a reserved-bit
+        // violation (here `NO_EXEC` with `NXE=0`) still passes
+        // `trystore_rip_walk_ok` — the walker checks canonical + PRESENT +
+        // table presence only — while the CPU would `#PF` (RSVD) on the
+        // volatile read. Live code pages run with `NXE=1`, so this stays a
+        // documented gap, not a blocker.
+        use baseos_kernel::page_table::pte_encode;
+        use baseos_kernel::page_table::pte_reserved_violation;
+        use baseos_kernel::page_table::walk_full_leaf_raw;
+        use baseos_kernel::page_table::PageFlags;
+        let flags = PageFlags::PRESENT
+            .union(PageFlags::WRITABLE)
+            .union(PageFlags::NO_EXEC);
+        let mut pml4 = [0u64; 512];
+        let mut pdpt = [0u64; 512];
+        let mut pd = [0u64; 512];
+        let mut pt = [0u64; 512];
+        pml4[0] = pte_encode(0x2000, flags);
+        pdpt[0] = pte_encode(0x3000, flags);
+        pd[0] = pte_encode(0x4000, flags);
+        pt[0] = pte_encode(0x5000, flags);
+        let lookup = |base: u64| -> Option<&[u64; 512]> {
+            match base {
+                0x1000 => Some(unsafe { &*(&pml4 as *const [u64; 512]) }),
+                0x2000 => Some(unsafe { &*(&pdpt as *const [u64; 512]) }),
+                0x3000 => Some(unsafe { &*(&pd as *const [u64; 512]) }),
+                0x4000 => Some(unsafe { &*(&pt as *const [u64; 512]) }),
+                _ => None,
+            }
+        };
+        // Guard passes: leaf is present and canonical.
+        assert!(trystore_rip_walk_ok(0x1000, 0x100, &lookup));
+        // Same leaf is a reserved violation exactly when NXE=0.
+        let (_phys, raw, level) = walk_full_leaf_raw(0x1000, 0x100, &lookup).unwrap();
+        assert_eq!(level, 0);
+        assert!(pte_reserved_violation(raw, level, false));
+        assert!(!pte_reserved_violation(raw, level, true));
     }
 
     #[test]
