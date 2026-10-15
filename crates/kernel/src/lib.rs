@@ -305,6 +305,22 @@ pub fn pf_cpl_verdict(vector: u64, code: u64, cs: u16) -> (bool, bool, u64) {
     (ok, us, cpl)
 }
 
+/// Live-`#PF` branch predicate: true when the faulting CS ran at CPL3.
+///
+/// Single-sources the S09 slice2cg exactly-one-line branch (REVIEW #801
+/// risk 4: one fault emits `PFCPL` xor `PFUS`, never both). The guest
+/// [`exception_handler_pf_rust`] branches on this; host tests pin it so a
+/// flipped comparison (`!= 3`, `== 0`) fails loudly.
+///
+/// REVIEW #803 residual (1): the CPL0/`PFUS` arm is now host-only — the
+/// live guest always takes the CPL3/`PFCPL` arm, so a `pf_us_verdict`
+/// mutant hides live. Owed: periodic forced-CPL0-probe boot proving the
+/// `PFUS` arm still fires.
+#[must_use]
+pub fn pf_branch_is_cpl3(cs_raw: u64) -> bool {
+    (cs_raw as u16) & 3 == 3
+}
+
 /// Rust body of the `#PF` stub: prove the fault was *caught* (serial
 /// line) then chain into an intentional `#DE` so the single e2e boot proves
 /// BOTH vectors (`PF ok=1 ...` then `EXC ok=1 vector=0`) before parking.
@@ -320,9 +336,13 @@ pub fn pf_cpl_verdict(vector: u64, code: u64, cs: u16) -> (bool, bool, u64) {
 /// frame misaligns).
 ///
 /// S09 slice2cg (live CPL3, #30): one fault emits `PF` plus exactly ONE
-/// specific line — CPL3 faults (`cs & 3 == 3`) emit `PFCPL` via
-/// [`pf_cpl_verdict`], CPL0 faults emit `PFUS` via [`pf_us_verdict`]
-/// (REVIEW #801 risk 4: never both lines for one fault).
+/// specific line — CPL3 faults (`cs & 3 == 3`, see [`pf_branch_is_cpl3`])
+/// emit `PFCPL` via [`pf_cpl_verdict`], CPL0 faults emit `PFUS` via
+/// [`pf_us_verdict`] (REVIEW #801 risk 4: never both lines for one fault).
+/// REVIEW #803 residual (2): the `iretq` user stack is still the unmapped
+/// `USER_STACK` (`USTACK ok=0` perms-refused) — one-way only, safe because
+/// the S-bit supervisor fetch faults before any stack use. True CPL3 entry
+/// (executing user code) needs the owed ident-pin mapped stack.
 #[no_mangle]
 pub extern "C" fn exception_handler_pf_rust(vector: u64, code: u64, cr2: u64, cs_raw: u64) -> ! {
     // Port I/O is a safe wrapper now (`uart::write_pf_line`); only the
@@ -333,7 +353,7 @@ pub extern "C" fn exception_handler_pf_rust(vector: u64, code: u64, cr2: u64, cs
     // per fault. CPL3 delivery proves the live user path (`PFCPL ok=1
     // us=1 cpl=3`); a CPL0 delivery keeps the supervisor `PFUS` proof.
     let cs = cs_raw as u16;
-    if cs & 3 == 3 {
+    if pf_branch_is_cpl3(cs_raw) {
         let (ok, us, cpl) = pf_cpl_verdict(vector, code, cs);
         write_pfcpl_line(ok, us, cpl);
     } else {
@@ -1034,6 +1054,32 @@ mod tests {
         assert_ne!(pf_cpl_verdict(0, 0b100, 0x1B), live_accept);
         assert_ne!(pf_cpl_verdict(14, 0b000, 0x1B), live_accept);
         assert_ne!(pf_cpl_verdict(14, 0b100, 0x08), live_accept);
+    }
+
+    #[test]
+    fn pf_branch_routes_exactly_one_line() {
+        // S09 slice2ch (REVIEW #801 risk 4 + #803 risk 1): the guest
+        // `#PF` body emits PFCPL xor PFUS per fault — this pins the
+        // routing predicate the guest branches on, so a flipped comparison
+        // (`!= 3`, `== 0`) fails here even though live QEMU only ever
+        // exercises the CPL3 arm.
+        for cs in [0x1Bu64, 0x23, 0xFFFB, 0x1B | (0xABCD << 16)] {
+            assert!(pf_branch_is_cpl3(cs), "CPL3 CS {cs:#x} must route PFCPL");
+        }
+        for cs in [0x08u64, 0x10, 0x00, 0x0C, 0x28] {
+            assert!(!pf_branch_is_cpl3(cs), "CPL0 CS {cs:#x} must route PFUS");
+        }
+        // Cross-domain check: a CPL3-routed fault can accept the PFCPL
+        // verdict while the supervisor PFUS verdict refuses its U=1 shape,
+        // and vice versa — the two arms never co-accept one fault.
+        let (cpl_ok, _, _) = pf_cpl_verdict(14, 0b100, 0x1B);
+        let (us_ok, _, _, _) = pf_us_verdict(0b100, PF_PROBE_ADDR);
+        assert!(cpl_ok, "live CPL3 shape must accept PFCPL");
+        assert!(!us_ok, "same U=1 shape must refuse PFUS");
+        let (cpl_refuse, _, _) = pf_cpl_verdict(14, 0x0, 0x08);
+        let (us_accept, _, _, _) = pf_us_verdict(0x0, PF_PROBE_ADDR);
+        assert!(!cpl_refuse, "supervisor shape must refuse PFCPL");
+        assert!(us_accept, "supervisor shape must accept PFUS");
     }
     #[test]
     fn pf_probe_addr_is_canonical_unmapped_guard() {
