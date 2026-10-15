@@ -1733,6 +1733,11 @@ unsafe fn try_store_probe(info: &BootInfo) -> TryStore {
         // REVIEW #782 finding 2 (slice2ca): the branch decision runs through
         // the pure `trystore_resolve_live_nmi_mce` so host tests pin it;
         // only the `Some` arm dereferences, and only on `idtr_ok`.
+        // REVIEW #787 boundary (slice2cc): deref safety is owned by this
+        // caller guard (`if idtr_ok`, where `idtr_ok` already binds the
+        // SIDT-verified base+limit), NOT by the resolver. The resolver owns
+        // the decision only; its `(false, Some)` arm is defense-in-depth
+        // against future misuse and is never exercised by this call site.
         let (nmi_present, mce_present) = if idtr_ok {
             let live_table = &*(live_base as *const [[u64; 2]; 32]);
             trystore_resolve_live_nmi_mce(true, Some(live_table))
@@ -6335,9 +6340,12 @@ mod tests {
             trystore_resolve_live_nmi_mce(true, Some(&nmi_only)),
             (true, false)
         );
-        // Both-present read must pass through verbatim (indistinguishable
-        // in value from the fail-closed default, but reached via the read
-        // arm — documents why the clear arm above is the load-bearing one).
+        // Both-present read is documentation-only with zero discriminating
+        // power (REVIEW #787: value-identical to the fail-closed default, so
+        // a regressed resolver returning constant (true, true) still passes
+        // this arm). It proves reachability of the read path for (true, true)
+        // only; the load-bearing read arms are clear (false, false), MCE-only
+        // (false, true), and NMI-only (true, false) above.
         let mut both = clear;
         both[2][0] |= 1 << 47;
         both[18][0] |= 1 << 47;
