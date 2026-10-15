@@ -1020,6 +1020,17 @@ mod tests {
             pf_us_verdict(!0x1Fu64, PF_PROBE_ADDR),
             (true, false, false, false)
         );
+        // Mutant-kill pin per slice2cf/slice2ce precedent: a regressed
+        // verdict returning constant (true, false, false, false) —
+        // value-identical to the supervisor live accept — MUST fail the
+        // refuse arms below, so the suite carries discriminating power on
+        // the refuse path even though live QEMU never exercises the CPL0
+        // arm (REVIEW #803 residual 1 / #805 live gap stays owed).
+        let live_accept = (true, false, false, false);
+        assert_ne!(pf_us_verdict(0b100, PF_PROBE_ADDR), live_accept);
+        assert_ne!(pf_us_verdict(0b010, PF_PROBE_ADDR), live_accept);
+        assert_ne!(pf_us_verdict(0b001, PF_PROBE_ADDR), live_accept);
+        assert_ne!(pf_us_verdict(0x0, PF_PROBE_ADDR + 0x1000), live_accept);
     }
 
     #[test]
