@@ -276,6 +276,35 @@ pub fn pf_us_verdict(code: u64, cr2: u64) -> (bool, bool, bool, bool) {
     (ok, us, w, p)
 }
 
+/// Fail-closed live-`#PF` CPL verdict (S09 slice2cf, #30 remainder, REVIEW
+/// #799: the supervisor-only [`pf_us_verdict`] pins `U/S=0`; the live CPL3
+/// entry slice must prove vector 14 + `U/S=1` + `CPL=3` from one fault).
+///
+/// Returns `(ok, us, cpl)` where `us` is the decoded U/S bit (error-code
+/// bit 2) and `cpl` is `cs & 3` (code-segment RPL — the faulting privilege
+/// level the CPU pushed on the `#PF` frame). `ok` is true only when
+/// `vector == VECTOR_PF && us && cpl == 3` — a supervisor fault, a non-`#PF`
+/// vector, or a CPL0 delivery prints `ok=0` fail-closed instead of a
+/// silent pass.
+///
+/// Hardware-IDT note: `#PF` is never software-invoked (`INT n`), so the
+/// CPU delivers CPL3 faults through the existing DPL0 `gate_for` gate —
+/// DPL gates only `INT`-invoked vectors (Linux precedent: a DPL0 `#PF`
+/// gate handles user-space faults). No IDT change is needed for the live
+/// slice; the guest `iretq` entry + stub CS capture + `PFCPL` serial line
+/// ride next, with `boot-uefi.ps1` hard-requiring
+/// `PFCPL ok=1 us=1 cpl=3`.
+///
+/// Pure / `core`-only so host tests and the future guest `#PF` handler
+/// share the exact rule.
+#[must_use]
+pub fn pf_cpl_verdict(vector: u64, code: u64, cs: u16) -> (bool, bool, u64) {
+    let us = PfError::from_bits(code).is_user();
+    let cpl = u64::from(cs & 3);
+    let ok = vector as usize == VECTOR_PF && us && cpl == 3;
+    (ok, us, cpl)
+}
+
 /// Rust body of the `#PF` stub: prove the fault was *caught* (serial
 /// line) then chain into an intentional `#DE` so the single e2e boot proves
 /// BOTH vectors (`PF ok=1 ...` then `EXC ok=1 vector=0`) before parking.
@@ -913,6 +942,36 @@ mod tests {
             (true, false, false, false)
         );
     }
+
+    #[test]
+    fn pf_cpl_verdict_pins_vector_us_cpl_shape() {
+        // S09 slice2cf (REVIEW #799): the live CPL3 entry must arrive as
+        // vector 14 + U/S=1 + CPL 3 (`iretq` with CS 0x1B/0x23, whose RPL
+        // the CPU pushes on the `#PF` frame). Any other shape — supervisor
+        // U/S=0, non-`#PF` vector, CPL0 CS — refuses fail-closed while
+        // still reporting the decoded bits.
+        assert_eq!(pf_cpl_verdict(14, 0b100, 0x1B), (true, true, 3));
+        assert_eq!(pf_cpl_verdict(14, 0b111, 0x23), (true, true, 3));
+        // Supervisor fault at CPL0 (today's live probe shape): refuses.
+        assert_eq!(pf_cpl_verdict(14, 0x0, 0x08), (false, false, 0));
+        // U/S=1 but wrong vector (not `#PF`): refuses.
+        assert_eq!(pf_cpl_verdict(0, 0b100, 0x1B), (false, true, 3));
+        // Vector 14 + U/S=1 but CPL0 CS (kernel selector): refuses.
+        assert_eq!(pf_cpl_verdict(14, 0b100, 0x08), (false, true, 0));
+        // Upper error-code bits (PK/SGX/HLAT) never flip the U/S verdict;
+        // high CS bits (TI/LDT) never leak into CPL.
+        assert_eq!(pf_cpl_verdict(14, u64::MAX, 0x1B), (true, true, 3));
+        assert_eq!(pf_cpl_verdict(14, !0x1F, 0x1B), (false, false, 3));
+        assert_eq!(pf_cpl_verdict(14, 0b100, 0xFFFB), (true, true, 3));
+        // Mutant-kill pin per slice2ce precedent: a regressed verdict
+        // returning constant (true, true, 3) — value-identical to the
+        // live-CPL3 accept — MUST fail the three refuse arms below, so the
+        // suite carries discriminating power on the refuse path.
+        let live_accept = (true, true, 3);
+        assert_ne!(pf_cpl_verdict(0, 0b100, 0x1B), live_accept);
+        assert_ne!(pf_cpl_verdict(14, 0b000, 0x1B), live_accept);
+        assert_ne!(pf_cpl_verdict(14, 0b100, 0x08), live_accept);
+    }
     #[test]
     fn pf_probe_addr_is_canonical_unmapped_guard() {
         // #168n6 live-#PF guard: canonical low-half, 4 KiB-aligned, far
@@ -965,6 +1024,7 @@ mod tests {
         let exc: fn(bool, u64) = uart::write_exc_line;
         let pf: fn(bool, u64, u64, u64) = uart::write_pf_line;
         let pfus: fn(bool, bool, bool, bool) = uart::write_pfus_line;
+        let pfcpl: fn(bool, bool, u64) = uart::write_pfcpl_line;
         let tr: fn(bool, u16) = uart::write_tr_line;
         let tick: fn(bool, u64) = uart::write_tick_line;
         let sti: fn(bool, u64, u64, u64, u64, u64) = uart::write_sti_line;
@@ -972,7 +1032,7 @@ mod tests {
         let dec: fn(u64) = uart::write_dec_u64;
         let hex: fn(u64) = uart::write_hex_u64;
         let _ = (
-            init, write_byte, exc, pf, pfus, tr, tick, sti, irqstack, dec, hex,
+            init, write_byte, exc, pf, pfus, pfcpl, tr, tick, sti, irqstack, dec, hex,
         );
     }
 

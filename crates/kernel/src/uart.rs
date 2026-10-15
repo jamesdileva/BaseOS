@@ -335,6 +335,55 @@ pub(crate) fn write_pfus_line(ok: bool, us: bool, w: bool, p: bool) {
     let _ = emit_pfus_line(&mut out, ok, us, w, p);
 }
 
+/// Pure PFCPL line formatter shared by the future guest CPL3 handler and
+/// host tests (S09 slice2cf, #30 remainder, REVIEW #799: the `PFUS` line
+/// pins the supervisor `U/S=0` half — the live CPL3 `U=1` half needs its
+/// own e2e-pinned shape).
+///
+/// Emits `PFCPL ok=<0|1> us=<0|1> cpl=<n>\n` through a byte callback
+/// (`core`-only, no port I/O), so host tests pin the literal field order,
+/// names, and decimal shape while [`write_pfcpl_line`] reuses this exact
+/// body for its COM1-direct write. `us` is the decoded `#PF` error-code
+/// U/S bit; `cpl` is the faulting `CS & 3`; `ok` is the caller-computed
+/// [`crate::pf_cpl_verdict`] fail-closed verdict. `no_std`-clean; the guest
+/// passes a `com1_write_byte` closure (infallible).
+pub(crate) fn emit_pfcpl_line<E>(
+    emit: &mut impl FnMut(u8) -> Result<(), E>,
+    ok: bool,
+    us: bool,
+    cpl: u64,
+) -> Result<(), E> {
+    use baseos_boot_info::{write_str, write_u64_dec};
+    write_str(emit, "PFCPL ok=")?;
+    write_u64_dec(emit, u64::from(ok))?;
+    write_str(emit, " us=")?;
+    write_u64_dec(emit, u64::from(us))?;
+    write_str(emit, " cpl=")?;
+    write_u64_dec(emit, cpl)?;
+    write_str(emit, "\n")
+}
+
+/// Emit `PFCPL ok=<0|1> us=<0|1> cpl=<n>\n` directly on COM1
+/// (S09 slice2cf live-`#PF` CPL3 path: `ok` is 1 only when the live handler
+/// decoded vector 14 + `U/S=1` at `CPL=3` — any supervisor fault, wrong
+/// vector, or CPL0 delivery prints `ok=0` fail-closed).
+///
+/// Uncalled until the live-CPL3 wiring slice lands (guest `#PF` stub CS
+/// capture + `iretq` entry + `boot-uefi.ps1` hard-require), so
+/// boot-neutral by construction.
+///
+/// Safe wrapper: only calls [`com1_write_byte`] via [`emit_pfcpl_line`].
+/// Requires COM1 initialized; single-threaded exception context owns
+/// the UART exclusively.
+#[allow(dead_code)]
+pub(crate) fn write_pfcpl_line(ok: bool, us: bool, cpl: u64) {
+    let mut out = |b: u8| {
+        com1_write_byte(b);
+        Ok::<(), core::convert::Infallible>(())
+    };
+    let _ = emit_pfcpl_line(&mut out, ok, us, cpl);
+}
+
 /// Pure TR line formatter shared by the guest writer and host tests
 /// (S09 slice2k, #30 remainder: `ltr` survival alone never proved `TR`
 /// holds `TSS_SEL` — boot-identical bytes only).
@@ -465,6 +514,21 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
+    fn run_pfcpl(ok: bool, us: bool, cpl: u64) -> String {
+        let mut out = Vec::new();
+        emit_pfcpl_line::<core::convert::Infallible>(
+            &mut |b| {
+                out.push(b);
+                Ok(())
+            },
+            ok,
+            us,
+            cpl,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
     fn run_sti(ok: bool, ticks: u64, work: u64, spins: u64, batch: u64, target: u64) -> String {
         let mut out = Vec::new();
         emit_sti_line::<core::convert::Infallible>(
@@ -542,6 +606,21 @@ mod tests {
         );
         assert!(us_i < w_i && w_i < p_i);
         assert!(line.starts_with("PFUS ok="));
+        assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn pfcpl_line_pins_exact_field_order_and_fail_closed_shape() {
+        // S09 slice2cf: host backstop for the live-CPL3 `#PF` e2e shape.
+        // The future guest CPL3 handler shares this body, so a format
+        // drift fails here.
+        assert_eq!(run_pfcpl(true, true, 3), "PFCPL ok=1 us=1 cpl=3\n");
+        assert_eq!(run_pfcpl(false, false, 0), "PFCPL ok=0 us=0 cpl=0\n");
+        assert_eq!(run_pfcpl(false, true, 0), "PFCPL ok=0 us=1 cpl=0\n");
+        let line = run_pfcpl(true, true, 3);
+        let (us_i, cpl_i) = (line.find(" us=").unwrap(), line.find(" cpl=").unwrap());
+        assert!(us_i < cpl_i);
+        assert!(line.starts_with("PFCPL ok="));
         assert!(line.ends_with('\n'));
     }
 
