@@ -6340,19 +6340,11 @@ mod tests {
             trystore_resolve_live_nmi_mce(true, Some(&nmi_only)),
             (true, false)
         );
-        // Both-present read is documentation-only with zero discriminating
-        // power (REVIEW #787: value-identical to the fail-closed default, so
-        // a regressed resolver returning constant (true, true) still passes
-        // this arm). It proves reachability of the read path for (true, true)
-        // only; the load-bearing read arms are clear (false, false), MCE-only
-        // (false, true), and NMI-only (true, false) above.
-        let mut both = clear;
-        both[2][0] |= 1 << 47;
-        both[18][0] |= 1 << 47;
-        assert_eq!(
-            trystore_resolve_live_nmi_mce(true, Some(&both)),
-            (true, true)
-        );
+        // Both-present arm REMOVED per REVIEW #789 (was REVIEW #787 doc-only:
+        // value-identical to the fail-closed default, so a constant-(true,
+        // true) mutant passed — zero discriminating power). Load-bearing
+        // read arms remain clear (false, false), MCE-only (false, true),
+        // and NMI-only (true, false) above.
         // Mismatch with a table present must NOT read: fail-closed.
         assert_eq!(
             trystore_resolve_live_nmi_mce(false, Some(&clear)),
