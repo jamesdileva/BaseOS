@@ -6326,6 +6326,25 @@ mod tests {
             trystore_resolve_live_nmi_mce(true, Some(&corrupt)),
             (false, true)
         );
+        // NMI-only present must read slot 2 independently (not just slot
+        // 18): proves the resolver reads both present bits, and guards
+        // against a regression that hard-codes the MCE arm.
+        let mut nmi_only = clear;
+        nmi_only[2][0] |= 1 << 47;
+        assert_eq!(
+            trystore_resolve_live_nmi_mce(true, Some(&nmi_only)),
+            (true, false)
+        );
+        // Both-present read must pass through verbatim (indistinguishable
+        // in value from the fail-closed default, but reached via the read
+        // arm — documents why the clear arm above is the load-bearing one).
+        let mut both = clear;
+        both[2][0] |= 1 << 47;
+        both[18][0] |= 1 << 47;
+        assert_eq!(
+            trystore_resolve_live_nmi_mce(true, Some(&both)),
+            (true, true)
+        );
         // Mismatch with a table present must NOT read: fail-closed.
         assert_eq!(
             trystore_resolve_live_nmi_mce(false, Some(&clear)),
