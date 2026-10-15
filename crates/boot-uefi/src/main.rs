@@ -6345,6 +6345,25 @@ mod tests {
         // true) mutant passed — zero discriminating power). Load-bearing
         // read arms remain clear (false, false), MCE-only (false, true),
         // and NMI-only (true, false) above.
+        // Mutant-kill pin per REVIEW #797 (S09 slice2ce): a regressed
+        // resolver returning constant (true, true) — value-identical to the
+        // fail-closed default — MUST fail the three read arms above. Each
+        // `assert_ne!` below fails red on exactly that mutant, so the suite
+        // carries discriminating power on the read path (the deleted
+        // both-present arm was the only zero-power arm).
+        let fail_closed_default = (true, true);
+        assert_ne!(
+            trystore_resolve_live_nmi_mce(true, Some(&clear)),
+            fail_closed_default
+        );
+        assert_ne!(
+            trystore_resolve_live_nmi_mce(true, Some(&corrupt)),
+            fail_closed_default
+        );
+        assert_ne!(
+            trystore_resolve_live_nmi_mce(true, Some(&nmi_only)),
+            fail_closed_default
+        );
         // Mismatch with a table present must NOT read: fail-closed.
         assert_eq!(
             trystore_resolve_live_nmi_mce(false, Some(&clear)),
