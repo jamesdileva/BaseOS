@@ -305,6 +305,40 @@ pub fn pf_cpl_verdict(vector: u64, code: u64, cs: u16) -> (bool, bool, u64) {
     (ok, us, cpl)
 }
 
+/// Fail-closed forced-CPL0-probe verdict (S09 #31 slice1, REVIEW #803
+/// residual 1: the live guest always takes the CPL3/`PFCPL` arm, so the
+/// CPL0/`PFUS` arm has no live proof; [`pf_us_verdict`] pins code + `CR2`
+/// only, never vector or CPL).
+///
+/// Returns `(ok, us, cpl)` where `us` is the decoded U/S bit (error-code
+/// bit 2) and `cpl` is `cs & 3`. `ok` is true only when
+/// `vector == VECTOR_PF && !us && !w && !p && cr2 == PF_PROBE_ADDR && cpl == 0`
+/// — the exact supervisor volatile-read probe shape the forced-CPL0 boot
+/// must deliver. A user fault, write, present, off-probe address, non-`#PF`
+/// vector, or CPL3 CS prints `ok=0` fail-closed instead of a silent pass.
+///
+/// Pure / `core`-only so host tests and the future forced-probe guest path
+/// share the exact rule. Guest wiring (forced supervisor read + `PFUS`
+/// hard-require mode) rides next slice; this slice pins the contract
+/// host-side only, so QEMU behavior is unchanged.
+///
+/// Symmetric to [`pf_cpl_verdict`], which proves the CPL3 half
+/// (`U/S=1` + `CPL=3`); this proves the CPL0 half (`U/S=0` + `CPL=0` +
+/// probe address) from one fault.
+#[must_use]
+pub fn pf_cpl0_probe_verdict(vector: u64, code: u64, cr2: u64, cs: u16) -> (bool, bool, u64) {
+    let err = PfError::from_bits(code);
+    let us = err.is_user();
+    let cpl = u64::from(cs & 3);
+    let ok = vector as usize == VECTOR_PF
+        && !us
+        && !err.is_write()
+        && !err.is_present()
+        && cr2 == PF_PROBE_ADDR
+        && cpl == 0;
+    (ok, us, cpl)
+}
+
 /// Live-`#PF` branch predicate: true when the faulting CS ran at CPL3.
 ///
 /// Single-sources the S09 slice2cg exactly-one-line branch (REVIEW #801
@@ -1058,6 +1092,85 @@ mod tests {
         assert_ne!(pf_cpl_verdict(0, 0b100, 0x1B), live_accept);
         assert_ne!(pf_cpl_verdict(14, 0b000, 0x1B), live_accept);
         assert_ne!(pf_cpl_verdict(14, 0b100, 0x08), live_accept);
+    }
+
+    #[test]
+    fn pf_cpl0_probe_verdict_pins_vector_us_addr_cpl_shape() {
+        // S09 #31 slice1 (REVIEW #803 residual 1): the forced-CPL0-probe
+        // boot must deliver vector 14 + U/S=0 + supervisor read-not-present
+        // at PF_PROBE_ADDR + CPL 0 from one fault. Any other shape —
+        // user bit, write, present, off-probe CR2, non-#PF vector, CPL3
+        // CS — refuses fail-closed while still reporting the decoded bits.
+        assert_eq!(
+            pf_cpl0_probe_verdict(14, 0x0, PF_PROBE_ADDR, 0x08),
+            (true, false, 0)
+        );
+        // U/S=1 (CPL3 fault shape): refuses.
+        assert_eq!(
+            pf_cpl0_probe_verdict(14, 0b100, PF_PROBE_ADDR, 0x1B),
+            (false, true, 3)
+        );
+        // Write fault: refuses.
+        assert_eq!(
+            pf_cpl0_probe_verdict(14, 0b010, PF_PROBE_ADDR, 0x08),
+            (false, false, 0)
+        );
+        // Present (protection-violation) fault: refuses.
+        assert_eq!(
+            pf_cpl0_probe_verdict(14, 0b001, PF_PROBE_ADDR, 0x08),
+            (false, false, 0)
+        );
+        // Right code, wrong address (stale CR2): refuses.
+        assert_eq!(
+            pf_cpl0_probe_verdict(14, 0x0, PF_PROBE_ADDR + 0x1000, 0x08),
+            (false, false, 0)
+        );
+        // U/S=0 but wrong vector (not #PF): refuses.
+        assert_eq!(
+            pf_cpl0_probe_verdict(0, 0x0, PF_PROBE_ADDR, 0x08),
+            (false, false, 0)
+        );
+        // Supervisor probe shape but CPL3 CS: refuses (CPL must be 0).
+        assert_eq!(
+            pf_cpl0_probe_verdict(14, 0x0, PF_PROBE_ADDR, 0x1B),
+            (false, false, 3)
+        );
+        // Upper error-code bits (PK/SGX/HLAT) never flip the verdict;
+        // high CS bits (TI/LDT) never leak into CPL.
+        assert_eq!(
+            pf_cpl0_probe_verdict(14, !0x1Fu64, PF_PROBE_ADDR, 0x08),
+            (true, false, 0)
+        );
+        assert_eq!(
+            pf_cpl0_probe_verdict(14, 0x0, PF_PROBE_ADDR, 0x0C),
+            (true, false, 0)
+        );
+        // Cross-domain check: the CPL0-probe accept refuses the CPL3
+        // verdict and vice versa — the two halves never co-accept.
+        let (cpl0_ok, _, _) = pf_cpl0_probe_verdict(14, 0x0, PF_PROBE_ADDR, 0x08);
+        let (cpl3_refuse, _, _) = pf_cpl_verdict(14, 0x0, 0x08);
+        assert!(cpl0_ok, "supervisor probe shape must accept CPL0 verdict");
+        assert!(!cpl3_refuse, "same shape must refuse CPL3 verdict");
+        let (cpl0_refuse, _, _) = pf_cpl0_probe_verdict(14, 0b100, PF_PROBE_ADDR, 0x1B);
+        let (cpl3_ok, _, _) = pf_cpl_verdict(14, 0b100, 0x1B);
+        assert!(!cpl0_refuse, "CPL3 shape must refuse CPL0 verdict");
+        assert!(cpl3_ok, "same shape must accept CPL3 verdict");
+        // Mutant-kill pin per slice2cf precedent: a regressed verdict
+        // returning constant (true, false, 0) — value-identical to the
+        // forced-probe accept — MUST fail the refuse arms below.
+        let live_accept = (true, false, 0);
+        assert_ne!(
+            pf_cpl0_probe_verdict(0, 0x0, PF_PROBE_ADDR, 0x08),
+            live_accept
+        );
+        assert_ne!(
+            pf_cpl0_probe_verdict(14, 0b100, PF_PROBE_ADDR, 0x08),
+            live_accept
+        );
+        assert_ne!(
+            pf_cpl0_probe_verdict(14, 0x0, PF_PROBE_ADDR, 0x1B),
+            live_accept
+        );
     }
 
     #[test]
