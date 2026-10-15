@@ -44,7 +44,7 @@ pub mod uart;
 /// `cpu::` directly.
 #[cfg(test)]
 pub(crate) use cpu::IdtEntry;
-use uart::{write_exc_line, write_pf_line, write_pfus_line};
+use uart::{write_exc_line, write_pf_line, write_pfcpl_line, write_pfus_line};
 #[cfg(not(test))]
 use uart::{write_tick_line, write_tr_line};
 
@@ -310,23 +310,39 @@ pub fn pf_cpl_verdict(vector: u64, code: u64, cs: u16) -> (bool, bool, u64) {
 /// BOTH vectors (`PF ok=1 ...` then `EXC ok=1 vector=0`) before parking.
 ///
 /// Never returns; `vector` is 14, `code` is the raw CPU-pushed error code
-/// ([`PfError`] decodes bits 0-4), `cr2` is the faulting address. The chain
+/// ([`PfError`] decodes bits 0-4), `cr2` is the faulting address, `cs_raw`
+/// is the raw 64-bit pushed CS slot (low 16 bits are the faulting
+/// code-segment selector; `cs & 3` is the faulting CPL). The chain
 /// (`xor eax,eax; div eax`) re-faults through the `#DE` gate whose handler
 /// parks — no `iretq` ever executes, so the CPU-pushed `#PF` error code is
 /// never popped (REVIEW #229 risk 2: safe exactly because nothing returns;
 /// a future returning handler MUST `add rsp,8` before `iretq` or the return
 /// frame misaligns).
+///
+/// S09 slice2cg (live CPL3, #30): one fault emits `PF` plus exactly ONE
+/// specific line — CPL3 faults (`cs & 3 == 3`) emit `PFCPL` via
+/// [`pf_cpl_verdict`], CPL0 faults emit `PFUS` via [`pf_us_verdict`]
+/// (REVIEW #801 risk 4: never both lines for one fault).
 #[no_mangle]
-pub extern "C" fn exception_handler_pf_rust(vector: u64, code: u64, cr2: u64) -> ! {
+pub extern "C" fn exception_handler_pf_rust(vector: u64, code: u64, cr2: u64, cs_raw: u64) -> ! {
     // Port I/O is a safe wrapper now (`uart::write_pf_line`); only the
     // fault-chain `div` + `hlt` park need `unsafe`. Same COM1-exclusive
     // contract as `exception_handler_rust`.
     write_pf_line(true, vector, code, cr2);
-    // S09 slice2b live-U/S proof: decode the CPU-pushed error code and emit
-    // the fail-closed PFUS line before chaining (a U=1/W=1/P=1/off-probe
-    // fault prints `PFUS ok=0` and fails the e2e hard-require loudly).
-    let (us_ok, us, w, p) = pf_us_verdict(code, cr2);
-    write_pfus_line(us_ok, us, w, p);
+    // S09 slice2cg branch (REVIEW #801 risk 4): exactly one specific line
+    // per fault. CPL3 delivery proves the live user path (`PFCPL ok=1
+    // us=1 cpl=3`); a CPL0 delivery keeps the supervisor `PFUS` proof.
+    let cs = cs_raw as u16;
+    if cs & 3 == 3 {
+        let (ok, us, cpl) = pf_cpl_verdict(vector, code, cs);
+        write_pfcpl_line(ok, us, cpl);
+    } else {
+        // S09 slice2b live-U/S proof: decode the CPU-pushed error code and emit
+        // the fail-closed PFUS line before chaining (a U=1/W=1/P=1/off-probe
+        // fault prints `PFUS ok=0` and fails the e2e hard-require loudly).
+        let (us_ok, us, w, p) = pf_us_verdict(code, cr2);
+        write_pfus_line(us_ok, us, w, p);
+    }
     unsafe {
         // Chain: intentional #DE so e2e keeps its EXC hard-require.
         core::arch::asm!("xor eax, eax", "xor edx, edx", "div eax", options(nostack),);
@@ -356,14 +372,20 @@ macro_rules! de_isr_stub_asm {
 
 /// Shared `#PF` ISR stub source. `#PF` pushes a 64-bit error code, so the
 /// fault frame on entry is `[error code][RIP][CS][RFLAGS...]` — the stub
-/// reads the code from `[RSP]` with NO pop, and no `iretq` ever runs (both
-/// handlers park via `hlt`; the `#PF` body chains via a fresh `#DE` fault,
-/// not a return). Hence the error-code slot is abandoned, not misaligned
-/// (REVIEW #229 risk 2 closed by construction; documented for any future
-/// returning handler: `add rsp,8` before `iretq`).
+/// reads the code from `[RSP]` and the faulting CS from `[RSP+16]` with NO
+/// pop, and no `iretq` ever runs (both handlers park via `hlt`; the `#PF`
+/// body chains via a fresh `#DE` fault, not a return). Hence the error-code
+/// slot is abandoned, not misaligned (REVIEW #229 risk 2 closed by
+/// construction; documented for any future returning handler:
+/// `add rsp,8` before `iretq`).
+/// The `[RSP+16]` CS offset holds for BOTH the CPL0 frame and the CPL3->0
+/// frame (a privilege change pushes extra SS/RSP/RFLAGS *above* CS, so CS
+/// stays at +16): S09 slice2cg captures it into the Win64 fourth arg (`R9`)
+/// so the Rust body can verdict `cpl = cs & 3` live.
 /// Microsoft x64 ABI: `RCX` = vector (14), `RDX` = error code (from
-/// `[RSP]`), `R8` = `CR2` (faulting address), 32-byte shadow space, `RSP`
-/// 16-byte aligned before `call`. Host tests assert these instructions.
+/// `[RSP]`), `R8` = `CR2` (faulting address), `R9` = pushed CS slot,
+/// 32-byte shadow space, `RSP` 16-byte aligned before `call`. Host tests
+/// assert these instructions.
 macro_rules! pf_isr_stub_asm {
     () => {
         r#"
@@ -372,6 +394,7 @@ macro_rules! pf_isr_stub_asm {
         mov rdx, [rsp]
         mov rax, cr2
         mov r8, rax
+        mov r9, [rsp+16]
         mov ecx, 14
         and rsp, -16
         sub rsp, 32
@@ -406,10 +429,12 @@ core::arch::global_asm!(pf_isr_stub_asm!());
 /// record-then-defer flip live (`timer_irq_rust` records one tick and
 /// returns with no in-IRQ dispatch; the task-context batch below carries the
 /// full wait window, TICK reports the gated cumulative total), emit
-/// `TICK ok=1 ticks=<n>`, then volatile-read [`PF_PROBE_ADDR`] (unmapped
-/// guard → not-present `#PF`).
+/// `TICK ok=1 ticks=<n>`, then `iretq` to CPL3 at a supervisor code RIP
+/// (S09 slice2cg live-CPL3 entry: CPL3 fetch of the S-bit page faults
+/// U/S=1, P=1 with no PTE surgery).
 /// The `#PF` gate jumps to [`exception_handler_pf_rust`], which emits
-/// `PF ok=1 vector=14 code=... addr=...` and chains into an intentional
+/// `PF ok=1 vector=14 code=... addr=...` plus `PFCPL ok=1 us=1 cpl=3`
+/// (stub-captured pushed CS) and chains into an intentional
 /// `#DE` so `EXC ok=1 vector=0` still fires before parking — never returns.
 ///
 /// The tick wait is bounded ([`timer::STI_MAX_SPINS`] `hlt` spins ≈ 2 s budget
@@ -560,13 +585,40 @@ pub unsafe fn bring_up_cpu_and_prove_exception() -> ! {
             && top & 0xF == 0;
         uart::write_irqstack_line(ok, task_rsp, inner, base, timer::IRQ_STACK_LEN as u64);
     }
-    // Live #PF (#168n6, sole functional open): touch the unmapped guard.
-    // If either IDT gate is wrong this triple-faults and e2e fails loudly
-    // (missing PF/EXC lines). Volatile so the read is never optimized out.
+    // Live #PF via CPL3 fetch-fault entry (S09 slice2cg, #30, REVIEW
+    // #799/#801 cheapest disconfirm): `iretq` to CPL3 (CS 0x1B / SS 0x23,
+    // RFLAGS 0x202, user-stack top) at a supervisor code RIP (the `772`
+    // label below, present supervisor `.text`). CPL3 fetch of the S-bit
+    // page faults with U/S=1, P=1 before executing a single user
+    // instruction — no PTE surgery needed. The `#PF` gate jumps to
+    // `exception_handler_pf_rust`, whose stub captures the pushed CS into
+    // `R9` and emits `PFCPL ok=1 us=1 cpl=3` before chaining into `#DE`.
+    // If the GDT/TSS/IDT wiring is wrong this triple-faults and e2e fails
+    // loudly (missing PFCPL/EXC lines). One-way: the handler never
+    // returns, so no CPL0 resume is needed.
+    // SAFETY: post-EBS guest, `cli` re-masked above; `TSS.rsp0` wired in
+    // `load_gdt` absorbs the CPL3->0 push; selectors/RFLAGS pin the
+    // host-tested `iretq_frame_for` shape (CS 0x1B, SS 0x23, 0x202).
+    // S09 slice2cg fix (disassembly-proven): `rax` MUST be plain
+    // `out`, never `lateout` — the `lea` writes `rax` BEFORE the
+    // `push {ss}` reads its input, so `lateout` lets the compiler stash
+    // `ss` in `rax` and the `lea` clobbers it (pushed SS became the RIP
+    // with garbage RPL → silent triple-fault; found via objdump).
+    let user_rsp = cpu::user_stack_top_for(cpu::user_stack_base());
     core::arch::asm!(
-        "mov rax, [{addr}]",
-        addr = in(reg) PF_PROBE_ADDR as *const u64,
-        options(nostack),
+        "lea rax, [rip + 772f]",
+        "push {ss}",
+        "push {rsp}",
+        "push {rflags}",
+        "push {cs}",
+        "push rax",
+        "iretq",
+        "772:",
+        ss = in(reg) u64::from(USER_DATA_SEL),
+        rsp = in(reg) user_rsp,
+        rflags = in(reg) cpu::USER_RFLAGS,
+        cs = in(reg) u64::from(USER_CODE_SEL),
+        out("rax") _,
     );
     // Unreachable when #PF fires; park if the trap somehow returns.
     loop {
@@ -810,8 +862,11 @@ mod tests {
     fn pf_isr_stub_passes_vector_code_cr2_per_win64_abi() {
         // `#PF` pushes an error code: the stub reads it from `[RSP]`
         // (no pop — the handler parks), loads `CR2` into the third arg
-        // (`R8`), the vector into `RCX`, then the standard Win64
-        // align + shadow-space + call sequence.
+        // (`R8`), the pushed CS slot from `[RSP+16]` into the fourth arg
+        // (`R9`; S09 slice2cg live-CPL3 capture — the +16 offset holds
+        // for both the CPL0 frame and the CPL3->0 frame, whose extra
+        // SS/RSP/RFLAGS sit *above* CS), the vector into `RCX`, then the
+        // standard Win64 align + shadow-space + call sequence.
         let stub = pf_isr_stub_asm!();
         assert!(
             stub.contains("mov rdx, [rsp]"),
@@ -824,6 +879,10 @@ mod tests {
         assert!(
             stub.contains("mov r8, rax"),
             "CR2 must reach the third Win64 arg (R8): {stub}"
+        );
+        assert!(
+            stub.contains("mov r9, [rsp+16]"),
+            "pushed CS must reach the fourth Win64 arg (R9) from [RSP+16]: {stub}"
         );
         assert!(
             stub.contains("mov ecx, 14"),
@@ -963,6 +1022,10 @@ mod tests {
         assert_eq!(pf_cpl_verdict(14, u64::MAX, 0x1B), (true, true, 3));
         assert_eq!(pf_cpl_verdict(14, !0x1F, 0x1B), (false, false, 3));
         assert_eq!(pf_cpl_verdict(14, 0b100, 0xFFFB), (true, true, 3));
+        // REVIEW #801 nit (TI coverage): 0xFFFB tests high bits but not
+        // TI=1/RPL=0 (0x0C = index 1, TI=1, RPL=0) — `& 3` still isolates
+        // CPL 0, so a TI-set CPL0 CS refuses even with U/S=1.
+        assert_eq!(pf_cpl_verdict(14, 0b100, 0x0C), (false, true, 0));
         // Mutant-kill pin per slice2ce precedent: a regressed verdict
         // returning constant (true, true, 3) — value-identical to the
         // live-CPL3 accept — MUST fail the three refuse arms below, so the

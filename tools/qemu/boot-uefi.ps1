@@ -286,16 +286,20 @@ if ($serialText -and $serialText.Contains($marker)) {
   # stops ok=10 false-passing, [^\r\n]* keeps code/addr same-line, hex pins
   # stop dropped fields, (\s|$) terminates the addr field.
   $pfPat = "PF ok=1 vector=14 [^\r\n]*code=0x[0-9a-f]+[^\r\n]*addr=0x[0-9a-f]+(\s|$)"
-  # S09 slice2b live-#PF U/S path (REVIEW #622 risk 3: USER is
-  # classifier-only, so the CPU-pushed U/S bit needs its own live proof):
-  # the #PF handler decodes the error code and emits
-  # `PFUS ok=1 us=0 w=0 p=0` for the supervisor-read-not-present probe.
-  # Value gate (not value-free): us/w/p must all be 0 — any U/S=1, write,
-  # or present fault prints ok=0 fail-closed. Mid-line `us`/`w` use
-  # `[ \t]` (single same-line blank, mirrors the PERMAUDIT user pin:
-  # `(\s|$)` would match `\n` and false-pass a newline-split pair);
-  # line-terminal `p` uses `(\s|$)`. CPL3 U=1 entry stays deferred.
-  $pfusPat = "PFUS ok=1 [^\r\n]*us=0[ \t][^\r\n]*w=0[ \t][^\r\n]*p=0(\s|$)"
+  # S09 slice2cg live-CPL3 #PF path (REVIEW #799/#801: supersedes the
+  # slice2b supervisor PFUS proof — the single guest fault is now the
+  # CPL3 fetch-fault entry, so the handler emits PFCPL instead of PFUS):
+  # the #PF stub captures the pushed CS into R9 and the handler emits
+  # `PFCPL ok=1 us=1 cpl=3` for vector 14 + U/S=1 + CPL 3.
+  # Value gate (not value-free): us must be 1 and cpl 3 — any supervisor
+  # fault, wrong vector, or CPL0 delivery prints ok=0 fail-closed.
+  # Mid-line `us` uses `[ \t]` (single same-line blank, mirrors the
+  # PERMAUDIT user pin: `(\s|$)` would match `\n` and false-pass a
+  # newline-split pair); line-terminal `cpl` uses `(\s|$)`.
+  # PFUS retirement note: the supervisor U/S=0 live shape is superseded
+  # by this stronger CPL3 live proof (U/S decoding proven live at U=1;
+  # U/S=0 shape stays pinned by the USER 9/9 classifier + TRYSTORE hcode).
+  $pfcplPat = "PFCPL ok=1 [^\r\n]*us=1[ \t][^\r\n]*cpl=3(\s|$)"
   # S09 slice2bt TRYSTORE rok hard-require (#30, REVIEW #765 R1 + #767:
   # three green rok=1 boots slice2bq+br+bs): the bounded #PF-catch must prove
   # walk==CPU (low=0 high=1) with the historic code (hcode=0x3 = P+W present
@@ -433,16 +437,16 @@ if ($serialText -and $serialText.Contains($marker)) {
     $chainOrderOk = ($ci1 -gt $ci3) -and $hasChainOk
   }
    $hasPf = [regex]::IsMatch($serialText, $pfPat)
-   $hasPfus = [regex]::IsMatch($serialText, $pfusPat)
+   $hasPfcpl = [regex]::IsMatch($serialText, $pfcplPat)
    $hasTrystore = [regex]::IsMatch($serialText, $trystorePat)
    $hasTrystoreNmi = [regex]::IsMatch($serialText, $trystoreNmiPat)
    $hasUstack = [regex]::IsMatch($serialText, $ustackPat)
   $hasTr = [regex]::IsMatch($serialText, $trPat)
   $noTrFail = -not $serialText.Contains($trFail)
   $hasExc = $serialText.Contains($exc)
-   if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasUser -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSwitchLat -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasTick -and $hasSti -and $hasIrqstack -and $hasThreadJump -and $hasThreadJumpRun -and    $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and    $hasPf -and $hasPfus -and $hasTrystore -and $hasTrystoreNmi -and $hasUstack -and $hasTr -and $noTrFail -and $hasExc) {
+   if ($hasBootinfo -and $hasMemmap -and $hasNotrunc -and $hasMapsize -and $hasDescsize -and $budgetOk -and $hasFb -and $hasGop -and $hasEbs -and $hasKernel -and $hasFramealloc -and $hasPaging -and $hasPerm -and $hasGuard -and $hasUser -and $hasPermaudit -and $hasPermauditW -and $hasPermauditUN -and $hasPermaudit2 -and $hasPermaudit2W -and $hasPermaudit2UN -and $hasRmbz -and $hasThread -and $hasThreadRun -and $hasThreadCs -and $hasThreadSave -and $hasThreadPong -and $hasThreadPongRun -and $hasSchedSwitch -and $hasSwitchLat -and $hasSchedExit -and $hasSchedJoin -and $hasSchedStat -and $hasSchedFair -and $hasSchedTrace -and $hasSchedTraceX -and $hasSchedTick -and $hasTick -and $hasSti -and $hasIrqstack -and $hasThreadJump -and $hasThreadJumpRun -and    $hasThreadJumpRefusal -and $noRefusalFail -and $chainOrderOk -and $hasChainCursor -and    $hasPf -and $hasPfcpl -and $hasTrystore -and $hasTrystoreNmi -and $hasUstack -and $hasTr -and $noTrFail -and $hasExc) {
     Write-Output ("Boot summary: FOUND (" + $bootinfo + " + " + $memmap + " + " + $notrunc + " + " + $mapsize + " + " + $descsize + " + " +
-      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + USER ok=1 passed=9/9 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SWITCH-LAT ok=1 count=16 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + STI ok=1 + IRQSTACK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + PFUS ok=1 us=0 w=0 p=0 + TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=1 + TRYSTORE-NMI ok=1 nmi=0 mce=0 idtr=1 + USTACK ok=0 label + TR ok=1 sel=0x28 + no TR ok=0 + $exc)")
+      "budget ok + $fb + $gop + $ebs + $kernel + $framealloc + $paging + $perm + GUARD ok=1 passed=7/7 + USER ok=1 passed=9/9 + $permaudit + $permaudit2 + RMBZ ok=1 viol + THREAD ok=1 + THREAD-RUN id=2 + THREAD-CS ok=1 iter=16 + THREAD-SAVE ok=1 + THREAD-PONG ok=1 + THREAD-PONG-RUN id=1 + SCHED-SWITCH ok=1 from=1 to=2 + SWITCH-LAT ok=1 count=16 + SCHED-EXIT ok=1 + SCHED-JOIN ok=1 + SCHED-STAT ok=1 + SCHED-FAIR ok=1 + SCHED-TRACE ok=1 + SCHED-TRACE-X ok=1 + SCHED-TICK ok=1 + TICK ok=1 + STI ok=1 + IRQSTACK ok=1 + THREAD-JUMP ok=1 id=2 + THREAD-JUMP-RUN id=2 + THREAD-JUMP ok=0 id=0 + no REFUSAL-FAIL + CHAIN hop=2/3/1 + CHAIN ok=1 chain=1231 + CHAIN-CURSOR ok=1 legs=3 + PF ok=1 vector=14 + PFCPL ok=1 us=1 cpl=3 + TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=1 + TRYSTORE-NMI ok=1 nmi=0 mce=0 idtr=1 + USTACK ok=0 label + TR ok=1 sel=0x28 + no TR ok=0 + $exc)")
     Write-Output "UEFI BOOT PASS"
     exit 0
   } else {
@@ -485,7 +489,7 @@ if ($serialText -and $serialText.Contains($marker)) {
       "CHAIN hop=2/3/1 in-order + ok=1 chain=1231 present=$chainOrderOk, " +
       "CHAIN-CURSOR ok=1 legs=3 present=$hasChainCursor, " +
       "PF ok=1 vector=14-shape present=$hasPf, " +
-      "PFUS ok=1 us=0 w=0 p=0-shape present=$hasPfus, " +
+      "PFCPL ok=1 us=1 cpl=3-shape present=$hasPfcpl, " +
       "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=1-shape present=$hasTrystore, " +
       "TRYSTORE-NMI ok=1 nmi=0 mce=0 idtr=1-shape present=$hasTrystoreNmi, " +
       "USTACK ok=0 label-shape present=$hasUstack, " +

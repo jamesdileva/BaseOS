@@ -18,9 +18,9 @@
   RMBZ (S04 slice 36 viol-enforcement, #139 note 1): ok=1 viol=0 passes;
   viol=10 / viol=1 / ok=0-viol=1 fail (fail-closed value gate);
   ok=10 / ok=1x fail; missing viol fails; newline-split fails.
-  PFUS (S09 slice2b live-#PF U/S, REVIEW #622 risk 3): ok=1 us=0 w=0 p=0
-  passes; us=1 / w=1 / p=1 fail (fail-closed value gate); ok=10 fails;
-  missing p fails; newline-split fails.
+  PFCPL (S09 slice2cg live-CPL3 #PF, REVIEW #799/#801, supersedes PFUS):
+  ok=1 us=1 cpl=3 passes; us=0 / cpl=0 fail (fail-closed value gate);
+  ok=10 fails; missing cpl fails; newline-split fails.
   TRYSTORE (S09 slice2bt rok hard-require, #30 REVIEW #767: three green
   rok=1 boots slice2bq+br+bs): low=0 high=1 lcode=0x0 hcode=0x3 rok=1
   passes; low=1 / high=0 / wrong-hcode / rok=0 fail (fail-closed value
@@ -52,7 +52,7 @@ $u2 = Get-Pat "permaudit2UNPat"
 $g = Get-Pat "guardPat"
 $u = Get-Pat "userPat"
 $r = Get-Pat "rmbzPat"
-$f = Get-Pat "pfusPat"
+$f = Get-Pat "pfcplPat"
 $y = Get-Pat "trystorePat"
 $yn = Get-Pat "trystoreNmiPat"
 $t = Get-Pat "trPat"
@@ -104,19 +104,19 @@ if (($r -notlike '*RMBZ ok=1 *') -or (-not $r.Contains('[^\r\n]*viol=0')) -or ($
   Write-Output "GATE TEST FAIL (RMBZ pattern missing ok=1/viol tightening: $r)"
   exit 1
 }
-# S09 slice2b live-#PF U/S (REVIEW #622 risk 3, value gate like RMBZ):
+# S09 slice2cg live-CPL3 #PF (REVIEW #799/#801, supersedes slice2b PFUS):
 # pattern must carry the literal space after `ok=1` (boundary), same-line
-# `us=0`/`w=0` pins with single same-line-blank `[ \t]` (mid-line: `(\s|$)`
+# `us=1` pin with single same-line-blank `[ \t]` (mid-line: `(\s|$)`
 # would match `\n` and false-pass a newline-split pair, same class as the
-# PERMAUDIT `user` pin), same-line `[^\r\n]*p=0` with a `p=0(\s|$)` value pin
-# so us=1 / w=1 / p=1 / missing-p / newline-split pairs fail.
-if (($f -notlike '*PFUS ok=1 *') -or (-not $f.Contains('us=0')) -or (-not $f.Contains('w=0')) -or (-not $f.Contains('[^\r\n]*p=0')) -or ($f -notlike '*p=0(\s|$)*')) {
-  Write-Output "GATE TEST FAIL (PFUS pattern missing ok=1/us/w/p tightening: $f)"
+# PERMAUDIT `user` pin), same-line `[^\r\n]*cpl=3` with a `cpl=3(\s|$)`
+# value pin so us=0 / cpl=0 / missing-cpl / newline-split pairs fail.
+if (($f -notlike '*PFCPL ok=1 *') -or (-not $f.Contains('us=1')) -or (-not $f.Contains('[^\r\n]*cpl=3')) -or ($f -notlike '*cpl=3(\s|$)*')) {
+  Write-Output "GATE TEST FAIL (PFCPL pattern missing ok=1/us/cpl tightening: $f)"
   exit 1
 }
 # S09 slice2bt TRYSTORE rok hard-require (#30, REVIEW #767: three green
 # rok=1 boots slice2bq+br+bs): pattern must carry the literal space after
-# `low=0` / `high=1` (boundary, mirrors PFUS), same-line `lcode=0x0` /
+# `low=0` / `high=1` (boundary, mirrors PFCPL), same-line `lcode=0x0` /
 # `hcode=0x3` pins with the historic code (P+W present supervisor-write),
 # and a `rok=1(\s|$)` value pin so low=1 / high=0 / wrong-code / rok=0 /
 # missing-rok / newline-split pairs fail.
@@ -205,13 +205,13 @@ $cases = @(
   @("R-ok0viol1", $r, "RMBZ ok=0 nxen=1 walks=2/2 viol=1`n", $false, "ok=0 viol=1 fails"),
   @("R-noviol", $r, "RMBZ ok=1 nxen=1 walks=2/2`n", $false, "missing viol fails"),
   @("R-split", $r, "RMBZ ok=1 nxen=1 walks=2/2`n viol=0`n", $false, "newline-split fails"),
-  @("F-good", $f, "PFUS ok=1 us=0 w=0 p=0`n", $true, "ok=1 us=0 w=0 p=0 passes"),
-  @("F-us1", $f, "PFUS ok=1 us=1 w=0 p=0`n", $false, "us=1 fails fail-closed"),
-  @("F-w1", $f, "PFUS ok=1 us=0 w=1 p=0`n", $false, "w=1 fails fail-closed"),
-  @("F-p1", $f, "PFUS ok=1 us=0 w=0 p=1`n", $false, "p=1 fails fail-closed"),
-  @("F-ten", $f, "PFUS ok=10 us=0 w=0 p=0`n", $false, "ok=10 fails"),
-  @("F-nop", $f, "PFUS ok=1 us=0 w=0`n", $false, "missing p fails"),
-  @("F-split", $f, "PFUS ok=1 us=0 w=0`n p=0`n", $false, "newline-split fails"),
+  @("F-good", $f, "PFCPL ok=1 us=1 cpl=3`n", $true, "ok=1 us=1 cpl=3 passes"),
+  @("F-us0", $f, "PFCPL ok=1 us=0 cpl=3`n", $false, "us=0 fails fail-closed"),
+  @("F-cpl0", $f, "PFCPL ok=1 us=1 cpl=0`n", $false, "cpl=0 fails fail-closed"),
+  @("F-ok0", $f, "PFCPL ok=0 us=1 cpl=3`n", $false, "ok=0 fails fail-closed"),
+  @("F-ten", $f, "PFCPL ok=10 us=1 cpl=3`n", $false, "ok=10 fails"),
+  @("F-nocpl", $f, "PFCPL ok=1 us=1`n", $false, "missing cpl fails"),
+  @("F-split", $f, "PFCPL ok=1 us=1`n cpl=3`n", $false, "newline-split fails"),
   @("Y-good", $y, "TRYSTORE low=0 high=1 lcode=0x0 hcode=0x3 rok=1`n", $true, "low/high/code/rok passes"),
   @("Y-low1", $y, "TRYSTORE low=1 high=1 lcode=0x0 hcode=0x3 rok=1`n", $false, "low=1 fails fail-closed"),
   @("Y-high0", $y, "TRYSTORE low=0 high=0 lcode=0x0 hcode=0x3 rok=1`n", $false, "high=0 fails fail-closed"),

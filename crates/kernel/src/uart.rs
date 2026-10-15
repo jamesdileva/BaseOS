@@ -368,14 +368,11 @@ pub(crate) fn emit_pfcpl_line<E>(
 /// decoded vector 14 + `U/S=1` at `CPL=3` — any supervisor fault, wrong
 /// vector, or CPL0 delivery prints `ok=0` fail-closed).
 ///
-/// Uncalled until the live-CPL3 wiring slice lands (guest `#PF` stub CS
-/// capture + `iretq` entry + `boot-uefi.ps1` hard-require), so
-/// boot-neutral by construction.
+/// Wired by the slice2cg guest `#PF` stub CS capture + `iretq` entry.
 ///
 /// Safe wrapper: only calls [`com1_write_byte`] via [`emit_pfcpl_line`].
 /// Requires COM1 initialized; single-threaded exception context owns
 /// the UART exclusively.
-#[allow(dead_code)]
 pub(crate) fn write_pfcpl_line(ok: bool, us: bool, cpl: u64) {
     let mut out = |b: u8| {
         com1_write_byte(b);
